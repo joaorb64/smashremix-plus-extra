@@ -1,8 +1,8 @@
 import os
+from .constants import SMASHREMIX_PATH as smashremix_path
 from .hex_util import find_last_hex_id
 from .logger import logger
 from dataclasses import dataclass
-
 
 @dataclass
 class ImportFile:
@@ -82,8 +82,6 @@ class ImportFile:
 
 
 class FileManager:
-    smashremix_path = "smashremix"
-
     _import_files: ImportFile = []
     _last_file_id = None
 
@@ -91,7 +89,7 @@ class FileManager:
     def get_last_file_id():
         if FileManager._last_file_id is None:
             FileManager._last_file_id = int(find_last_hex_id(
-                os.path.join(FileManager.smashremix_path, 'src/File.asm')), 16)
+                os.path.join(smashremix_path, 'src/File.asm')), 16)
             logger.info(f"Last file ID: 0x{FileManager._last_file_id:04X}")
         return FileManager._last_file_id
 
@@ -145,4 +143,5 @@ class FileManager:
         return import_strings
 
 
-FileManager.get_last_file_id()
+if os.path.exists(os.path.join(smashremix_path, "src/File.asm")):
+    FileManager.get_last_file_id()

@@ -1,5 +1,6 @@
 @echo off
 setlocal
+set py=python -m
 
 where python >nul 2>&1
 if errorlevel 1 (
@@ -8,10 +9,10 @@ if errorlevel 1 (
     exit /b 1
 )
 
-where pipenv >nul 2>&1
+%py% pipenv >nul 2>&1
 if errorlevel 1 (
     echo Pipenv is not installed. Installing Pipenv...
-    python -m pip install pipenv
+    %py% pip install pipenv
     if errorlevel 1 (
         echo Failed to install Pipenv. Please install it manually and try again.
         @echo %cmdcmdline%|find /i """%~f0""">nul && pause
@@ -20,13 +21,13 @@ if errorlevel 1 (
 )
 
 echo Updating pipenv...
-python -m pip install --upgrade pipenv
+%py% pip install --upgrade pipenv
 
 echo Installing dependencies from Pipfile...
-pipenv install
+%py% pipenv install
 
 echo Running the Python script...
-pipenv run python character_appender.py %*
+%py% pipenv run python character_appender.py %*
 if errorlevel 1 (
     echo Character appender exited due to an error. Check above messages for more information.
     @echo %cmdcmdline%|find /i """%~f0""">nul && pause
@@ -46,7 +47,7 @@ if errorlevel 1 (
 )
 
 echo Generating RDB (PJ64KSE)...
-pipenv run python scripts/gen_rdb.py > rdb.txt
+%py% pipenv run python scripts/gen_rdb.py > rdb.txt
 
 echo Generating INI (RMG-K)...
-pipenv run python scripts/gen_ini.py > ini.txt
+%py% pipenv run python scripts/gen_ini.py > ini.txt
