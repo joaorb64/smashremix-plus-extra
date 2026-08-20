@@ -14,10 +14,10 @@ name: "Rebecca"
 
 num_costumes: 5
 
-charge_smash_frames:
-  up: 3
-  forward: 2
-  down: 2
+# charge_smash_frames:
+#   up: 3
+#   forward: 3
+#   down: 2
 
 results:
   name: "Rebecca"
