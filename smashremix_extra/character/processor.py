@@ -1034,15 +1034,18 @@ class CharacterProcessor:
 
         # Check for Data screen textures (bio, name, works, specials)
         if os.path.exists(f"{output_path}/datascreen/bio.png"):
+            # Bios are stored as three stacked I4 strips (51 + 51 + 13 rows);
+            # the biography table pointer + 0x30 must land past exactly three
+            # segment nodes, so the source image must be 160x115.
             pixels, w, h = get_image_data(
-                f"{output_path}/datascreen/bio.png"
+                f"{output_path}/datascreen/bio.png", 160, 115
             )
             bio_texture = append_image(
                 "scripts/10F5.bin",
                 "scripts/10F5.bin",
                 pixels,
                 w, h,
-                ImageMode.I8
+                ImageMode.I4,
             )
             bio_texture += 0x80000000
             bio_texture = f"0x{bio_texture:08X}"
@@ -1056,7 +1059,7 @@ class CharacterProcessor:
                 "scripts/10F6.bin",
                 pixels,
                 w, h,
-                ImageMode.I8
+                ImageMode.I4,
             )
             name_texture += 0x80000000
             name_texture = f"0x{name_texture:08X}"
@@ -1070,7 +1073,7 @@ class CharacterProcessor:
                 "scripts/10F6.bin",
                 pixels,
                 w, h,
-                ImageMode.I8
+                ImageMode.I4,
             )
             works_texture += 0x80000000
             works_texture = f"0x{works_texture:08X}"
@@ -1084,7 +1087,7 @@ class CharacterProcessor:
                 "scripts/10F6.bin",
                 pixels,
                 w, h,
-                ImageMode.I8
+                ImageMode.I4,
             )
             usp_texture += 0x80000000
             usp_texture = f"0x{usp_texture:08X}"
@@ -1098,7 +1101,7 @@ class CharacterProcessor:
                 "scripts/10F6.bin",
                 pixels,
                 w, h,
-                ImageMode.I8
+                ImageMode.I4,
             )
             nsp_texture += 0x80000000
             nsp_texture = f"0x{nsp_texture:08X}"
@@ -1112,7 +1115,7 @@ class CharacterProcessor:
                 "scripts/10F6.bin",
                 pixels,
                 w, h,
-                ImageMode.I8
+                ImageMode.I4,
             )
             dsp_texture += 0x80000000
             dsp_texture = f"0x{dsp_texture:08X}"
