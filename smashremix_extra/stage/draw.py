@@ -9,6 +9,8 @@ item spawns, ...). Pure inspection; reads stage.bin + header.bin, writes a PNG.
 """
 from __future__ import annotations
 
+import math
+
 from PIL import Image, ImageDraw, ImageFont
 
 from smashremix_extra.stage import collision, ground
@@ -34,6 +36,59 @@ def _font(sz=12):
         return ImageFont.truetype("DejaVuSans.ttf", sz)
     except OSError:
         return ImageFont.load_default()
+
+
+# Draw a translucent slab to tell different collision lines apart
+_SLAB_SIDE = {"floor": (0, 1), "ceil": (0, -1),
+              "lwall": (1, 0), "rwall": (-1, 0)}
+_SLAB_DEPTH = 10
+_SLAB_ALPHA = 60
+
+
+def _slab_quad(ax, ay, bx, by, tname):
+    """The 4 screen points of the mass-side slab for a segment, or None."""
+    side = _SLAB_SIDE.get(tname)
+    if side is None:
+        return None
+    dx, dy = bx - ax, by - ay
+    L = math.hypot(dx, dy) or 1.0
+    # unit normal, flipped to point at the body side
+    nx, ny = -dy / L, dx / L
+    if nx * side[0] + ny * side[1] < 0:
+        nx, ny = -nx, -ny
+    ox, oy = nx * _SLAB_DEPTH, ny * _SLAB_DEPTH
+    return [(ax, ay), (bx, by), (bx + ox, by + oy), (ax + ox, ay + oy)]
+
+
+def _floor_segments(geo):
+    """yid -> [((ax,ay),(bx,by)), ...] for every floor segment."""
+    out: dict = {}
+    for yid, tname, _ln, pts in geo.iter_lines():
+        if tname != "floor":
+            continue
+        segs = out.setdefault(yid, [])
+        for a, b in zip(pts, pts[1:]):
+            segs.append(((a[0], a[1]), (b[0], b[1])))
+    return out
+
+
+def _floor_continues_both_sides(segs, x, y):
+    """True if a floor in the same group runs past (x, y) to both its left
+    and its right - i.e. an interior polyline joint or a floor-floor seam,
+    where we don't want to draw a ledge grab indicator."""
+    left = right = False
+    for (ax, ay), (bx, by) in segs:
+        if (ax, ay) == (x, y):
+            ox = bx
+        elif (bx, by) == (x, y):
+            ox = ax
+        else:
+            continue
+        if ox < x:
+            left = True
+        elif ox > x:
+            right = True
+    return left and right
 
 
 def render(stage_bytes, header_bytes, *, chain_head=None, groupdata_off=0x14,
@@ -107,7 +162,8 @@ def render(stage_bytes, header_bytes, *, chain_head=None, groupdata_off=0x14,
         th = 15
         # tag centred just above the top edge
         tw = dr.textlength(tag, font=fs)
-        dr.text(((x0 + x1) / 2 - tw / 2, ymin - th - 5), tag, fill=color, font=fs)
+        dr.text(((x0 + x1) / 2 - tw / 2, ymin - th - 5),
+                tag, fill=color, font=fs)
         # corner coordinates, just outside each corner
         for cx, cy, sx, sy in ((b["left"], b["top"], x0, ymin),
                                (b["right"], b["top"], x1, ymin),
@@ -125,26 +181,56 @@ def render(stage_bytes, header_bytes, *, chain_head=None, groupdata_off=0x14,
     # collision lines
     ftiny = _font(11)
     labeled = set()   # screen positions already given an x,y label
-    for yid, tname, line_id, pts in geo.iter_lines():
-        if only_group is not None and yid != only_group:
-            continue
+    floor_segs = _floor_segments(geo)
+    lines = [(yid, tn, ln, pts) for yid, tn, ln, pts in geo.iter_lines()
+             if only_group is None or yid == only_group]
+
+    # pass 1: translucent mass-side slabs on their own RGBA layer, composited
+    # under the strokes so the outline stays crisp.
+    slab = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    sdr = ImageDraw.Draw(slab)
+    for yid, tname, _ln, pts in lines:
+        color = _GROUP_COLORS[(yid - 1) % len(_GROUP_COLORS)]
+        scr = [px(x, y) for x, y, _f in pts]
+        for (ax, ay), (bx, by) in zip(scr, scr[1:]):
+            quad = _slab_quad(ax, ay, bx, by, tname)
+            if quad:
+                sdr.polygon(quad, fill=color + (_SLAB_ALPHA,))
+    img = Image.alpha_composite(img.convert("RGBA"), slab).convert("RGB")
+    dr = ImageDraw.Draw(img)
+
+    # pass 2: strokes, vertices, labels
+    for yid, tname, line_id, pts in lines:
         color = _GROUP_COLORS[(yid - 1) % len(_GROUP_COLORS)]
         scr = [px(x, y) for x, y, _f in pts]
         w = 3 if tname in ("rwall", "lwall") else 2
-        drop = bool(pts and pts[0][2] & 0x4000)
-        if drop:
-            for (ax, ay), (bx, by) in zip(scr, scr[1:]):
-                n = max(int(((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5 / 12), 1)
-                for k in range(0, n, 2):
+        # One pass per segment. The engine reads the drop-through / ledge /
+        # material bits from the FIRST vertex of whichever segment you are
+        # above (mpCollisionGetFCCommon), so a polyline can be solid on one
+        # span and drop-through on the next - render each span on its own.
+        for i, ((ax, ay), (bx, by)) in enumerate(zip(scr, scr[1:])):
+            seg_flags = pts[i][2]
+            if seg_flags & 0x4000:                       # drop-through: dashed
+                seg_len = math.hypot(bx - ax, by - ay)
+                n = max(int(seg_len / 9), 1)             # ~6px dash, ~3px gap
+                for k in range(n):
+                    if k % 3 == 2:                       # skip 1 in 3
+                        continue
                     dr.line([(ax + (bx - ax) * k / n, ay + (by - ay) * k / n),
                              (ax + (bx - ax) * (k + 1) / n,
                               ay + (by - ay) * (k + 1) / n)], fill=color, width=w)
-        else:
-            dr.line(scr, fill=color, width=w)
+            else:
+                dr.line([(ax, ay), (bx, by)], fill=color, width=w)
         for idx, ((sx, sy), (x, y, pf)) in enumerate(zip(scr, pts)):
-            dr.ellipse([sx - 2, sy - 2, sx + 2, sy + 2], fill=color)
-            if pf & 0x8000:                      # grab-able ledge
-                dr.ellipse([sx - 6, sy - 6, sx + 6, sy + 6], outline=color, width=2)
+            dr.ellipse([sx - 4, sy - 4, sx + 4, sy + 4], fill=color)
+            # grab-able ledge: only ring a vertex where the floor actually
+            # ENDS - an interior joint / floor-floor seam still carries the
+            # 0x8000 bit but you stand on it, you don't hang off it.
+            if (pf & 0x8000 and tname == "floor"
+                    and not _floor_continues_both_sides(
+                        floor_segs.get(yid, []), x, y)):
+                dr.ellipse([sx - 10, sy - 10, sx + 10, sy + 10],
+                           outline=color, width=3)
             key = (round(sx), round(sy))
             if key in labeled:
                 continue
@@ -155,7 +241,8 @@ def render(stage_bytes, header_bytes, *, chain_head=None, groupdata_off=0x14,
             ox2, oy2 = scr[idx - 1] if idx else scr[idx + 1]
             txt = f"{x}, {y}"
             tw, th, pad = dr.textlength(txt, font=ftiny), 12, 6
-            dx = (pad if sx > ox2 + 1 else -tw - pad if sx < ox2 - 1 else -tw / 2)
+            dx = (pad if sx > ox2 + 1 else -tw -
+                  pad if sx < ox2 - 1 else -tw / 2)
             dy = (-th - pad if sy < oy2 - 1 else pad if sy > oy2 + 1 else -th / 2)
             dr.text((sx + dx, sy + dy), txt, fill=_TEXT, font=ftiny)
         # line id at the midpoint of the middle segment
@@ -185,6 +272,9 @@ def render(stage_bytes, header_bytes, *, chain_head=None, groupdata_off=0x14,
         c = _GROUP_COLORS[(yid - 1) % len(_GROUP_COLORS)]
         dr.line([(12, ly + 6), (30, ly + 6)], fill=c, width=3)
         dr.text((36, ly), f"group {yid}", fill=c, font=fs)
+    ly += 20
+    dr.text((12, ly), "shaded slab = solid-body side   dashed = drop-through "
+            "span   ring = grab-able ledge", fill=_TEXT, font=fs)
     return img
 
 
