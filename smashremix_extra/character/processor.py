@@ -545,9 +545,26 @@ class CharacterProcessor:
         select_pose = config.get("definitions", {}).get("select_pose", 1)
         select_pose_string = f"0x0001000{select_pose}"
 
+        # Compile any sounds/<name>.wav -> <name>.aifc first. Target rate from
+        # sounds_special[<id>].sample_rate when that id maps to the file name
+        # (config['sounds']: id -> name), else 16000 like add_sound's default.
+        from smashremix_extra.audio import vadpcm
+        _snd_map = config.get("sounds", {}) or {}
+        _snd_special = config.get("sounds_special", {}) or {}
+        _name_rate = {
+            nm: (_snd_special.get(sid) or {}).get("sample_rate", 16000)
+            for sid, nm in _snd_map.items()
+        }
+        vadpcm.convert_dir(
+            f"./{output_path}/sounds",
+            rate_for=lambda n: _name_rate.get(n, 16000))
+
         # Get sounds to add
         if os.path.exists(f"./{output_path}/sounds"):
             for s in os.listdir(f"./{output_path}/sounds"):
+                # .wav sources were compiled to .aifc above; skip the originals.
+                if not s.lower().endswith(".aifc"):
+                    continue
                 sample_rate = 16000
                 type = "VOICE"
                 reverb = 0

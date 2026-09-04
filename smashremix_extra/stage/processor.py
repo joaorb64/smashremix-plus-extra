@@ -73,8 +73,8 @@ class StageProcessor:
             logger.info("%s: moved rebirth platform to (%s, %s)",
                         stage_folder, rx, ry)
 
-        # blast_zones / camera_bounds / light_angle / fog -> MPGroundData in
-        # header.bin (in-place scalar writes; see smashremix_extra/stage/ground.py).
+        # blast_zones / camera_bounds / light_angle / magnifying_glass_color ->
+        # MPGroundData in header.bin (in-place scalar writes; see ground.py).
         from smashremix_extra.stage import ground as _ground
         _gd_changed = _ground.apply(
             f"{output_path}/header.bin",
@@ -270,28 +270,13 @@ class StageProcessor:
 
                     compiled_reqlist.write(line)
 
-        # Read config and update attributes
-        with open(f"{original_path}/header.bin", 'rb') as binary_file:
+        # Grow the header's external reloc chain. NB: read the *build* copy, not
+        # the source - ground.apply() (MPGroundData: camera_bounds / blast_zones
+        # / light_angle / magnifying_glass_color / ...) has already patched it in
+        # place; re-reading the source here would silently discard those edits.
+        # `magnifying_glass_color` is handled entirely by ground.apply() now.
+        with open(f"{output_path}/header.bin", 'rb') as binary_file:
             data = bytearray(binary_file.read())
-
-            # At 0x60 we have the magnifying glass color RRGGBB00
-            if config.get("magnifying_glass_color"):
-                color = config.get("magnifying_glass_color")
-                # Accept either an array or a html color string
-                if isinstance(color, str):
-                    color = color.replace("#", "")
-                    color_r = int(color[0:2], 16)
-                    color_g = int(color[2:4], 16)
-                    color_b = int(color[4:6], 16)
-                    color = bytearray(
-                        [color_r, color_g, color_b, 0x00]
-                    )
-                elif isinstance(color, list) and len(color) == 3:
-                    color = bytearray(
-                        [color[0], color[1], color[2], 0x00]
-                    )
-
-                data[0x60:0x64] = color
 
             # Grow the header's external reloc chain so every entry in
             # header_reqlist.txt (including imported ${NAME} files) is loaded and
@@ -455,6 +440,15 @@ class StageProcessor:
             file_constants.append("\n".join(lines))
 
         sounds = config.get("sounds", {}) or {}
+
+        # Compile any sounds/<name>.wav -> <name>.aifc before they're picked up
+        # below. Target rate comes from the sound's `sample_rate:` (default
+        # 16000, matching add_sound's default) so playback pitch stays correct.
+        from smashremix_extra.audio import vadpcm
+        vadpcm.convert_dir(
+            f"{output_path}/sounds",
+            rate_for=lambda n: (sounds.get(n) or {}).get("sample_rate", 16000))
+
         for name, settings in sounds.items():
             settings = settings or {}
             sample_rate = settings.get("sample_rate", 16000)

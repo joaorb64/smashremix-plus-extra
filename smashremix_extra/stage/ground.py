@@ -8,7 +8,7 @@ All edits are in-place scalar writes - nothing moves, no pointer is touched.
     blast_zones_team:   { top: 5700, bottom: -1500, left: -6000, right: 6000 }
     camera_bounds_team: { top: 3900, bottom: -1500, left: -4200, right: 4200 }
     light_angle:        [80, 25]           # [pitch, yaw] (or [pitch, yaw, roll]) deg
-    fog:               { color: [225, 200, 255], alpha: 0 }  # color = #RRGGBB or [r,g,b]
+    magnifying_glass_color: [10, 10, 10]   # #RRGGBB or [r,g,b]
     emblem_colors:     [[255,0,0], [0,0,255], [255,255,0], [0,255,0]]   # per-player
     alt_warning:        -3200              # whistle plays below this altitude
     zoom_start:         [0, 0, 0]          # bonus-stage pause camera, region start (Vec3, s16)
@@ -20,7 +20,7 @@ are relative to it; the layout is verified against ssb-decomp `mptypes.h` and a
 real ShadowMoses header.bin.
 
     +0x44  layer_mask (u8)
-    +0x4C  fog_color (u8 r,g,b)     +0x4F  fog_alpha (u8)
+    +0x4C  fog_color (u8 r,g,b)     +0x4F  fog_alpha (u8, unused padding)
     +0x50  emblem_colors[4]  (u8 r,g,b each)
     +0x60  light_angle x,y (f32)    +0x68  camera_tilt (f32 rad; see below)
     +0x6C  camera_bound      top/bottom/right/left  (s16 x4)
@@ -34,6 +34,16 @@ real ShadowMoses header.bin.
            (Break the Targets / Board the Platforms): the pause camera pulls
            back and frames the map from zoom_start to zoom_end. Unused on
            normal VS stages.
+
+`fog_color` (+0x4C, `SYColorRGB`) is exposed as `magnifying_glass_color`.
+Despite the decomp's struct name there is no fog render that reads it. Its
+consumers in ssb-decomp are: `ifCommonPlayerMagnifyDraw` (if/ifcommon.c) - the
+prim colour of the magnifying-glass lens overlay drawn when a player is far
+off-screen - and `ftCommonMotionDeadState` (ft/ftcommon/ftcommondead.c) - the
+tint of a fighter's death colour-anim. `fog_alpha` (+0x4F) is written 0x00 by
+every vanilla map and read by nothing: pure padding. Note Training Mode
+overwrites this field each frame from the chosen wallpaper
+(sc1ptrainingmode.c), so it has no visible effect there.
 
 `light_angle` is a Vec3f but only x/y are scene lighting (pitch/yaw deg). The
 3rd component (+0x68) is actually the **camera baseline pitch**: gmcamera.c's
@@ -53,7 +63,7 @@ _BSIDES = {"top": 0, "bottom": 2, "right": 4, "left": 6}
 # key -> (offset relative to MPGroundData, kind). Order is the dump order.
 _FIELDS = (
     ("layer_mask",         0x44, "bin8"),  # bit per gr_desc geo layer
-    ("fog",                0x4C, "fog"),
+    ("magnifying_glass_color", 0x4C, "mgcolor"),   # SYColorRGB fog_color; +0x4F pad
     ("emblem_colors",      0x50, "rgb4"),
     ("light_angle",        0x60, "vec2f"),   # scene light pitch/yaw, degrees
     ("camera_tilt",        0x68, "angle_deg"),   # camera baseline pitch, degrees
@@ -98,15 +108,13 @@ def _read_field(d, b, off, kind):
         return list(struct.unpack_from(">3h", d, b + off))
     if kind == "rgb4":
         return [list(d[b + off + i * 3:b + off + i * 3 + 3]) for i in range(4)]
-    if kind == "fog":
-        return {"color": list(d[b + off:b + off + 3]), "alpha": d[b + off + 3]}
+    if kind == "mgcolor":
+        return list(d[b + off:b + off + 3])
     raise ValueError(kind)
 
 
 def read(header_bytes, groupdata_offset):
-    """Every editable MPGroundData field -> dict, in `_FIELDS` order.
-    Back-compat: `camera_bounds`, `blast_zones`, `light_angle`, `fog` are the
-    keys the draw tool already uses."""
+    """Every editable MPGroundData field -> dict, in `_FIELDS` order."""
     d, b = header_bytes, groupdata_offset
     return {key: _read_field(d, b, off, kind) for key, off, kind in _FIELDS}
 
@@ -139,12 +147,9 @@ def _write_field(d, b, off, kind, val):
     elif kind == "rgb4":
         for i, c in enumerate(val[:4]):
             d[b + off + i * 3:b + off + i * 3 + 3] = bytes(_color(c))
-    elif kind == "fog":
-        val = val or {}
-        if "color" in val:
-            d[b + off:b + off + 3] = bytes(_color(val["color"]))
-        if "alpha" in val:
-            d[b + off + 3] = int(val["alpha"]) & 0xFF
+    elif kind == "mgcolor":
+        d[b + off:b + off + 3] = bytes(_color(val))
+        d[b + off + 3] = 0                       # fog_alpha: unused padding
     else:
         raise ValueError(kind)
 
