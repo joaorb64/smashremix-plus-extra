@@ -225,8 +225,11 @@ def render(stage_bytes, header_bytes, *, chain_head=None, groupdata_off=0x14,
             dr.ellipse([sx - 4, sy - 4, sx + 4, sy + 4], fill=color)
             # grab-able ledge: only ring a vertex where the floor actually
             # ENDS - an interior joint / floor-floor seam still carries the
-            # 0x8000 bit but you stand on it, you don't hang off it.
-            if (pf & 0x8000 and tname == "floor"
+            # 0x8000 bit but you stand on it, you don't hang off it. The bit
+            # lives on a segment (its first vertex), so a line's far end has
+            # a 0 flag word of its own - check the incident segment too.
+            seg_ledge = (pf & 0x8000) or (idx and pts[idx - 1][2] & 0x8000)
+            if (seg_ledge and tname == "floor"
                     and not _floor_continues_both_sides(
                         floor_segs.get(yid, []), x, y)):
                 dr.ellipse([sx - 10, sy - 10, sx + 10, sy + 10],
