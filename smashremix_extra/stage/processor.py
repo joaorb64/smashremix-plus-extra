@@ -99,6 +99,20 @@ class StageProcessor:
             logger.warning("%s: collision_layout.png render skipped (%s)",
                            stage_folder, _e)
 
+        # Full attribute dump (collision + map objects + every MPGroundData
+        # field) as YAML next to the built files, for debugging / diffing.
+        try:
+            from smashremix_extra.stage import attributes as _attrs
+            _attrs.dump_to(
+                f"{output_path}/stage_attributes.yaml",
+                f"{output_path}/stage.bin", f"{output_path}/header.bin",
+                int(config['offsets']['stage'][0], 16),
+                int(config['offsets']['header'][1], 16))
+            logger.info("%s: wrote stage_attributes.yaml", stage_folder)
+        except Exception as _e:                        # never fail a build over a dump
+            logger.warning("%s: stage_attributes.yaml skipped (%s)",
+                           stage_folder, _e)
+
         # header_reqlist.txt may reference imported files via ${NAME} tokens that
         # have no matching node in header.bin's resource linked list yet; count
         # them (or take an explicit override) so validate_reqlist() allows it.
