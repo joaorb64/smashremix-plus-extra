@@ -11,8 +11,8 @@ mushroom_kingdom_camera: true
 music:
   main: STREETFIGHTER2_RYU_THEME
   occasional: STREETFIGHTER2_KEN_THEME
-  rare: MORTALKOMBAT_TECHNO_SYNDROME
-  rare2: -1
+  rare: FF10_FIGHT_WITH_SEYMOUR
+  rare2: CASTLEVANIA_DOS_PITCH_BLACK_INTRUSION
 
 series_position:
   x: 4.25

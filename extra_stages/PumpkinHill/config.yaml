@@ -14,7 +14,7 @@ music:
   main: "SONICADVENTURE2_PUMPKIN_HILL"
   occasional: "KNUCKLESCHAOTIX_MIDNIGHT_GREENHOUSE"
   rare: "KNUCKLESCHAOTIX_SEASCAPE"
-  rare2: -1
+  rare2: "SONICADVENTURE2_BIOLIZARD"
 
 spawn_locations:
   default:
