@@ -1057,6 +1057,8 @@ class CharacterAppender:
 
         add_to_scope("src/SinglePlayerModes.asm", "progress_icon",
                      self.char_proc.character_1p_icon_defs)
+        add_to_scope("src/SinglePlayerModes.asm", "progress_icon",
+                     self.char_proc.character_boss_icon_defs)
         add_to_label_on_empty("src/SinglePlayerModes.asm", "duo_array",
                               self.char_proc.character_1p_duo_parameter_defs)
         add_to_label_on_empty("src/SinglePlayerModes.asm", "team_array",
