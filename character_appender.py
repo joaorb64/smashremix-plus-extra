@@ -1019,7 +1019,7 @@ class CharacterAppender:
         lineinfile.add_line_to_file(
             filepath="src/SinglePlayer.asm",
             line="\t"+"\n\t".join(self.char_proc.singleplayer_boss_name_defs),
-            inserter=lineinfile.AfterLast(r'.*constant DK_CREW(0x0000D890).*')
+            inserter=lineinfile.AfterLast(r'.*constant DK_CREW\(0x0000D890\).*')
         )
 
         lineinfile.add_line_to_file(
