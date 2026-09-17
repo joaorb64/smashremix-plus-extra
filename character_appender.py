@@ -1019,6 +1019,12 @@ class CharacterAppender:
 
         lineinfile.add_line_to_file(
             filepath="src/SinglePlayer.asm",
+            line="\t"+"\n\t".join(self.char_proc.singleplayer_boss_name_defs),
+            inserter=lineinfile.AfterLast(r'.*constant DK_CREW(0x0000D890).*')
+        )
+
+        lineinfile.add_line_to_file(
+            filepath="src/SinglePlayer.asm",
             line="\t\t" +
             "\n\t\t".join(self.char_proc.singleplayer_name_width_defs["normal"]),
             inserter=lineinfile.BeforeLast(r'.*// use normal width otherwise.*')
@@ -1046,6 +1052,7 @@ class CharacterAppender:
         )
 
         add_to_scope("src/SinglePlayerModes.asm", "progress_icon", self.char_proc.character_1p_icon_defs)
+        add_to_scope("src/SinglePlayerModes.asm", "progress_icon", self.char_proc.character_boss_icon_defs)
         add_to_label_on_empty("src/SinglePlayerModes.asm", "duo_array", self.char_proc.character_1p_duo_parameter_defs)
         add_to_label_on_empty("src/SinglePlayerModes.asm", "team_array", self.char_proc.character_1p_team_parameter_defs)
 
