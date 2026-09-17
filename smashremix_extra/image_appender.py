@@ -276,11 +276,12 @@ def append_image(input_file, output_file, _pixels, width, height, mode,
             struct_start, b'\x04\x00', rows_per_segment)
         data_address = struct_start
 
+    if data_address >= 0x3FFFC:
+        # Do not modify file if the image is too large to be addressable
+        raise ValueError("Image too large, exceeds addressable space.")
+
     with open(output_file, "wb") as f:
         f.write(out)
-
-    if data_address >= 0x3FFFC:
-        raise ValueError("Image too large, exceeds addressable space.")
 
     return data_address
 

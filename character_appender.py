@@ -15,6 +15,7 @@ from smashremix_extra.smashremix.kirbyshared import kirby_shared
 from smashremix_extra.logger import logger
 from smashremix_extra import file_manager
 from smashremix_extra.character.processor import CharacterProcessor
+from smashremix_extra.character.bio_overflow import apply_bio_overflow_patches, write_bio_overflow_asm
 from smashremix_extra.stage.processor import StageProcessor
 from smashremix_extra.audio.processor import AudioProcessor
 from smashremix_extra.injector import ROMInjector, MODIFIED_FILES
@@ -57,7 +58,6 @@ class CharacterAppender:
         )
         self.name_texture_default = f"0x{name_texture_offset:08X} + 0x10"
 
-
         default_sp_icon_pixels, w, h = get_image_data(
             "extra_resources/1p_icon.png")
         sp_icon_offset = append_image(
@@ -65,7 +65,6 @@ class CharacterAppender:
             default_sp_icon_pixels, w, h, ImageMode.RGBA5551
         )
         self.sp_icon_default = f"0x{sp_icon_offset:08X} + 0x10"
-
 
         self.char_folders = [cf for cf in os.listdir("extra_characters") if os.path.isdir(
             os.path.join("extra_characters", cf)) and not cf.startswith("_")]
@@ -1026,15 +1025,19 @@ class CharacterAppender:
         lineinfile.add_line_to_file(
             filepath="src/SinglePlayer.asm",
             line="\t\t" +
-            "\n\t\t".join(self.char_proc.singleplayer_name_width_defs["normal"]),
-            inserter=lineinfile.BeforeLast(r'.*// use normal width otherwise.*')
+            "\n\t\t".join(
+                self.char_proc.singleplayer_name_width_defs["normal"]),
+            inserter=lineinfile.BeforeLast(
+                r'.*// use normal width otherwise.*')
         )
 
         # SinglePlayerModes.asm
         lineinfile.add_line_to_file(
             filepath="src/SinglePlayerModes.asm",
-            line="\t"+"\n\t".join(self.char_proc.singleplayer_remix_match_defs),
-            inserter=lineinfile.BeforeLast(r".*// Add entry here if a new variant.type.NA character is added UPDATE.*")
+            line="\t" +
+            "\n\t".join(self.char_proc.singleplayer_remix_match_defs),
+            inserter=lineinfile.BeforeLast(
+                r".*// Add entry here if a new variant.type.NA character is added UPDATE.*")
         )
 
         lineinfile.add_line_to_file(
@@ -1047,14 +1050,17 @@ class CharacterAppender:
         lineinfile.add_line_to_file(
             filepath="src/SinglePlayerModes.asm",
             line="\t\t" +
-            "\n\t\t".join(self.char_proc.singleplayer_name_width_defs["giant"]),
+            "\n\t\t".join(
+                self.char_proc.singleplayer_name_width_defs["giant"]),
             inserter=lineinfile.BeforeLast(r'.*b       _done_giant.*')
         )
 
-        add_to_scope("src/SinglePlayerModes.asm", "progress_icon", self.char_proc.character_1p_icon_defs)
-        add_to_scope("src/SinglePlayerModes.asm", "progress_icon", self.char_proc.character_boss_icon_defs)
-        add_to_label_on_empty("src/SinglePlayerModes.asm", "duo_array", self.char_proc.character_1p_duo_parameter_defs)
-        add_to_label_on_empty("src/SinglePlayerModes.asm", "team_array", self.char_proc.character_1p_team_parameter_defs)
+        add_to_scope("src/SinglePlayerModes.asm", "progress_icon",
+                     self.char_proc.character_1p_icon_defs)
+        add_to_label_on_empty("src/SinglePlayerModes.asm", "duo_array",
+                              self.char_proc.character_1p_duo_parameter_defs)
+        add_to_label_on_empty("src/SinglePlayerModes.asm", "team_array",
+                              self.char_proc.character_1p_team_parameter_defs)
 
         # TwelveCharBattle.asm
         lineinfile.add_line_to_file(
@@ -1617,6 +1623,8 @@ def main(args):
     ca.copy_remix_src()
     ca.overwrite_files()
     ca.prepare_files()
+    apply_bio_overflow_patches()
+    write_bio_overflow_asm(ca.char_proc.bio_overflow_names)
     ca.inject_files_in_rom()
     ca.edit_src_files()
 

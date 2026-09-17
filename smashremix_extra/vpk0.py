@@ -166,7 +166,7 @@ def _get_codes(tree: Optional[_TreeNode]) -> Dict[int, Tuple[int, int]]:
     """
     Return {symbol: (huffman_code, code_bit_length)}.
 
-    For a single-leaf tree the code is (0, 0) — zero bits are written
+    For a single-leaf tree the code is (0, 0) - zero bits are written
     for the Huffman path; the decoder reads the leaf value directly.
     """
     if tree is None:

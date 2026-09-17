@@ -1,5 +1,5 @@
 """
-SSB64 ROM file injector — self-contained package.
+SSB64 ROM file injector - self-contained package.
 
 Only external dependency: SSB.py (N64/SSBtbl ROM utilities).
 

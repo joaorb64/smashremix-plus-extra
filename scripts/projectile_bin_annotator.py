@@ -132,7 +132,8 @@ def try_decode_matanim_script(data, off, max_words=64):
             )
             pos += 4
         else:
-            lines.append(f"  0x{pos:04X}: {name:16} flags=0x{flags:03X} payload={payload}")
+            lines.append(
+                f"  0x{pos:04X}: {name:16} flags=0x{flags:03X} payload={payload}")
             pos += 4
         if len(lines) > 40:
             return None
@@ -152,7 +153,8 @@ def annotate_gfx(path, table_offset):
     data = open(path, "rb").read()
     print(f"=== {path} ({len(data)} bytes) ===\n")
 
-    print(f"-- Self-relocation chain (file-table), start=0x{table_offset:04X} --")
+    print(
+        f"-- Self-relocation chain (file-table), start=0x{table_offset:04X} --")
     nodes = walk_chain(data, table_offset)
     for field_addr, next_raw, target_word, target_addr in nodes:
         note = ""
@@ -175,7 +177,8 @@ def annotate_gfx(path, table_offset):
             j += 1
         if len(run) >= 2:
             targets = [n[3] for n in run]
-            diffs = {targets[k + 1] - targets[k] for k in range(len(targets) - 1)}
+            diffs = {targets[k + 1] - targets[k]
+                     for k in range(len(targets) - 1)}
             spacing = diffs.pop() if len(diffs) == 1 else None
             print(f"  fields 0x{run[0][0]:04X}..0x{run[-1][0]:04X} "
                   f"({len(run)} entries) -> targets {[hex(t) for t in targets]}"
@@ -204,13 +207,15 @@ def annotate_gfx(path, table_offset):
     for i in range(16):
         off = pal_off + i * 2
         val = u16(data, off)
-        r, g, b, a = (val >> 11) & 0x1F, (val >> 6) & 0x1F, (val >> 1) & 0x1F, val & 1
-        print(f"    [{i:2}] 0x{val:04X}  R{r*255//31:3} G{g*255//31:3} B{b*255//31:3} A{a}")
+        r, g, b, a = (val >> 11) & 0x1F, (val >>
+                                          6) & 0x1F, (val >> 1) & 0x1F, val & 1
+        print(
+            f"    [{i:2}] 0x{val:04X}  R{r*255//31:3} G{g*255//31:3} B{b*255//31:3} A{a}")
 
 
 def annotate_hitbox(path, reqlist_path=None):
     data = open(path, "rb").read()
-    print(f"=== {path} ({len(data)} bytes) — WPAttributes (src/wp/wptypes.h) ===\n")
+    print(f"=== {path} ({len(data)} bytes) - WPAttributes (src/wp/wptypes.h) ===\n")
 
     labels = []
     if reqlist_path:
@@ -233,9 +238,11 @@ def annotate_hitbox(path, reqlist_path=None):
     visited = {n[0] for n in nodes}
     for off, name in field_names.items():
         if off not in visited:
-            print(f"  0x{off:02X} {name:24} (not part of the chain -- stays NULL/unused)")
+            print(
+                f"  0x{off:02X} {name:24} (not part of the chain -- stays NULL/unused)")
 
-    print("\n-- attack_offsets[2] (Vec3h, joint-relative hitbox positions) @0x10 --")
+    print(
+        "\n-- attack_offsets[2] (Vec3h, joint-relative hitbox positions) @0x10 --")
     for i in range(2):
         off = 0x10 + i * 6
         x = int.from_bytes(data[off:off+2], "big", signed=True)
@@ -279,7 +286,8 @@ def decode_wpattributes_bitfields(data):
     packing, new 32-bit word only on bit overflow, 4 words of real content
     followed by zero padding up to the 64-byte (DMA-aligned) struct size.
     """
-    w = [int.from_bytes(data[0x24 + i * 4:0x28 + i * 4], "big") for i in range(4)]
+    w = [int.from_bytes(data[0x24 + i * 4:0x28 + i * 4], "big")
+         for i in range(4)]
     b = [_bits(x) for x in w]
     out = {}
 
@@ -315,18 +323,21 @@ def decode_wpattributes_bitfields(data):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_gfx = sub.add_parser("gfx", help="Annotate a projectile gfx.bin (palette/anim/sprites/DL)")
+    p_gfx = sub.add_parser(
+        "gfx", help="Annotate a projectile gfx.bin (palette/anim/sprites/DL)")
     p_gfx.add_argument("file")
     p_gfx.add_argument("--table-offset", default="0x58",
-                        help="InternalFileTableOffsetBytes from config.yaml (default: 0x58)")
+                       help="InternalFileTableOffsetBytes from config.yaml (default: 0x58)")
 
-    p_hit = sub.add_parser("hitbox", help="Annotate a projectile hitbox.bin (WPAttributes)")
+    p_hit = sub.add_parser(
+        "hitbox", help="Annotate a projectile hitbox.bin (WPAttributes)")
     p_hit.add_argument("file")
     p_hit.add_argument("--reqlist", default=None,
-                        help="Matching *_hitbox_reqlist.txt, to label pointer targets")
+                       help="Matching *_hitbox_reqlist.txt, to label pointer targets")
 
     args = parser.parse_args()
     if args.cmd == "gfx":

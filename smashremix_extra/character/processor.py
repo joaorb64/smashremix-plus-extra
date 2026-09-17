@@ -11,6 +11,10 @@ from smashremix_extra.constants import (
     PRIMARY_MOVESETS, SHIELD_POSES, TWELVECB_DEFEAT, SP_DUO_POSES, SP_TEAM_POSES, COMMAND_SIZES, ExtraFile,
 )
 from smashremix_extra.image_appender import append_image, get_image_data, ImageMode
+from smashremix_extra.character.gen_datascreen import (
+    generate_name_image, generate_bio_image, generate_works_image,
+    generate_special_image, generate_blank_image,
+)
 from smashremix_extra.file_appender import append_file, get_pointer, update_pointer
 from smashremix_extra.rom_util import get_attrib_offset
 from smashremix_extra.file_manager import FileManager
@@ -40,6 +44,12 @@ class CharacterProcessor:
         self.SWORD_TRAIL_COUNT = sword_trail_count
         self.characters_exist = characters_exist
         self.stage_ids = stage_ids
+
+        # scripts/10F5.bin (data-screen bios) overflows past a fixed
+        # 0x3FFFC-byte ceiling once enough characters are added. Extra
+        # files get created via _get_bio_overflow_path() as needed.
+        self.bio_overflow_paths = []
+        self.bio_overflow_names = []
 
         self.bonus_chars = []
         self.character_defs = []
@@ -157,6 +167,28 @@ class CharacterProcessor:
             if line.startswith("WARNING"):
                 logger.warning(f"{name}: {line}")
         return f"{res.new_head:X}"
+
+    def _get_bio_overflow_path(self, index: int) -> str:
+        """Path for bio overflow file `index` (0-based), creating and
+        registering it on first use."""
+        while len(self.bio_overflow_paths) <= index:
+            n = len(self.bio_overflow_paths) + 1
+            path = f"scripts/10F5_extra{n}.bin"
+            name = f"CHARACTER_BIOS_EXTENDED_EXTRA{n}"
+            stub = bytearray(b"\x00" * 0x18)
+            stub[0x0C:0x10] = b"\xFF\xFF\x00\x00"
+            with open(path, "wb") as f:
+                f.write(bytes(stub))
+            FileManager.add_file(
+                path=path,
+                name=name,
+                internal_file_table_offset=0x0C,
+                internal_file_resource_offset=0x3FFFC,
+                compression_level=2,
+            )
+            self.bio_overflow_paths.append(path)
+            self.bio_overflow_names.append(name)
+        return self.bio_overflow_paths[index]
 
     def process(self, character_folder: str) -> None:
         """Process one character folder and accumulate patch data into self."""
@@ -1152,6 +1184,63 @@ class CharacterProcessor:
         if jab_char == "CAPTAIN":
             jab_char = "FALCON"
 
+        # Generate data screen textures into the build output for characters without pre-drawn PNGs
+        data_screen_cfg = config.get("data_screen", {})
+        if data_screen_cfg:
+            os.makedirs(f"{output_path}/datascreen", exist_ok=True)
+
+            font_big = data_screen_cfg.get(
+                "font_big", "appender/extra_resources/font_big.ttf")
+            font_bio = data_screen_cfg.get(
+                "font_bio", "appender/extra_resources/fonts/bio")
+            font_works = data_screen_cfg.get(
+                "font_works", "appender/extra_resources/fonts/works")
+            font_specials = data_screen_cfg.get(
+                "font_specials", "appender/extra_resources/fonts/movenames")
+
+            display_name = data_screen_cfg.get(
+                "name", config.get("results", {}).get(
+                    "name", character_folder))
+            bio_text = data_screen_cfg.get("bio")
+            works_cfg = data_screen_cfg.get("works")
+            specials_cfg = data_screen_cfg.get("specials", {})
+
+            if not os.path.exists(f"{output_path}/datascreen/name.png"):
+                generate_name_image(
+                    display_name, font_big,
+                    f"{output_path}/datascreen/name.png")
+
+            if bio_text and not os.path.exists(
+                    f"{output_path}/datascreen/bio.png"):
+                generate_bio_image(
+                    bio_text, font_bio, f"{output_path}/datascreen/bio.png")
+
+            if works_cfg and not os.path.exists(
+                    f"{output_path}/datascreen/works.png"):
+                generate_works_image(
+                    works_cfg, font_works,
+                    f"{output_path}/datascreen/works.png")
+
+            for special_name, cfg_key in (
+                ("special_u", "usp"),
+                ("special_n", "nsp"),
+                ("special_d", "dsp"),
+            ):
+                path = f"{output_path}/datascreen/{special_name}.png"
+                move_text = specials_cfg.get(cfg_key)
+                if move_text and not os.path.exists(path):
+                    generate_special_image(move_text, font_specials, path)
+
+            for blank_name, dims in (
+                ("works", (160, 32)),
+                ("special_u", (64, 7)),
+                ("special_n", (64, 7)),
+                ("special_d", (64, 7)),
+            ):
+                path = f"{output_path}/datascreen/{blank_name}.png"
+                if not os.path.exists(path):
+                    generate_blank_image(path, *dims)
+
         # Check for Data screen textures (bio, name, works, specials)
         if os.path.exists(f"{output_path}/datascreen/bio.png"):
             # Bios are stored as three stacked I4 strips (51 + 51 + 13 rows);
@@ -1160,14 +1249,29 @@ class CharacterProcessor:
             pixels, w, h = get_image_data(
                 f"{output_path}/datascreen/bio.png", 160, 115
             )
-            bio_texture = append_image(
-                "scripts/10F5.bin",
-                "scripts/10F5.bin",
-                pixels,
-                w, h,
-                ImageMode.I4,
-            )
-            bio_texture += 0x80000000
+            # 10F5.bin overflows past enough characters - write to
+            # overflow file (flag 0x81, 0x82, ...) instead of 10F5.bin
+            # (flag 0x80).
+            try:
+                bio_texture = append_image(
+                    "scripts/10F5.bin",
+                    "scripts/10F5.bin",
+                    pixels,
+                    w, h,
+                    ImageMode.I4,
+                )
+                bio_texture += 0x80000000
+            except ValueError:
+                index = 0
+                while True:
+                    path = self._get_bio_overflow_path(index)
+                    try:
+                        bio_texture = append_image(
+                            path, path, pixels, w, h, ImageMode.I4)
+                        bio_texture += (0x81 + index) << 24
+                        break
+                    except ValueError:
+                        index += 1
             bio_texture = f"0x{bio_texture:08X}"
 
         if os.path.exists(f"{output_path}/datascreen/name.png"):
