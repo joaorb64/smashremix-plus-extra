@@ -740,8 +740,6 @@ class CharacterProcessor:
             f'add_to_single_player(Character.id.{character_folder.upper()}, {name_texture_sp}, {name_delay_sp})')
 
             # Check for Boss name texture and use if found
-        name_texture_boss_sp = "name_texture.MARIO"
-
         if os.path.exists(f"{output_path}/nameplate_boss.png"):
             pixels, w, h = get_image_data(
                 f"{output_path}/nameplate_boss.png"
@@ -755,8 +753,9 @@ class CharacterProcessor:
             )
             name_texture_boss_sp = f"0x{name_texture_boss_sp:08X}"
 
-        self.singleplayer_boss_name_defs.append(
-            f'constant {character_folder.upper()}_BOSS({name_texture_boss_sp})')
+        if os.path.exists(f"{output_path}/nameplate_boss.png"):
+            self.singleplayer_boss_name_defs.append(
+                f'constant {character_folder.upper()}_BOSS({name_texture_boss_sp})')
 
         # Use alternate width for character's 1P name texture if defined
         alt_name_width = sp_config.get("alt_name_width", None)
@@ -808,8 +807,6 @@ class CharacterProcessor:
         singleplayer_icon = f"progress_icon.{character_folder.upper()}"
 
         # Check for Boss icon and use if found
-        icon_boss_offset = self.sp_icon_default
-
         if os.path.isfile(f"{output_path}/boss_icon.png"):
             pixels, w, h = get_image_data(
                 f"{output_path}/boss_icon.png"
@@ -823,10 +820,11 @@ class CharacterProcessor:
             )
             icon_boss_offset = f"0x{icon_boss_offset:X} + 0x10"
 
-        self.character_boss_icon_defs.append(
-            f"constant {character_folder.upper()}_BOSS({icon_boss_offset})")
+        if os.path.isfile(f"{output_path}/boss_icon.png"):
+            self.character_boss_icon_defs.append(
+                f"constant {character_folder.upper()}_BOSS({icon_boss_offset})")
 
-        singleplayer_boss_icon = f"progress_icon.{character_folder.upper()}_BOSS"
+            singleplayer_boss_icon = f"progress_icon.{character_folder.upper()}_BOSS"
 
         # Remix 1P Character Battle versus parameters
         if config.get("definitions", {}).get("variant_type", "SPECIAL") == "NA":
@@ -881,6 +879,23 @@ class CharacterProcessor:
 
         self.character_1p_team_parameter_defs.append(
             f"add_team_parameters({anim}, {moveset}, {flags}) // {character_folder.upper()}")
+
+        if os.path.exists(f"./{output_path}/1p_p2.bin"):
+            victory_image_bottom = FileManager.add_file(
+                path=f"{output_path}/1p_p2.bin",
+                name=f"{character_folder.upper()}_VICTORY_IMAGE_BOTTOM",
+                internal_file_table_offset=config['singleplayer']['victory_image_bottom_offset'][0],
+                internal_file_resource_offset=config['singleplayer']['victory_image_bottom_offset'][1],
+                compression_level=2
+            )
+
+            victory_image_top = FileManager.add_file(
+                path=f"{output_path}/1p_p1.bin",
+                name=f"{character_folder.upper()}_VICTORY_IMAGE_TOP",
+                internal_file_table_offset=config['singleplayer']['victory_image_top_offset'][0],
+                internal_file_resource_offset=config['singleplayer']['victory_image_top_offset'][1],
+                compression_level=2
+            )
 
         # Get series to use for character
         series_css = config.get("definitions", {}).get(
