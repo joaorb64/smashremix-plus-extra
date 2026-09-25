@@ -49,7 +49,6 @@ xdeltaUI.exe
 rdb.txt
 ini.txt
 scripts/*.bin
-gen_editable_rom.py
 
 *.ram
 *.state1

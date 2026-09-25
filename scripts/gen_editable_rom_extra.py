@@ -24,9 +24,12 @@ import shutil
 import sys
 import tempfile
 
-APPENDER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+APPENDER_DIR = os.path.dirname(SCRIPTS_DIR)
+# smashremix is a submodule, not ours to edit - only used for its
+# roms/build/assembler assets. gen_editable_rom.py and SSB.py live here
+# in appender/scripts/ instead, so they're actually tracked by our repo.
 SMASHREMIX_DIR = os.path.join(APPENDER_DIR, "smashremix")
-SMASHREMIX_SCRIPTS_DIR = os.path.join(SMASHREMIX_DIR, "scripts")
 # character_appender.py builds against the content repo embedding appender/
 # as a submodule (extra_characters/, src/, main.asm, build/ live there).
 CONTENT_ROOT = os.path.dirname(APPENDER_DIR)
@@ -59,11 +62,8 @@ def load_extra_overrides(overrides_path):
 
 
 def find_animation_definitions(character_name, roots):
-    """Same regex scan as gen_editable_rom.get_character_animation_definitions,
-    but over arbitrary root dirs - extra characters declare their
-    Character.edit_action_parameters(...) calls in their own
-    extra_characters/<Name>/main.asm, which gen_editable_rom.py's
-    src/-only scan misses."""
+    """Same scan as gen_editable_rom.get_character_animation_definitions,
+    but also checks extra_characters/<Name>/main.asm, not just src/."""
     animation_entries = []
 
     for root_dir in roots:
@@ -96,6 +96,77 @@ def find_animation_definitions(character_name, roots):
                                 ))
 
     return animation_entries
+
+
+def find_local_action_constants(character_name, roots):
+    """Extra characters can declare custom action IDs in a local
+    `scope Action { constant USP(0x0DC) ... }` block. gen_editable_rom.py's
+    ACTIONS dict doesn't know these, so pull them out here to merge in."""
+    local_actions = {}
+    scope_pattern = re.compile(r'scope\s+Action\s*:?\s*\{(.*?)\n\s*\}', re.DOTALL)
+    const_pattern = re.compile(r'constant\s+(\w+)\((0x[0-9A-Fa-f]+)\)')
+
+    for root_dir in roots:
+        if not os.path.isdir(root_dir):
+            continue
+        for root, _, files in os.walk(root_dir):
+            for file in files:
+                if not file.endswith('.asm'):
+                    continue
+                path = os.path.join(root, file)
+                with open(path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                if f'Character.edit_action_parameters({character_name}' not in content and \
+                        f'Character.edit_menu_action_parameters({character_name}' not in content:
+                    continue
+                for scope_body in scope_pattern.findall(content):
+                    for name, value in const_pattern.findall(scope_body):
+                        local_actions[name] = int(value, 16)
+
+    return local_actions
+
+
+def find_character_moveset_dir(character_name, roots):
+    """Find the extra_characters/<Name>/moveset/ folder for this character,
+    by locating the main.asm that actually declares its actions."""
+    for root_dir in roots:
+        if not os.path.isdir(root_dir):
+            continue
+        for root, _, files in os.walk(root_dir):
+            if 'main.asm' not in files:
+                continue
+            with open(os.path.join(root, 'main.asm'), 'r', encoding='utf-8') as f:
+                content = f.read()
+            if f'Character.edit_action_parameters({character_name}' in content:
+                moveset_dir = os.path.join(root, 'moveset')
+                if os.path.isdir(moveset_dir):
+                    return moveset_dir
+    return None
+
+
+def find_special_part_forms(moveset_dir):
+    """Scans every moveset/*.bin for "Set Model Form" commands (event 40)
+    and collects every (bone_id, form) pair found, in order. Just a
+    fixed-4-byte scan, not a real disassembler - good enough since we only
+    need to know which bones/forms exist."""
+    seen = set()
+    pairs = []
+    for name in sorted(os.listdir(moveset_dir)):
+        if not name.lower().endswith('.bin'):
+            continue
+        with open(os.path.join(moveset_dir, name), 'rb') as f:
+            data = f.read()
+        for i in range(0, len(data) - 3, 4):
+            word = int.from_bytes(data[i:i+4], 'big')
+            if (word >> 26) & 0x3F != 40:  # nFTMotionEventSetModelPartID
+                continue
+            bone_id = (word >> 19) & 0x7F
+            form = word & 0x7FFFF
+            pair = (bone_id, form)
+            if pair not in seen:
+                seen.add(pair)
+                pairs.append(pair)
+    return pairs
 
 
 def main():
@@ -141,7 +212,8 @@ def main():
         os.symlink(os.path.join(SMASHREMIX_DIR, "roms"),
                    os.path.join(workdir, "roms"))
 
-        sys.path.insert(0, SMASHREMIX_SCRIPTS_DIR)
+        sys.path.insert(0, SCRIPTS_DIR)  # gen_editable_rom.py
+        sys.path.insert(0, APPENDER_DIR)  # SSB.py, which it imports
         os.chdir(workdir)
 
         import gen_editable_rom as ger
@@ -168,11 +240,17 @@ def main():
             if own_shield_name in overrides:
                 ergen.character['file_shield'] = f"File.{own_shield_name}"
 
+        animation_roots = [os.path.join(workdir, "src"),
+                          os.path.join(CONTENT_ROOT, "extra_characters")]
         ergen.get_character_animation_definitions = lambda: find_animation_definitions(
-            ergen.character["name"],
-            [os.path.join(workdir, "src"),
-             os.path.join(CONTENT_ROOT, "extra_characters")]
+            ergen.character["name"], animation_roots
         )
+
+        # Merge in this character's own local scope-Action constants (custom
+        # action IDs like USP/TORNADO_START >= 0xDC) so create_rom() can
+        # resolve them instead of treating them as unrecognized names.
+        ger.ACTIONS.update(find_local_action_constants(
+            ergen.character["name"], animation_roots))
 
         try:
             ergen.create_rom()
@@ -191,17 +269,26 @@ def main():
 
         # Recompute internal_file_table_offset for every injected animation
         # and re-inject any that are wrong.
-        sys.path.insert(0, APPENDER_DIR)
         from smashremix_extra.injector.injector import ROMInjector
 
         fixups = []
         for file_name, action_name, _flags, func in ergen.get_character_animation_definitions():
-            action_id = ger.ACTIONS[action_name] if action_name in ger.ACTIONS else int(
-                action_name, 16)
-            if action_id >= 0xDC:
+            if func == 'edit_menu_action_parameters':
+                # create_rom() leaves these untouched (overwriting them
+                # crashes character select in Training mode), so there's
+                # nothing here to offset-correct either.
                 continue
+            if action_name in ger.ACTIONS:
+                action_id = ger.ACTIONS[action_name]
+            else:
+                try:
+                    action_id = int(action_name, 16)
+                except ValueError:
+                    # Action name that doesn't resolve to a vanilla action ID,
+                    # a locally-declared custom action ID, or a raw hex ID.
+                    continue
             action_file = ergen.get_action_animation_file(action_id, func)
-            if not action_file:
+            if not action_file or action_file > 0x853:
                 continue
             data = ergen.entries[ger.FILES[file_name]].extract('data')
             correct_offset = leading_zero_word_offset(data)
@@ -226,6 +313,27 @@ def main():
                     print(f"  {line}")
                 injector.save(on_progress=print)
                 ger.run_windows_command(f"assembler/rn64crc.exe -u {generated}")
+
+        # Report (don't inject) the "Set Model Form" commands this
+        # character's special parts need - every attempt to inject these
+        # into file 0xE8 automatically has crashed GE on load for reasons
+        # that weren't pinned down, so this is left as a manual step: add
+        # these to Jab1 (or wherever) yourself in GE.
+        moveset_dir = find_character_moveset_dir(
+            ergen.character["name"], animation_roots)
+        part_forms = find_special_part_forms(
+            moveset_dir) if moveset_dir else []
+        # 0x7FFFF is the 19-bit "-1"/default-form sentinel - not a real
+        # form to set, so it's not worth listing.
+        part_forms = sorted(
+            (pf for pf in part_forms if pf[1] != 0x7FFFF))
+
+        if part_forms:
+            print(
+                f"\n{len(part_forms)} Set Model Form command(s) to add manually in GE "
+                f"for {ergen.character['name']}'s special parts:")
+            for bone_id, form in part_forms:
+                print(f"  bone {bone_id}, form {form}")
 
         shutil.move(generated, output_path)
     finally:
