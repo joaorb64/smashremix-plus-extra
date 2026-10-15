@@ -1,0 +1,5 @@
+name: "Fight with Seymour"
+random_tournament_profile: "OS.TRUE"
+random_netplay_profile: "OS.TRUE"
+can_toggle: "OS.TRUE"
+has_title: "OS.TRUE"

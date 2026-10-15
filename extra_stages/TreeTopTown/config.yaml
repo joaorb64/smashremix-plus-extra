@@ -14,9 +14,9 @@ offsets:
 
 music:
   main: "DKC_TREETOP_ROCK"
-  occasional: "DKCTITLE"
-  rare: "DKC2_HOT_HEAD_BOP"
-  rare2: -1
+  occasional: "DKC2_HOT_HEAD_BOP"
+  rare: "DK64_JUNGLEJAPES64"
+  rare2: "DKJR_DK_JR_STAGE"
 
 spawn_locations:
   default:

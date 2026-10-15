@@ -15,7 +15,7 @@ music:
   main: "SONICADVENTURE2_RADICAL_HIGHWAY"
   occasional: "LIVE_AND_LEARN"
   rare: "SONICADVENTURE_SYMBOL_OF_THRILL"
-  rare2: -1
+  rare2: "SHADOW_IAMALLOFME"
 
 spawn_locations:
   default:

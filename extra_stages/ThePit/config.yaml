@@ -3,6 +3,8 @@ name: "The Pit"
 
 training_background: SECTOR_Z
 
+hazard_type: "HAZARDS" # Options: NONE, HAZARDS, MOVEMENT, BOTH
+
 offsets:
   header: ["0098", "0014"]
   stage: ["7244", "3FFFC"]
