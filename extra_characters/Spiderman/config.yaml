@@ -9,6 +9,11 @@ definitions:
 
 name: "Spider-Man"
 
+charge_smash_frames:
+  up: 2
+  forward: 20
+  down: 2
+
 results:
   name: "Spider-Man"
   name_scale: 0.65
