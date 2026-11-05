@@ -397,6 +397,194 @@ def _complement(ranges, n):
     return out
 
 
+# ---------------------------------------------------------------- splice editor
+Splice = namedtuple("Splice", "off cut data ptrs claim")
+Splice.__new__.__defaults__ = ((), None)
+Splice.__doc__ = """Replace ``d[off:off+cut]`` with ``data`` (bytes).
+
+``ptrs``  [(rel, old_target)]: the 4-byte words at ``data[rel:]`` are pointers
+          to ``old_target`` (an offset in the ORIGINAL file).  They become
+          fixup-chain nodes in the output.
+``claim`` what happens to pointers aimed exactly at ``off``.  True: they move to
+          the start of the new bytes (the new bytes take the old ones' place).
+          False: they keep following the original byte at ``off`` (it moves
+          down past the new bytes).  None (default) = ``cut > 0``.
+``cut`` and ``len(data)`` must be multiples of 8, so every later texture /
+vertex block keeps its 8-byte alignment."""
+
+SpliceResult = namedtuple(
+    "SpliceResult", "data new_head remap new_len old_len report")
+
+
+def splice(d, head, splices):
+    """Insert / delete / replace bytes anywhere in a GE self-relocating .bin and
+    rebuild the fixup chain from scratch.
+
+    Every pointer in the file is a chain node (field -> target), so an edit is:
+    splice the bytes, send every field and target through the old->new offset
+    map, add the new pointers the splices bring in, then re-thread one chain in
+    ascending field order (what GE emits).  Nodes whose field was cut out are
+    dropped; a node whose TARGET was cut out is an error (something still
+    points at bytes the edit removes).
+
+    Returns SpliceResult; ``remap(x)`` maps an original offset (treated as a
+    pointer target) to the new file, or None if it was cut.  Use it to repoint
+    anything outside the file (hitbox footers, ...).
+    """
+    d = bytes(d)
+    n = len(d)
+    sp = []
+    for s in splices:
+        s = Splice(s.off, s.cut, bytes(s.data), tuple(s.ptrs),
+                   (s.cut > 0) if s.claim is None else bool(s.claim))
+        if s.off % 8 or s.cut % 8 or len(s.data) % 8:
+            raise ValueError(f"splice @0x{s.off:X}: offset, cut ({s.cut}) and "
+                             f"data ({len(s.data)}) must be multiples of 8")
+        if not (0 <= s.off <= s.off + s.cut <= n):
+            raise ValueError(f"splice @0x{s.off:X}+{s.cut} outside the file")
+        sp.append(s)
+    sp.sort(key=lambda s: (s.off, s.cut))
+
+    # merge pure inserts at the same spot (same claim) in the given order
+    merged = []
+    for s in sp:
+        p = merged[-1] if merged else None
+        if (p and p.cut == 0 and s.cut == 0 and p.off == s.off
+                and p.claim == s.claim):
+            ptrs = p.ptrs + tuple((r + len(p.data), t) for r, t in s.ptrs)
+            merged[-1] = Splice(p.off, 0, p.data + s.data, ptrs, p.claim)
+            continue
+        if p and (p.off + p.cut > s.off or (p.off == s.off and p.cut == s.cut)):
+            raise ValueError(f"edits overlap at 0x{p.off:X} / 0x{s.off:X}")
+        merged.append(s)
+    sp = merged
+
+    def remap(x, target=True):
+        shift = 0
+        for s in sp:
+            if x < s.off:
+                break
+            if x == s.off and s.claim and target:
+                return s.off + shift
+            if x < s.off + s.cut:
+                return None
+            shift += len(s.data) - s.cut
+        return x + shift
+
+    out, prev, new_ptrs = bytearray(), 0, []
+    for s in sp:
+        out += d[prev:s.off]
+        start = len(out)
+        out += s.data
+        new_ptrs += [(start + rel, t) for rel, t in s.ptrs]
+        prev = s.off + s.cut
+    out += d[prev:]
+    new_len = len(out)
+
+    nodes = walk_chain(d, head)
+    links, dropped = [], 0
+    for nd in nodes:
+        f = remap(nd.field, target=False)
+        if f is None:
+            dropped += 1
+            continue
+        t = remap(nd.target)
+        if t is None:
+            raise ValueError(
+                f"pointer @0x{nd.field:X} -> 0x{nd.target:X} aims inside bytes "
+                f"an edit removes")
+        links.append((f, t))
+    for f, old_t in new_ptrs:
+        t = remap(old_t)
+        if t is None or not (0 <= old_t < n):
+            raise ValueError(f"new pointer -> 0x{old_t:X} has no target in "
+                             f"the edited file")
+        links.append((f, t))
+
+    links.sort()
+    for i, (f, t) in enumerate(links):
+        if f % 4 or t % 4 or f >= CHAIN_END or t >= CHAIN_END:
+            raise ValueError(f"pointer @0x{f:X} -> 0x{t:X} not encodable "
+                             f"(must be 4-aligned and below 0x3FFFC)")
+        if i and links[i - 1][0] == f:
+            raise ValueError(f"two pointers share field 0x{f:X}")
+    for i, (f, t) in enumerate(links):
+        nxt = (links[i + 1][0] // 4) if i + 1 < len(links) else 0xFFFF
+        struct.pack_into(">HH", out, f, nxt, t // 4)
+    new_head = links[0][0] if links else CHAIN_END
+
+    v = walk_chain(out, new_head) if links else []
+    assert len(v) == len(links), \
+        f"rebuilt chain visits {len(v)} of {len(links)} nodes"
+    assert all(0 <= nd.target < new_len for nd in v), "rebuilt chain OOB"
+
+    report = [f"chain head 0x{head:X} -> 0x{new_head:X}, {len(nodes)} -> "
+              f"{len(links)} pointers ({dropped} cut, {len(new_ptrs)} added), "
+              f"{n} -> {new_len} bytes"]
+    for s in sp:
+        report.append(f"  @0x{s.off:X}: -{s.cut} +{len(s.data)} bytes")
+    return SpliceResult(bytes(out), new_head, remap, new_len, n, report)
+
+
+# ---------------------------------------------------------- display-list edits
+DList = namedtuple("DList", "start entry list_id cmds")   # cmds [(off, w0, w1)]
+
+
+def dobjdesc_entries(d, first):
+    """Offsets of the 0x2C-byte DObjDesc entries from ``first`` up to the
+    id == 0x12 terminator."""
+    out, e = [], first
+    while e + 4 <= len(d) and u32(d, e) != 0x12 and len(out) < 64:
+        out.append(e)
+        e += 0x2C
+    return out
+
+
+def read_dl(d, start, limit=4096):
+    """[(off, w0, w1)] from ``start`` through its G_ENDDL (0xDF)."""
+    cmds, o = [], start
+    while o + 8 <= len(d) and len(cmds) < limit:
+        w0, w1 = u32(d, o), u32(d, o + 4)
+        cmds.append((o, w0, w1))
+        if w0 >> 24 == 0xDF:
+            return cmds
+        o += 8
+    raise ValueError(f"DL @0x{start:X} has no G_ENDDL")
+
+
+def find_display_lists(d, head, roots):
+    """Top-level display lists of the DObjDesc lists whose first entries are
+    ``roots``.  An entry's dl is either a plain Gfx list (list_id None) or a
+    DObjDLLink array ``{u32 list_id; Gfx *dl}`` ended by list_id 4.  G_DL calls
+    into the file are followed (same entry/list).  Deduped, file order."""
+    tgt = {nd.field: nd.target for nd in walk_chain(d, head)}
+    out, seen = [], set()
+
+    def add(start, entry, lid):
+        if start in seen:
+            return
+        seen.add(start)
+        dl = DList(start, entry, lid, read_dl(d, start))
+        out.append(dl)
+        for off, w0, _ in dl.cmds:          # G_DL into this file
+            if w0 >> 24 == 0xDE and off + 4 in tgt:
+                add(tgt[off + 4], entry, lid)
+
+    for r in roots:
+        for idx, e in enumerate(dobjdesc_entries(d, r)):
+            p = tgt.get(e + 4)
+            if p is None:
+                continue
+            if u32(d, p) <= 4 and (p + 4 in tgt or u32(d, p) == 4):
+                while p + 8 <= len(d) and u32(d, p) != 4:
+                    if p + 4 in tgt:
+                        add(tgt[p + 4], idx, u32(d, p))
+                    p += 8
+            else:
+                add(p, idx, None)
+    return sorted(out, key=lambda x: x.start)
+
+
 # -------------------------------------------------- old <-> new offset matching
 def chain_breakpoints(old_d, old_head, new_d, new_head):
     """Pair the two files' fixup chains 1:1 in chain order and return

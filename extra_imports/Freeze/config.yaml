@@ -1,0 +1,17 @@
+# Data for Freeze.asm (frozen state)
+
+# Ice block shown around frozen fighters (billboard), colored from Freeze.BLOCK_DARK_COLOR (dark) to Freeze.BLOCK_COLOR (bright).
+# ia8 = 4-bit intensity + 4-bit alpha, up to 64x64 (rgba32 is up to 32x32).
+# in_file: kept in a file loaded at the start of every battle instead of always in RAM.
+textures:
+  ice_block:
+    file: ice64.png
+    format: ia8
+    in_file: true
+
+# sounds/<name>.aifc (or .wav, converted at build time)
+sounds:
+  # se_common_freeze from Smash Ultimate: freezing, hits while frozen and the ice breaking
+  ice_hit:
+    fgm_type: VOICE
+    sample_rate: 32000

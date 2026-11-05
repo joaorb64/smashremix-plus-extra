@@ -328,6 +328,28 @@ class StageProcessor:
         return data
 
     @staticmethod
+    def _repoint_footer(footer_path, remap, name, footer_name, why):
+        """Point a <name>_hitbox.bin footer's chain nodes (DObjDesc,
+        p_mobjsubs) at their new offsets after the model was rewritten.
+        `remap(old) -> new | None`."""
+        from smashremix_extra import ge_bin
+
+        if not (footer_path and os.path.exists(footer_path)):
+            return
+        fb = bytearray(open(footer_path, "rb").read())
+        fr = ge_bin.footer_roots(bytes(fb))
+        for node, old in ((fr.dd_node, fr.dobjdesc),
+                          (fr.pm_node, fr.pmobjsubs)):
+            if node is None:
+                continue
+            new = remap(old)
+            if new is None:
+                raise ValueError(
+                    f"{name}: {footer_name} points at 0x{old:X}, which {why}")
+            ge_bin.w16(fb, node + 2, new // 4)
+        open(footer_path, "wb").write(fb)
+
+    @staticmethod
     def _trim_ge_model(output_path, name, tbl_off, trim, footer_name):
         """Mark-and-sweep <output_path>/<name>.bin (a GoldEditor self-relocating
         model) down to the regions reachable from its roots, in place.
@@ -356,20 +378,9 @@ class StageProcessor:
         res = ge_bin.gc(d0, roots, head=head)
         open(model_path, "wb").write(res.data)
 
-        if footer_path and os.path.exists(footer_path):
-            fb = bytearray(open(footer_path, "rb").read())
-            fr = ge_bin.footer_roots(bytes(fb))
-            for node, old in ((fr.dd_node, fr.dobjdesc),
-                              (fr.pm_node, fr.pmobjsubs)):
-                if node is None:
-                    continue
-                new = res.remap.get(old)
-                if new is None:
-                    raise ValueError(
-                        f"{name}: {footer_name} points at 0x{old:X}, which the "
-                        f"trim dropped - add it as an explicit trim root")
-                ge_bin.w16(fb, node + 2, new // 4)
-            open(footer_path, "wb").write(fb)
+        StageProcessor._repoint_footer(
+            footer_path, res.remap.get, name, footer_name,
+            "the trim dropped - add it as an explicit trim root")
 
         saved = res.old_len - res.new_len
         pct = 100 * saved / res.old_len if res.old_len else 0.0

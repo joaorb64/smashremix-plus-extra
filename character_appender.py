@@ -17,6 +17,7 @@ from smashremix_extra import file_manager
 from smashremix_extra.character.processor import CharacterProcessor
 from smashremix_extra.character.bio_overflow import apply_bio_overflow_patches, write_bio_overflow_asm
 from smashremix_extra.stage.processor import StageProcessor
+from smashremix_extra.extra_import.processor import ExtraImportProcessor, EXTRA_IMPORTS_ASM
 from smashremix_extra.audio.processor import AudioProcessor
 from smashremix_extra.injector import ROMInjector, MODIFIED_FILES
 
@@ -134,6 +135,7 @@ class CharacterAppender:
             stage_ids=self._collect_stage_ids(),
         )
         self.stage_proc = StageProcessor()
+        self.import_proc = ExtraImportProcessor()
 
         # Delete the build folder if it exists and create a new one
         if os.path.exists("build"):
@@ -187,6 +189,11 @@ class CharacterAppender:
 
         for stage_folder in self.stage_folders:
             self._process_stage(stage_folder)
+
+        # Extra imports' files and sounds (extra_imports/<Name>/config.yaml).
+        # Their sound ids continue after the stage sounds.
+        self.import_proc.LAST_SFX_ID = self.stage_proc.LAST_SFX_ID
+        self.import_proc.process_all()
 
     def _process_character(self, character_folder):
         self.char_proc.process(character_folder)
@@ -714,12 +721,13 @@ class CharacterAppender:
 
         self.audio_proc.patch_bgm_asm()
 
-        # FGM.asm - character sounds first, then stage sounds (matches the order
-        # LAST_SFX_ID was advanced, so the generated FGM ids stay correct).
+        # FGM.asm - character sounds, then stage sounds, then extra import sounds
+        # (matches the order LAST_SFX_ID was advanced, so the generated FGM ids stay correct).
         lineinfile.add_line_to_file(
             filepath="src/FGM.asm",
             line="\t"+"\n\t".join(
-                self.char_proc.sound_add_list + self.stage_proc.sound_add_list),
+                self.char_proc.sound_add_list + self.stage_proc.sound_add_list +
+                self.import_proc.sound_add_list),
             inserter=lineinfile.AfterLast(
                 r"^\s*(add_sound|add_fgm|add_sound_advanced)\(.*")
         )
@@ -1638,16 +1646,35 @@ class CharacterAppender:
             inserter=lineinfile.BeforeFirst(r"\/\/ KIRBY")
         )
 
-        # Insert extra imports in main asm before characters start (before "// METAL MARIO")
-        extra_imports = os.listdir("./extra_imports/")
-        extra_imports = [ei for ei in extra_imports if ei.endswith(".asm")]
+        # Insert extra imports in main asm before characters start (before "// METAL MARIO").
+        # An import with a data folder (extra_imports/<Name>/config.yaml) gets its
+        # generated FILES/FGM scope included right before it.
+        extra_import_includes = [f'include "{EXTRA_IMPORTS_ASM}"']
+        for ei, ei_folder in ExtraImportProcessor.list_imports().items():
+            if ei in self.import_proc.generated:
+                extra_import_includes.append(
+                    f'include "build/extra_imports/{ei}/generated.asm"')
+            ei_path = os.path.join(ei_folder, f"{ei}.asm").replace("\\", "/")
+            extra_import_includes.append(f'include "{ei_path}"')
 
         lineinfile.add_line_to_file(
             filepath="main.asm",
-            line="// Extra imports\n"+"\n".join(
-                [f"include \"extra_imports/{ei}\"" for ei in extra_imports])+"\n",
+            line="// Extra imports\n"+"\n".join(extra_import_includes)+"\n",
             inserter=lineinfile.BeforeFirst(r"\/\/ METAL MARIO")
         )
+
+        # Load extra imports' files at the start of every battle
+        with open("src/Render.asm", 'r', encoding='utf-8') as f:
+            render = f.read()
+        for label in ["_1p", "_multiman", "_vs", "_training", "_bonus"]:
+            anchor = f"\n        {label}:\n"
+            if anchor not in render:
+                raise RuntimeError(f"Render.asm: battle setup label {label} not found")
+            render = render.replace(
+                anchor,
+                anchor + "        jal     ExtraImports.load_files_ // load extra imports' files\n        nop\n", 1)
+        with open("src/Render.asm", 'w', encoding='utf-8') as f:
+            f.write(render)
 
         # Add CSS debug menu toggles
         css_toggles = [i for i in os.listdir(

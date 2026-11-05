@@ -35,7 +35,8 @@ def _render_name_line(text, font, cap, max_width):
 def _render_name(lines, font_path, cap, max_width):
     # Size the font so capitals are `cap` pixels tall
     h_bbox = ImageFont.truetype(font_path, 100).getbbox("H")
-    font = ImageFont.truetype(font_path, round(cap * 100 / (h_bbox[3] - h_bbox[1])))
+    font = ImageFont.truetype(font_path, round(
+        cap * 100 / (h_bbox[3] - h_bbox[1])))
     rendered = [_render_name_line(l, font, cap, max_width) for l in lines]
 
     pitch = round((NAME_MAX_HEIGHT - NAME_CAP_HEIGHT) * cap / NAME_CAP_HEIGHT)
@@ -116,17 +117,14 @@ def generate_works_image(entries, font_path, output_file,
                          width=160, height=32, slots=3,
                          text_x=4, bullet_x=0, bullet_y0=3, text_y0=0,
                          space_width=1,
-                         platform_box_x0=124, platform_box_x1=149,
-                         fallback_font_path="appender/extra_resources/fonts/bio"):
+                         platform_box_x0=124, platform_box_x1=149):
     """Up to `slots` entries, space-distributed vertically like the vanilla
     works screen. Each entry ({"game", "platform"}) is a bullet + game name
-    left-aligned, "(platform)" right-aligned in a fixed box. A game name
-    too wide for the worksfont falls back to the narrower bio font."""
+    left-aligned, "(platform)" right-aligned in a fixed box. A game name too
+    wide for the font is scaled down to fit; see [[datascreen-image-autogen]]."""
     image = Image.new("RGBA", (width, height), (0, 0, 0, 255))
     draw = ImageDraw.Draw(image)
     font = BitmapFont(font_path, space_width=space_width, letter_spacing=1)
-    fallback_font = BitmapFont(
-        fallback_font_path, space_width=space_width, letter_spacing=1)
 
     # Fewer than `slots` entries space out like CSS "space-around": n rows
     # of row_height plus n+1 equal gaps fill the image height.
@@ -150,11 +148,23 @@ def generate_works_image(entries, font_path, output_file,
 
         draw_y = text_y
 
-        # Fall back to the narrower bio font instead of overlapping the box.
-        game_font = font
-        if font.text_width(entry["game"]) > available_w:
-            game_font = fallback_font
-        game_font.draw(image, entry["game"], text_x, draw_y)
+        # A game name too wide for the font is rendered at natural size
+        # then scaled down to fit (BOX: crisper than bilinear/lanczos,
+        # doesn't collapse letters like 'm' the way a bigger NEAREST
+        # correction did) - this is actually how vanilla's own
+        # "condensed" rows work (not a distinct font).
+        game = entry["game"]
+        natural_w = font.text_width(game)
+        if natural_w > available_w:
+            scratch = Image.new(
+                "RGBA", (natural_w + text_x, font.line_height),
+                (0, 0, 0, 0))
+            font.draw(scratch, game, text_x, 0)
+            fitted = scratch.resize(
+                (text_x + available_w, font.line_height), Image.BOX)
+            image.alpha_composite(fitted, (0, draw_y))
+        else:
+            font.draw(image, game, text_x, draw_y)
 
         # Draw the platform name in a fixed position
         open_w = font.char_width("(")
@@ -173,8 +183,9 @@ def generate_works_image(entries, font_path, output_file,
                 cx += cw + gap
         else:
             # Too wide even at zero gap - squeeze to fit
+            natural_w = font.text_width(platform)
             scratch = Image.new(
-                "RGBA", (text_w, font.line_height), (0, 0, 0, 0))
+                "RGBA", (natural_w, font.line_height), (255, 255, 255, 0))
             font.draw(scratch, platform, 0, 0)
             scratch = scratch.resize(
                 (inner_w, font.line_height), Image.BILINEAR)
@@ -196,7 +207,7 @@ def generate_special_image(text, font_path, output_file,
     if text_w <= available_w:
         font.draw(image, text, margin, 0)
     else:
-        scratch = Image.new("RGBA", (text_w, height), (0, 0, 0, 0))
+        scratch = Image.new("RGBA", (text_w, height), (255, 255, 255, 0))
         font.draw(scratch, text, 0, 0)
         scratch = scratch.resize((available_w, height), Image.LANCZOS)
         image.alpha_composite(scratch, (margin, 0))
