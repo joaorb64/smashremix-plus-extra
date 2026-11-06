@@ -16,6 +16,10 @@ from smashremix_extra.character.gen_datascreen import (
     generate_special_image, generate_blank_image,
 )
 from smashremix_extra.character.gen_victory_image import generate_victory_images
+from smashremix_extra.character.gen_nameplate import (
+    generate_1p_name_image, generate_css_nameplate,
+    DEFAULT_1P_FONT, DEFAULT_CSS_FONT,
+)
 from smashremix_extra.file_appender import append_file, get_pointer, update_pointer
 from smashremix_extra.rom_util import get_attrib_offset
 from smashremix_extra.file_manager import FileManager
@@ -614,6 +618,46 @@ class CharacterProcessor:
         skin_number = config.get("num_costumes", 8)
         self.character_skins.append(skin_number)
 
+        # Generate nameplate textures from text for any character without a
+        # hand-made PNG. Optional `nameplate:` keys (`nameplate: false`
+        # turns generation off and falls back to the default textures):
+        #   css / singleplayer: text to render, or false to skip
+        #     (both default to results.name, then name)
+        #   boss: text for nameplate_boss.png (only generated if set)
+        #   css_font / singleplayer_font: font file paths
+        #   singleplayer_max_width: 1P names wider than this get squeezed
+        #     (default 120; CSS names always squeeze to fit the 72px plate)
+        nameplate_cfg = config.get("nameplate", {})
+        generated_1p_width = None
+        if nameplate_cfg is not False:
+            nameplate_cfg = nameplate_cfg or {}
+            default_text = config.get("results", {}).get(
+                "name", character_name)
+
+            css_text = nameplate_cfg.get("css", default_text)
+            if css_text and not os.path.isfile(
+                    f"{output_path}/nameplate.png"):
+                generate_css_nameplate(
+                    css_text, f"{output_path}/nameplate.png",
+                    nameplate_cfg.get("css_font", DEFAULT_CSS_FONT))
+
+            sp_text = nameplate_cfg.get("singleplayer", default_text)
+            if sp_text and not os.path.isfile(
+                    f"{output_path}/nameplate_singleplayer.png"):
+                generated_1p_width = generate_1p_name_image(
+                    sp_text, f"{output_path}/nameplate_singleplayer.png",
+                    nameplate_cfg.get("singleplayer_font", DEFAULT_1P_FONT),
+                    max_width=nameplate_cfg.get("singleplayer_max_width", 120))
+
+            # Boss nameplate is optional, so only made when text is given
+            boss_text = nameplate_cfg.get("boss")
+            if boss_text and not os.path.isfile(
+                    f"{output_path}/nameplate_boss.png"):
+                generate_1p_name_image(
+                    boss_text, f"{output_path}/nameplate_boss.png",
+                    nameplate_cfg.get("singleplayer_font", DEFAULT_1P_FONT),
+                    max_width=nameplate_cfg.get("singleplayer_max_width", 120))
+
         # Character select name texture
         name_texture = self.name_texture_default
 
@@ -774,6 +818,11 @@ class CharacterProcessor:
         # Use alternate width for character's 1P name texture if defined
         alt_name_width = sp_config.get(
             "alt_name_width", None)
+        # Generated 1P names are padded to a multiple of 8 wide; tell the
+        # game the visible width so it lays out like a vanilla name.
+        if alt_name_width is None and generated_1p_width is not None \
+                and generated_1p_width % 8:
+            alt_name_width = generated_1p_width
         alt_name_width_team = sp_config.get(
             "alt_name_width_team", alt_name_width)
         alt_name_width_giant = sp_config.get(
