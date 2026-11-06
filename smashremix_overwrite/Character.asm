@@ -3652,7 +3652,7 @@ scope Character {
     db Stages.id.BTT_PIKACHU             // PIKACHU
     db Stages.id.BTT_JIGGLYPUFF          // JIGGLYPUFF
     db Stages.id.BTT_NESS                // NESS
-    db 0xFF                              // MASTERHAND
+    db Stages.id.BTT_STG1                // MASTERHAND
     db Stages.id.BTT_MARIO               // METAL MARIO
     db Stages.id.BTT_STG1            // NMARIO
     db Stages.id.BTT_STG1            // NFOX
@@ -3686,7 +3686,7 @@ scope Character {
     db Stages.id.BTP_PIKACHU             // PIKACHU
     db Stages.id.BTP_JIGGLYPUFF          // JIGGLYPUFF
     db Stages.id.BTP_NESS                // NESS
-    db 0xFF                              // MASTERHAND
+    db Stages.id.BTP_POLY                // MASTERHAND
     db Stages.id.BTP_MARIO               // METAL MARIO
     db Stages.id.BTP_POLY                // NMARIO
     db Stages.id.BTP_POLY                // NFOX
@@ -3723,7 +3723,7 @@ scope Character {
     db Stages.id.BTT_SAMUS               // PIKACHU
     db Stages.id.BTT_FOX                 // JIGGLYPUFF
     db Stages.id.BTT_YL                  // NESS
-    db 0xFF                              // MASTERHAND
+    db Stages.id.BTT_STG1                // MASTERHAND
     db Stages.id.BTT_MARIO               // METAL MARIO
     db Stages.id.BTT_STG1            // NMARIO
     db Stages.id.BTT_STG1            // NFOX
@@ -3757,7 +3757,7 @@ scope Character {
     db Stages.id.BTP_NESS                // PIKACHU
     db Stages.id.BTP_WARIO               // JIGGLYPUFF
     db Stages.id.BTP_PIKACHU             // NESS
-    db 0xFF                              // MASTERHAND
+    db Stages.id.BTP_POLY                // MASTERHAND
     db Stages.id.BTP_BOWSER              // METAL MARIO
     db Stages.id.BTP_POLY                // NMARIO
     db Stages.id.BTP_POLY                // NFOX
