@@ -13,8 +13,14 @@ definitions:
 
 dk_cargo: true
 
-name: "DK Ultimate" 
+name: "DK Ultimate"
+
 num_costumes: 5
+
+charge_smash_frames:
+  up: 7
+  forward: 15
+  down: 3
 
 results:
   name: "DK ULT"
