@@ -1,4 +1,0 @@
-${usp_gfx}
-${usp_gfx}
-${usp_gfx}
-END OF REQ LIST
