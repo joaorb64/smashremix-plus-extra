@@ -5052,27 +5052,140 @@ scope AI {
                 // f26 = my X
                 // f28 = my Y
 
+                // Chase lead: the CPU moves towards this position, which is where the target is right now.
+                // When the target is launched, the CPU always arrives late, so juggles and up air chains
+                // fall apart. While the target is in hitstun, move it to where they'll be in LEAD_FRAMES
+                // frames: movement + knockback (losing 1.7/frame, same as fix_movement_prediction) +
+                // gravity, without going below the ground under them. The clamps below still apply.
+                // s0 = target fp. Only uses at, t2, t3, f0-f10, f14-f18 (v1 must be kept).
+                scope chase_lead: {
+                    constant LEAD_FRAMES(10)
+                    constant KB_DECAY(0x3FD9999A) // 1.7
+
+                    lw      t2, 0x0024(s0)      // t2 = target action
+                    sltiu   at, t2, Action.DamageHigh1
+                    bnez    at, _end            // not in hitstun
+                    sltiu   at, t2, Action.DamageFlyRoll + 1
+                    beqz    at, _end            // not in hitstun
+                    nop
+
+                    lwc1    f6, 0x0048(s0)      // f6 = vel_air.x
+                    lwc1    f8, 0x004C(s0)      // f8 = vel_air.y
+                    lwc1    f10, 0x0054(s0)     // f10 = vel_damage_air.x
+                    lwc1    f14, 0x0058(s0)     // f14 = vel_damage_air.y
+                    lw      t2, 0x09C8(s0)      // t2 = target attributes
+                    lwc1    f0, 0x0058(t2)      // f0 = gravity
+                    lwc1    f2, 0x005C(t2)      // f2 = max fall speed
+                    neg.s   f2, f2              // f2 = -max fall speed
+                    li      at, KB_DECAY
+                    mtc1    at, f18             // f18 = 1.7
+
+                    // f16 = knockback speed, f10/f14 = knockback direction (unit vector)
+                    mul.s   f16, f10, f10
+                    mul.s   f4, f14, f14
+                    add.s   f16, f16, f4
+                    sqrt.s  f16, f16
+                    c.le.s  f16, f18
+                    nop
+                    bc1tl   _simulate           // small or no knockback: ignore it
+                    mtc1    r0, f16
+                    div.s   f10, f10, f16
+                    div.s   f14, f14, f16
+
+                    _simulate:
+                    lli     t2, LEAD_FRAMES
+                    _loop:
+                    add.s   f20, f20, f6        // x += vel_air.x
+                    mul.s   f4, f10, f16
+                    add.s   f20, f20, f4        // x += knockback x
+                    add.s   f22, f22, f8        // y += vel_air.y
+                    mul.s   f4, f14, f16
+                    add.s   f22, f22, f4        // y += knockback y
+
+                    sub.s   f16, f16, f18       // knockback speed -= 1.7
+                    mtc1    r0, f4
+                    c.lt.s  f16, f4
+                    nop
+                    bc1tl   _gravity
+                    mtc1    r0, f16             // knockback is over
+
+                    _gravity:
+                    sub.s   f8, f8, f0          // vel_air.y -= gravity
+                    c.lt.s  f8, f2
+                    nop
+                    bc1tl   _next
+                    mov.s   f8, f2              // clamp to max fall speed
+                    _next:
+                    addiu   t2, t2, -1
+                    bnez    t2, _loop
+                    nop
+
+                    // don't go below the ground under them
+                    lw      t3, 0x00EC(s0)      // t3 = clipping below the target (-1 = none)
+                    bltz    t3, _end
+                    lw      t2, 0x0078(s0)      // t2 = target position
+                    lwc1    f4, 0x0004(t2)      // f4 = target y
+                    lwc1    f6, 0x00F0(s0)      // f6 = distance to the ground below (negative if above it)
+                    add.s   f4, f4, f6          // f4 = ground y
+                    c.lt.s  f22, f4
+                    nop
+                    bc1tl   _end
+                    mov.s   f22, f4
+
+                    _end:
+                }
+
+                mov.s   f6, f20     // f6 = target X before clamping (used for JUMP_PADDING below)
+
+                // Exception: if we're in the air, moving up and still have our double jump,
+                // following the target offstage is safe, so skip the ledge clamp and the offstage
+                // JUMP_PADDING (s1 = this fp). t3 = 1 if the exception applies.
+                scope offstage_exception: {
+                    or      t3, r0, r0          // t3 = 0
+                    lw      at, 0x014C(s1)      // at = kinetic state (0 = grounded)
+                    beqz    at, _end
+                    lwc1    f2, 0x004C(s1)      // f2 = our y velocity
+                    mtc1    r0, f4
+                    c.lt.s  f4, f2              // moving up?
+                    nop
+                    bc1f    _end
+                    lb      at, 0x0148(s1)      // at = jumps used
+                    sltiu   at, at, 2
+                    beqz    at, _end            // already used a double jump
+                    lw      at, 0x09C8(s1)      // at = attributes
+                    lw      at, 0x0064(at)      // at = max jumps
+                    sltiu   at, at, 2
+                    bnez    at, _end            // no double jump at all
+                    nop
+                    lli     t3, 1
+                    _end:
+                }
+                bnez    t3, clamp_min_y     // exception: skip the ledge clamp
+                nop
+
                 lui     at, LEDGE_PADDING
                 mtc1    at, f4      // f4 = LEDGE_PADDING
 
+                // s3 = gMPCollisionBounds.current: 0x28 = right edge X, 0x2C = left edge X
+                // keep the target X at least LEDGE_PADDING inside the stage edges
                 clamp_min_x:
-                lwc1    f2, 0x28(s3) // load left ledge X
-                sub.s   f2, f2, f4   // add padding
-                c.le.s  f2, f20      // code = 1 if left ledge X <= target X
+                lwc1    f2, 0x28(s3) // load right edge X
+                sub.s   f2, f2, f4   // move it inwards by the padding
+                c.le.s  f2, f20      // code = 1 if (right edge X - padding) <= target X
                 nop
-                bc1fl   after_clamp_min_x // not offstage, skip
+                bc1fl   after_clamp_min_x // not too close to the right edge, skip
                 nop
-                mov.s   f20, f2 // replace target X by ledge X + padding
+                mov.s   f20, f2 // replace target X by right edge X - padding
                 after_clamp_min_x:
 
                 clamp_max_x:
-                lwc1    f2, 0x2C(s3) // load right ledge X
-                add.s   f2, f2, f4   // add padding
-                c.le.s  f20, f2      // code = 1 if target X <= right ledge X
+                lwc1    f2, 0x2C(s3) // load left edge X
+                add.s   f2, f2, f4   // move it inwards by the padding
+                c.le.s  f20, f2      // code = 1 if target X <= (left edge X + padding)
                 nop
-                bc1fl   after_clamp_max_x // not offstage, skip
+                bc1fl   after_clamp_max_x // not too close to the left edge, skip
                 nop
-                mov.s   f20, f2 // replace target X by ledge X + padding
+                mov.s   f20, f2 // replace target X by left edge X + padding
                 after_clamp_max_x:
 
                 // if y != CPU's y, they'll try to jump
@@ -5084,7 +5197,22 @@ scope AI {
                 or      at, r0, r0
                 mtc1    at, f2      // f2 = 0
 
+                // Consider target Y lower than it is using JUMP_PADDING, but only if the target is
+                // past a stage edge, so the CPU doesn't jump offstage after them. Over the stage,
+                // keep the real height so the CPU jumps for juggles.
+                bnez    t3, _skip_jump_padding // offstage exception (see above)
+                lwc1    f8, 0x28(s3)    // f8 = right edge X
+                c.lt.s  f8, f6          // code = 1 if past the right edge
+                nop
+                bc1t    _apply_jump_padding
+                lwc1    f8, 0x2C(s3)    // f8 = left edge X
+                c.lt.s  f6, f8          // code = 1 if past the left edge
+                nop
+                bc1f    _skip_jump_padding
+                nop
+                _apply_jump_padding:
                 sub.s   f22, f22, f4    // consider target Y lower than it is using JUMP_PADDING
+                _skip_jump_padding:
 
                 c.le.s  f22, f2         // code = 1 if target Y <= stage min Y
                 nop
@@ -5107,15 +5235,25 @@ scope AI {
             // Here, the CPU is grounded and the target is above it in Y (and we're not in the initial dash animation, idk why the check)
             // By default, the CPU would fullhop for a frame and then continue to hold towards the target's position
             // and probably go for a follow-up attack
-            // In this patch we check if we can just shorthop since it just makes more sense sometimes!
+            // In this patch we pick the lowest jump that gets the target in range of an up attack:
+            // walk under them, shorthop, full C jump, or vanilla's fullhop. Jump heights are worked out
+            // from this character's jump attributes and gravity, so it works for floaty and heavy characters alike.
+            // The target height (com->target_pos.y) already leads a launched target (see chase_lead).
             OS.patch_start(0xB0558, 0x80135B18)
             j       shorthop_followup_attack
             nop
             _return:
             OS.patch_end()
 
+            // jump speeds with a neutral stick (ftCommonJumpGetJumpForceButton), in stick units
+            constant SHORTHOP_FORCE(0x4234)     // 45.0 = FTCOMMON_KNEEBEND_BUTTON_SHORT_FORCE + SHORT_MIN
+            constant C_JUMP_FORCE(0x429A)       // 77.0 = FTCOMMON_KNEEBEND_BUTTON_HEIGHT_CLAMP
+            constant REACH(0x4396)              // 300.0 - how far above the CPU an up attack reaches
+
             // a0 = self player struct
-            // t0 = target struct !!
+            // t0 = com (self + 0x1CC)
+            // f4 = target Y (com->target_pos.y)
+            // f6 = my Y
 
             addiu   a1, r0, 0x0004 // original line 2: command = 0x4 = fullhop
 
@@ -5125,55 +5263,71 @@ scope AI {
             bnezl   t1, _end        // if not level 10, return normally
             nop
 
-            lw      at, 0x0078(a0)
-
-            // f6 = my Y
-            // f4 = target Y
             lw      t1, 0x6C(t0) // t1 = target fighter struct
             beqz    t1, _end     // skip if no target fighter
             nop
+
+            // if the target isn't in hitstun, factor in 1 frame of their movement
+            // (in hitstun, chase_lead already moved target_pos ahead)
+            lw      at, 0x18C(t1) // fp->is_hitstun (and other flags)
+            andi    at, at, 0x1
+            bnez    at, _diff
+            nop
             lwc1    f2, 0x4C(t1) // f2 = target air Y velocity
             add.s   f4, f4, f2 // factor in 1 frame
-            lwc1    f2, 0x58(t1) // f2 = vel_damage_air.y
-            add.s   f4, f4, f2 // factor in 1 frame
 
-            sub.s   f4, f4, f6 // f4 = my Y - target Y in the next frame
+            _diff:
+            sub.s   f4, f4, f6 // f4 = target Y - my Y
 
-            lui     at, 0x4396 // 300.0
-            mtc1    at, f2     // move to f2
-            c.le.s  f4, f2     // true if Y diff < constant
+            // close enough: walk under them
+            lui     at, REACH
+            mtc1    at, f10    // f10 = REACH
+            c.le.s  f4, f10
             nop
-            bc1tl   diff_very_low
-            nop
-            lui     at, 0x4416 // 600.0
-            mtc1    at, f2     // move to f2
-            c.le.s  f4, f2     // true if Y diff < constant
-            nop
-            bc1tl   diff_low
-            nop
-            lui     at, 0x4461 // 900.0
-            mtc1    at, f2     // move to f2
-            c.le.s  f4, f2     // true if Y diff < constant
-            nop
-            bc1tl   diff_med
-            nop
-            b diff_high
-            nop
-
-            diff_very_low:
-            b _end
+            bc1tl   _end
             lli     a1, AI.ROUTINE.MOVE
 
-            diff_low:
-            b _end
+            // jump apex height = v^2 / (2 * gravity), v = force * jump_height_mul + jump_height_base
+            lw      t1, 0x09C8(a0) // t1 = our attributes
+
+            // shorthop
+            lui     at, SHORTHOP_FORCE
+            mtc1    at, f2
+            jal     _apex // f2 = apex height
+            nop
+            add.s   f2, f2, f10 // + REACH
+            c.le.s  f4, f2
+            nop
+            bc1tl   _end
             lli     a1, AI.ROUTINE.SHORT_HOP_TOWARDS
 
-            diff_med:
-            b _end
+            // full C jump
+            lui     at, C_JUMP_FORCE
+            mtc1    at, f2
+            jal     _apex // f2 = apex height
+            nop
+            add.s   f2, f2, f10 // + REACH
+            c.le.s  f4, f2
+            nop
+            bc1tl   _end
             lli     a1, AI.ROUTINE.FULL_C_JUMP_TOWARDS
 
-            diff_high:
-            // no change from vanilla
+            // higher: vanilla fullhop (a1 = 0x4)
+            b       _end
+            nop
+
+            // f2 = jump force (in), apex height (out). t1 = attributes. uses f8
+            _apex:
+            lwc1    f8, 0x003C(t1) // jump_height_mul
+            mul.s   f2, f2, f8
+            lwc1    f8, 0x0040(t1) // jump_height_base
+            add.s   f2, f2, f8 // f2 = v
+            mul.s   f2, f2, f2 // v^2
+            lwc1    f8, 0x0058(t1) // gravity
+            add.s   f8, f8, f8 // 2 * gravity
+            jr      ra
+            div.s   f2, f2, f8 // v^2 / (2 * gravity)
+
             _end:
             jal     0x80132564 // original line 1 ftComputerSetCommandWait
             nop
