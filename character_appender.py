@@ -1257,11 +1257,12 @@ class CharacterAppender:
 
             stages_per_page = num_rows * num_columns
 
-        # -1 for the Random stage on the last slot of each page
-        pages_needed = len(self.stage_folders) // (stages_per_page - 1) + 1
+        # Variants ("Stage/remix", ...) don't get their own SSS slot.
+        menu_stages = [s for s in self.stage_folders if "/" not in s]
 
-        if len(self.stage_folders) % (stages_per_page - 1) == 0:
-            pages_needed -= 1
+        # -1 for the Random stage on the last slot of each page
+        stages_per_extra_page = stages_per_page - 1
+        pages_needed = -(-len(menu_stages) // stages_per_extra_page)
 
         num_pages += pages_needed
 
@@ -1372,6 +1373,22 @@ class CharacterAppender:
                 f"{900+len(add_stage_strings)})"
             )
 
+        # Stage ids are stored as bytes all over the engine, and 0xFF is the
+        # "no variant" marker, so 0xFE is the last usable id. Anything above
+        # would be truncated by `db` and alias a vanilla stage.
+        if max_stage_id > 0xFE:
+            first_extra_id = 0xDE - self.RANDOM_STAGE_INDEX
+            max_extra = 0xFE - first_extra_id + 1
+            if first_extra_id <= 0xDE:
+                max_extra -= 1  # 0xDE is reserved for Random
+            raise Exception(
+                f"Too many extra stages: {len(self.stage_proc.stage_configs)} "
+                f"stages + variants need ids up to 0x{max_stage_id:X}, but stage "
+                f"ids are 1 byte (max 0xFE). At most {max_extra} extra stages "
+                f"(variants included) fit, so remove "
+                f"{len(self.stage_proc.stage_configs) - max_extra} of them "
+                f"(prefix a folder with '_' to skip it).")
+
         lineinfile.add_line_to_file(
             filepath="src/Stages.asm",
             line="\t\t"+"\n\t\t".join(stage_ids),
@@ -1396,24 +1413,14 @@ class CharacterAppender:
         # Assign stages to the menu slots
         # Any extra slots will be filled with the Random stage
         stage_slots = []
-        for i, stg in enumerate(self.stage_folders):
-            if "/" in stg:
-                continue
-
-            if i % (stages_per_page - 1) == 0:
-                stage_slots.append(
-                    f"// Extra page {i // (stages_per_page - 1) + 1}")
-
-            if i % (stages_per_page - 1) == 0 and i != 0:
-                stage_slots.append("db id.RANDOM")
-
-            stage_slots.append(f"db id.STAGE_{stg.upper()}")
-
-        stages_on_last_page = (
-            len([s for s in self.stage_folders if "/" not in s]) % (stages_per_page - 1))
-
-        if stages_on_last_page != 0:
-            for _ in range((stages_per_page) - stages_on_last_page):
+        for page in range(pages_needed):
+            chunk = menu_stages[page * stages_per_extra_page:
+                                (page + 1) * stages_per_extra_page]
+            stage_slots.append(f"// Extra page {page + 1}")
+            for stg in chunk:
+                stage_slots.append(f"db id.STAGE_{stg.upper()}")
+            # Pad the rest of the page (always at least the last slot) with Random
+            for _ in range(stages_per_page - len(chunk)):
                 stage_slots.append("db id.RANDOM")
 
         lineinfile.add_line_to_file(
