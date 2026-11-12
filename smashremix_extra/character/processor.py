@@ -30,6 +30,29 @@ from smashremix_extra.logger import logger
 from smashremix_extra import hex_util, asm_util
 
 
+def sound_loop_asm(aifc_path):
+    """FGM.asm line that makes the sound added right before it loop forever.
+
+    Emits an ALADPCMloop (start, end, count = -1, 16 zeroed state samples) and
+    points the sample's wavetable loop field at it (FGM.asm's SOUND_LOOP_PARAMS,
+    an offset from the CTL like the other wavetable pointers). The loop covers
+    the whole sample, so the state at the loop start is the zero state the
+    decoder starts from.
+    """
+    with open(aifc_path, "rb") as f:
+        data = f.read()
+    # SSND chunk size at 0xF4 (FGM.asm reads the same field); raw ADPCM data
+    # starts at 0x100 and is that size - 8. Each 9-byte frame = 16 samples.
+    ssnd_size = struct.unpack(">I", data[0xF4:0xF8])[0]
+    loop_end = ((ssnd_size - 8) // 9) * 16
+    return (
+        "evaluate loop_num(new_sample_count); "
+        "global evaluate SOUND_LOOP_PARAMS_{loop_num}(pc() - CTL_TABLE_PC); "
+        f"dw 0, 0x{loop_end:X}, 0xFFFFFFFF; fill 0x20 "
+        f"// loop: {os.path.basename(aifc_path)}"
+    )
+
+
 class CharacterProcessor:
     """Processes extra character folders and accumulates patch data."""
 
@@ -813,6 +836,7 @@ class CharacterProcessor:
                 type = "VOICE"
                 reverb = 0
                 length = -1
+                loop = False
 
                 sound_list = config.get("sounds", {})
 
@@ -826,7 +850,13 @@ class CharacterProcessor:
                         sample_rate = sound_settings.get("sample_rate", 16000)
                         type = sound_settings.get("fgm_type", "VOICE")
                         reverb = sound_settings.get("reverb", 0)
-                        length = sound_settings.get("length", -1)
+                        loop = bool(sound_settings.get("loop", False))
+                        # A looping sample keeps going until the FGM ends, so by
+                        # default make the FGM as long as possible (it's meant to
+                        # be stopped by the game: moveset command 0x3C sounds
+                        # stop on action change, or command 0x40 / FGM stop).
+                        length = sound_settings.get(
+                            "length", "0x7FFF" if loop else -1)
 
                 # If announcer sound, set reverb
                 if config.get("announcer_fgm"):
@@ -841,6 +871,9 @@ class CharacterProcessor:
                         s.rsplit('.', 1)[0]}, "
                     f"SAMPLE_RATE_{sample_rate}, FGM_TYPE_{type}, {reverb}, {length})"
                 )
+                if loop:
+                    self.sound_add_list.append(sound_loop_asm(
+                        f"./{output_path}sounds/{s}"))
 
         print(f"SOUND_ADD_LIST(character): {character_sound_add_list}")
 

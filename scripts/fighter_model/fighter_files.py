@@ -1,0 +1,516 @@
+"""Read an SSB64 / Smash Remix fighter's model data (main.bin + character.bin).
+
+Generic (any fighter): everything is found through the fighter attributes
+block in main.bin (layout from the decomp, src/ft/fttypes.h FTAttributes):
+
+  commonparts_container  (attr + 0x2D4) -> FTCommonPart[2] (hi, lo detail):
+      DObjDesc *dobjdesc; MObjSub ***p_mobjsubs; AObjEvent32 ***p_costume_matanim; u8 flags
+  modelparts_container   (attr + 0x328) -> FTModelPartDesc*[joint]  (alternate parts:
+      per joint a list of [variant][hi, lo] FTModelPart {dl, mobjsubs, costume_matanim,
+      main_matanim, flags})
+  textureparts_container (attr + 0x330) -> FTTexturePart[2] {u8 joint, u8 detail[2]}
+      (facial expressions: which joint's which material swaps image)
+
+main.bin pointers into character.bin are external (main's external chain);
+pointers inside each file are internal (each file's internal chain).
+"""
+import struct
+from dataclasses import dataclass, field
+
+import numpy as np
+
+ATTR_PATTERN = b'\x00\x64\x00\x64'     # same rule as smashremix_extra.rom_util.get_attrib_offset
+ATTR_PATTERN_BACK = 228
+A_COMMONPARTS = 0x2D4
+A_MODELPARTS = 0x328
+A_TEXTUREPARTS = 0x330
+A_SKELETON = 0x344
+G_CULL_FRONT, G_CULL_BACK, G_LIGHTING = 0x200, 0x400, 0x20000
+GEOM_BITS = G_CULL_FRONT | G_CULL_BACK | G_LIGHTING        # what a material keeps of the geometry mode
+GEOM_CMD = 0xD9000000 | (~GEOM_BITS & 0xFFFFFF)          # gSPGeometryMode: AND mask (clear those), then set w1
+GEOM_DEFAULT = G_LIGHTING | G_CULL_BACK                  # the game's fighter drawing: lit, back faces culled
+JOINT_COMMON_START = 4     # player joints[0..3]: TopN, TransN, XRotN, YRotN; DObjDesc i = joints[i + 4]
+# modelparts_container is indexed by fighter joint number directly (index 6 = joint 6)
+DOBJDESC_SIZE = 0x2C
+DOBJDESC_END = 0x12
+MODELPART_SIZE = 0x14
+
+
+def u16(d, o): return struct.unpack_from('>H', d, o)[0]
+def u32(d, o): return struct.unpack_from('>I', d, o)[0]
+def f32(d, o): return struct.unpack_from('>f', d, o)[0]
+
+
+def chain(d, head):
+    """{field offset: target offset} of a relocation chain starting at head."""
+    out, off, seen = {}, head, set()
+    while 0 <= off <= len(d) - 4 and off not in seen:
+        seen.add(off)
+        nxt, tgt = u16(d, off), u16(d, off + 2)
+        out[off] = tgt * 4
+        if nxt == 0xFFFF or nxt * 4 >= len(d):
+            break
+        off = nxt * 4
+    return out
+
+
+def attributes_offset(main):
+    pos = main.rfind(ATTR_PATTERN)
+    if pos < 0:
+        raise ValueError('fighter attributes not found in main.bin')
+    return pos - ATTR_PATTERN_BACK
+
+
+def rot_zyx(r, p, h):
+    cx, sx, cy, sy, cz, sz = np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(h), np.sin(h)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+@dataclass
+class Joint:
+    index: int
+    depth: int
+    parent: int
+    dl: int                  # character.bin offset of its display list (or None)
+    t: np.ndarray
+    r: np.ndarray
+    s: np.ndarray
+    world: np.ndarray = None
+
+
+@dataclass
+class Fighter:
+    main: bytes
+    char: bytes
+    main_int: dict
+    main_ext: dict
+    char_int: dict
+    attr: int
+    details: dict = field(default_factory=dict)      # 'hi'/'lo' -> dict(joints, mobjs, matanims)
+    modelparts: dict = field(default_factory=dict)   # joint -> [[hi part, lo part], ...]
+    textureparts: list = field(default_factory=list)
+    skeletons: dict = field(default_factory=dict)    # electric-shock skeleton id -> {joint: entry}
+
+    def ptr_main(self, field_off):
+        """Where a main.bin pointer field points: ('char', off) / ('main', off) / None."""
+        if field_off in self.main_ext:
+            return ('char', self.main_ext[field_off])
+        if field_off in self.main_int:
+            return ('main', self.main_int[field_off])
+        return None
+
+    def ptr_char(self, field_off):
+        return self.char_int.get(field_off)
+
+
+def read_skeleton(char, char_int, arr):
+    joints, e, stack = [], arr, {}
+    while u32(char, e) != DOBJDESC_END and len(joints) < 64:
+        depth = u32(char, e)
+        v = struct.unpack_from('>9f', char, e + 8)
+        parent = stack.get(depth - 1) if depth > 0 else None
+        j = Joint(len(joints), depth, parent, char_int.get(e + 4),
+                  np.array(v[:3]), np.array(v[3:6]), np.array(v[6:]))
+        stack[depth] = j.index
+        M = np.eye(4)
+        M[:3, :3] = rot_zyx(*j.r) * j.s
+        M[:3, 3] = j.t
+        j.world = M if parent is None else joints[parent].world @ M
+        joints.append(j)
+        e += DOBJDESC_SIZE
+    return joints
+
+
+def pointer_list(d, ptrs, start, count):
+    """Entries of an array of pointers (None where a field isn't relocated)."""
+    return [ptrs.get(start + 4 * i) for i in range(count)]
+
+
+def load(main_path, char_path, main_int_head=0x2CC, main_ext_head=0x0, char_int_head=0x4):
+    main = open(main_path, 'rb').read()
+    char = open(char_path, 'rb').read()
+    f = Fighter(main, char, chain(main, main_int_head), chain(main, main_ext_head),
+                chain(char, char_int_head), attributes_offset(main))
+    # ---- common parts (hi, lo)
+    cp = f.ptr_main(f.attr + A_COMMONPARTS)
+    if cp is None or cp[0] != 'main':
+        raise ValueError('commonparts_container not found')
+    for k, detail in enumerate(('hi', 'lo')):
+        base = cp[1] + 0x10 * k
+        dobj = f.ptr_main(base)
+        mobj = f.ptr_main(base + 4)
+        anim = f.ptr_main(base + 8)
+        if dobj is None:
+            continue
+        joints = read_skeleton(char, f.char_int, dobj[1])
+        n = len(joints)
+        # p_mobjsubs: array (one per joint) of NULL-terminated MObjSub* lists (in character.bin)
+        mobjs = {}
+        if mobj is not None:
+            arr = mobj[1]
+            for j in range(n):
+                lst = f.char_int.get(arr + 4 * j)
+                items = []
+                while lst is not None and lst + 4 * len(items) in f.char_int:
+                    items.append(f.char_int[lst + 4 * len(items)])
+                mobjs[j] = items
+        f.details[detail] = dict(dobjdesc=dobj[1], joints=joints, mobjs=mobjs,
+                                 matanim=anim[1] if anim else None)
+    # ---- model parts (alternate pieces per joint)
+    mp = f.ptr_main(f.attr + A_MODELPARTS)
+    if mp is not None and mp[0] == 'main':
+        nj = len(f.details['hi']['joints'])
+        descs = {i: f.main_int[mp[1] + 4 * i] for i in range(nj) if mp[1] + 4 * i in f.main_int}
+        # a joint's variant list has no stored length: it runs until the next joint's
+        # list (or the container itself), and stops at the first pair without a display list
+        starts = sorted(set(descs.values()) | {mp[1]})
+        for i, desc in sorted(descs.items()):
+            end = next((x for x in starts if x > desc), len(main))
+            variants, off = [], desc
+            while off + MODELPART_SIZE * 2 <= end:
+                pair = []
+                for k in range(2):
+                    b = off + MODELPART_SIZE * k
+                    dl = f.ptr_main(b)
+                    ms = f.ptr_main(b + 4)
+                    pair.append(dict(field=b, dl=dl[1] if dl and dl[0] == 'char' else None,
+                                     mobjsubs=ms[1] if ms and ms[0] == 'char' else None,
+                                     flags=main[b + 0x10]))
+                if pair[0]['dl'] is None and pair[1]['dl'] is None:
+                    break
+                variants.append(pair)
+                off += MODELPART_SIZE * 2
+            if variants:
+                f.modelparts[i] = variants
+    # ---- electric-shock skeleton models: attr->skeleton[id][joint] = {dl, flags} (8 bytes),
+    # id 0 unused; drawn with the joint's MObjs (flags & 0xF: 0 = one DL, 1 = two-DL array)
+    sk = f.ptr_main(f.attr + A_SKELETON)
+    if sk is not None and sk[0] == 'main':
+        nj = len(f.details['hi']['joints'])
+        for sid in range(1, 4):
+            tab = f.ptr_main(sk[1] + 4 * sid)
+            if tab is None or tab[0] != 'main':
+                continue
+            ents = {}
+            for j in range(nj):
+                fld = tab[1] + 8 * j
+                dl = f.ptr_main(fld)
+                if dl is not None and dl[0] == 'char':
+                    ents[j] = dict(field=fld, dl=dl[1], flags=main[fld + 4])
+            if ents:
+                f.skeletons[sid] = ents
+    # ---- texture parts (expressions)
+    tp = f.ptr_main(f.attr + A_TEXTUREPARTS)
+    if tp is not None and tp[0] == 'main':
+        for k in range(2):
+            o = tp[1] + 3 * k
+            game_joint, d0, d1 = main[o], main[o + 1], main[o + 2]
+            joint = game_joint - JOINT_COMMON_START                 # our joint index (DObjDesc entry)
+            hi_lst = f.details['hi']['mobjs'].get(joint, [])
+            if game_joint < JOINT_COMMON_START or d0 >= len(hi_lst):  # unused slot
+                continue
+            f.textureparts.append(dict(index=k, joint=joint, mobj_hi=d0, mobj_lo=d1))
+    return f
+
+
+# ---------------------------------------------------------------- textures
+def rgba16(v):
+    return (((v >> 11) & 31) * 255 // 31, ((v >> 6) & 31) * 255 // 31,
+            ((v >> 1) & 31) * 255 // 31, 255 * (v & 1))
+
+
+def row_bytes(w, siz):
+    """Bytes per texture row in memory: rows are 64-bit aligned (a texture memory line),
+    so narrow textures (e.g. 8 px CI4 = 4 bytes) are stored padded to 8 bytes per row."""
+    return (w * (4, 8, 16, 32)[siz] // 8 + 7) // 8 * 8
+
+
+def decode_texture(d, addr, fmt, siz, w, h, pal_addr, stride=None):
+    """N64 texture -> RGBA array (CI4/CI8/RGBA16/RGBA32/IA4/IA8/IA16/I4/I8).
+    stride: bytes per row (default: 64-bit aligned rows, see row_bytes)."""
+    bpp = (4, 8, 16, 32)[siz]
+    stride = stride or row_bytes(w, siz)
+    pal = None
+    if fmt == 2 and pal_addr is not None:
+        n = 256 if siz == 1 else 16
+        pal = np.array([rgba16(u16(d, pal_addr + 2 * i)) if pal_addr + 2 * i + 2 <= len(d) else (255, 0, 255, 255)
+                        for i in range(n)], np.uint8)
+    out = np.zeros((h, w, 4), np.uint8)
+    for y in range(h):
+        for x in range(w):
+            bit = y * stride * 8 + x * bpp
+            o = addr + bit // 8
+            if o >= len(d):
+                continue
+            if bpp == 4:
+                v = (d[o] >> (4 if bit % 8 == 0 else 0)) & 15
+            elif bpp == 8:
+                v = d[o]
+            elif bpp == 16:
+                v = u16(d, o)
+            else:
+                v = u32(d, o)
+            if fmt == 2:
+                out[y, x] = pal[v] if pal is not None and v < len(pal) else (255, 0, 255, 255)
+            elif fmt == 0:
+                out[y, x] = rgba16(v) if bpp == 16 else [(v >> s) & 255 for s in (24, 16, 8, 0)]
+            elif fmt == 3:
+                if bpp == 4:
+                    i, a = (v >> 1) * 255 // 7, 255 * (v & 1)
+                elif bpp == 8:
+                    i, a = (v >> 4) * 17, (v & 15) * 17
+                else:
+                    i, a = v >> 8, v & 255
+                out[y, x] = (i, i, i, a)
+            else:
+                i = v * 17 if bpp == 4 else v
+                out[y, x] = (i, i, i, 255)
+    return out
+
+
+# ---------------------------------------------------------------- display lists
+@dataclass
+class Tri:
+    joint: int               # the joint whose DL draws it
+    corners: list            # [(source joint, local xyz, normal xyz, st texels, rgba bytes)] x3
+    material: tuple          # key into Geometry.materials
+
+
+@dataclass
+class Geometry:
+    tris: list = field(default_factory=list)
+    materials: dict = field(default_factory=dict)   # key -> description
+
+
+def decode_model(f, joints, mobjs, dls, cache=None):
+    """Triangles of the given display lists, drawn in order with one shared RSP
+    vertex cache (joints reuse their parent's cached vertices: knees, elbows...).
+    dls: [(joint index, dl offset)]."""
+    char, ptrs = f.char, f.char_int
+    geo = Geometry()
+    cache = cache if cache is not None else [None] * 32
+    for j, dl in dls:
+        # geometry mode: the game draws fighters lit, with back-face culling on
+        st = dict(img=None, tile=(2, 0), size=(32, 32), prim=(255, 255, 255, 255), tex_on=False,
+                  mobj=None, pal=None, wrap=(0, 0, 0, 0), geom=GEOM_DEFAULT,
+                  state={(0xD9, 0): (GEOM_CMD, GEOM_DEFAULT)})
+
+        def key():
+            if not st['tex_on']:
+                if st['mobj'] is not None:     # untextured, colors from the MObj (may change per costume)
+                    return ('mobj', st['mobj'], None, None, None, None, None, tuple(sorted(st['state'].items())))
+                return ('prim',) + tuple(st['prim']) + (tuple(sorted(st['state'].items())),)
+            if st['mobj'] is not None:     # material object (+ inline image/palette it may not supply)
+                return ('mobj', st['mobj'], st['tile'], st['size'], st['img'], st['pal'], st['wrap'],
+                        tuple(sorted(st['state'].items())))
+            return ('tex', st['img'], st['pal'], st['tile'], st['size'], st['wrap'],
+                    tuple(sorted(st['state'].items())))
+
+        def run(o, depth=0):
+            while o + 8 <= len(char):
+                w0, w1 = u32(char, o), u32(char, o + 4)
+                op = w0 >> 24
+                if st.get('drawn') and (op in (0xF5, 0xFD, 0xF0, 0xE8, 0xD7) or
+                                        (op == 0xDE and (w1 >> 24) == 0x0E)):
+                    # a new material is being set up: an MObj called for the last one doesn't apply
+                    st['mobj'], st['drawn'] = None, False
+                if op == 0xFD:                                   # SETTIMG
+                    st['img'] = ptrs.get(o + 4)
+                elif op == 0xF0:                                 # LOADTLUT
+                    st['pal'] = st['img']
+                    st['tlut_n'] = ((w1 >> 14) & 0x3FF) + 1      # colors loaded
+                elif op == 0xF5 and ((w1 >> 24) & 7) == 0:      # SETTILE render tile
+                    st['tile'] = ((w0 >> 21) & 7, (w0 >> 19) & 3)
+                    # clamp/mirror bits (cm: 1 = mirror, 2 = clamp) and wrap masks, per axis
+                    st['wrap'] = ((w1 >> 8) & 3, (w1 >> 18) & 3, (w1 >> 4) & 15, (w1 >> 14) & 15)
+                elif op in (0xE2, 0xE3, 0xFC, 0xFB, 0xF9):        # render state (blend mode, combiner, colors)
+                    k = (op, (w0 >> 8) & 0xFF) if op in (0xE2, 0xE3) else (op, 0)
+                    st['state'] = dict(st['state'])
+                    st['state'][k] = (w0, w1)
+                elif op == 0xF2 and ((w1 >> 24) & 7) == 0:      # SETTILESIZE render tile
+                    st['size'] = (((w1 >> 12) & 0xFFF) // 4 + 1, (w1 & 0xFFF) // 4 + 1)
+                elif op == 0xFA:
+                    st['prim'] = (w1 >> 24, (w1 >> 16) & 255, (w1 >> 8) & 255, w1 & 255)
+                    st['state'] = dict(st['state'])
+                    st['state'][(0xFA, 0)] = (w0, w1)
+                elif op == 0xD9:                                 # geometry mode: keep lighting + culling
+                    st['geom'] = (st['geom'] & (w0 | 0xFF000000)) | w1
+                    st['state'] = dict(st['state'])
+                    st['state'][(0xD9, 0)] = (GEOM_CMD, st['geom'] & GEOM_BITS)
+                elif op == 0xDB and (w0 & 0xFFFF0000) == 0xDB0A0000:   # light colors (per material too)
+                    st['state'] = dict(st['state'])
+                    st['state'][(0xDB, w0 & 0xFFFF)] = (w0, w1)
+                elif op == 0xD7:
+                    st['tex_on'] = bool((w0 >> 1) & 0x7F)
+                elif op == 0x01:                                 # VTX
+                    n = (w0 >> 12) & 0xFF
+                    v0 = ((w0 & 0xFF) >> 1) - n
+                    a = ptrs.get(o + 4)
+                    if v0 < 0 or v0 + n > len(cache):
+                        raise BadDL(f'vertex load {n} at slot {v0} does not fit the vertex cache (0x{o:X})')
+                    if a is not None:
+                        for k in range(n):
+                            x, y, z, _, s, t = struct.unpack_from('>hhhHhh', char, a + 16 * k)
+                            nx, ny, nz = struct.unpack_from('>bbb', char, a + 16 * k + 12)
+                            rgba = tuple(char[a + 16 * k + 12:a + 16 * k + 16])   # = color when unlit
+                            cache[v0 + k] = (j, (x, y, z), (nx, ny, nz), (s / 32.0, t / 32.0), rgba)
+                elif op in (0x05, 0x06):
+                    st['drawn'] = True
+                    tl = [[(w0 >> 16 & 0xFF) // 2, (w0 >> 8 & 0xFF) // 2, (w0 & 0xFF) // 2]]
+                    if op == 0x06:
+                        tl.append([(w1 >> 16 & 0xFF) // 2, (w1 >> 8 & 0xFF) // 2, (w1 & 0xFF) // 2])
+                    k = key()
+                    if k not in geo.materials:
+                        geo.materials[k] = dict(st)
+                    for t in tl:
+                        cs = [cache[i] for i in t]
+                        if all(c is not None for c in cs):
+                            geo.tris.append(Tri(j, cs, k))
+                elif op == 0xDE:
+                    if (w1 >> 24) == 0x0E:                       # MObj material (segment 0x0E)
+                        i = (w1 & 0xFFFFFF) // 8
+                        lst = mobjs.get(j, []) if isinstance(mobjs, dict) else mobjs
+                        st['mobj'] = lst[i] if i < len(lst) else None
+                    elif o + 4 in ptrs and depth < 8:
+                        run(ptrs[o + 4], depth + 1)
+                        if (w0 >> 16) & 0xFF == 1:               # branch
+                            return
+                elif op == 0xDF:
+                    return
+                o += 8
+        if dl is not None:
+            if char[dl] not in DL_START_OPS:
+                raise BadDL(f'0x{dl:X} does not start like a display list ({char[dl:dl + 8].hex()})')
+            run(dl)
+    return geo, cache
+
+
+class BadDL(ValueError):
+    """A pointer that should be a display list isn't one (dummy / unused slots)."""
+
+
+# commands a fighter display list starts with (sync, geometry mode, lights, combiner, render
+# mode, texture, color, vertex, call)
+DL_START_OPS = {0xE7, 0xD9, 0xDB, 0xD7, 0xFC, 0xE2, 0xE3, 0xDE, 0x01, 0xF5, 0xFD, 0xFA, 0xFB, 0xE8, 0xE6, 0xDF}
+
+
+_TARGETS = {}
+
+
+def pointer_run(ptrs, start, limit=64):
+    """Entries of a pointer array (no stored length): consecutive relocated
+    fields from start, stopping where another array begins (an offset that
+    something else points to)."""
+    key = id(ptrs)
+    if key not in _TARGETS:
+        _TARGETS[key] = set(ptrs.values())
+    targets = _TARGETS[key]
+    out = []
+    while start is not None and start + 4 * len(out) in ptrs and len(out) < limit:
+        if out and start + 4 * len(out) in targets:
+            break
+        out.append(ptrs[start + 4 * len(out)])
+    return out
+
+
+COLOR_TRACKS = ('prim', 'env', 'blend', 'light1', 'light2')   # ext-value flag bits 0..4
+
+
+def decode_script(d, addr, limit=200):
+    """AObjEvent32 costume script -> one dict per frame (= costume): 'tex' / 'pal'
+    (indices) and 'prim' / 'env' / 'blend' / 'light1' / 'light2' (RGBA u32 colors).
+    Event word: opcode:7 | flags:10 | payload:15. SetVal* (3-11): flags 0x001 texture,
+    0x200 palette, float values in flag-bit order. SetExtVal* (18-21): flag bits 0-4 =
+    prim / env / blend / light1 / light2 color words. *After* events take effect
+    `payload` frames later; *Block* events also advance time by `payload`."""
+    sets, t, o = [], 0, addr
+    for _ in range(limit):
+        if o + 4 > len(d):
+            break
+        w = u32(d, o)
+        op, fl, payload = w >> 25, (w >> 15) & 0x3FF, w & 0x7FFF
+        o += 4
+        if op == 0:
+            break
+        if op == 1:                              # jump: a costume script never needs it
+            break
+        if op == 2:                              # wait
+            t += payload
+            continue
+        if op in (3, 4, 5, 6, 7, 8, 9, 10, 11):
+            at = t + payload if op in (10, 11) else t
+            for b in range(10):
+                if fl >> b & 1:
+                    v = f32(d, o)
+                    o += 4
+                    if b == 9:
+                        sets.append((at, 'pal', int(round(v))))
+                    elif b == 0:
+                        sets.append((at, 'tex', int(round(v))))
+            if op in (3, 5, 8, 10):              # *Block: time moves on
+                t += payload
+        elif op in (18, 19, 20, 21):
+            at = t + payload if op in (18, 19) else t
+            for b in range(5):
+                if fl >> b & 1:
+                    sets.append((at, COLOR_TRACKS[b], u32(d, o)))
+                    o += 4
+            if op in (18, 20):
+                t += payload
+        else:                                    # other events: skip their values
+            o += 4 * bin(fl).count('1')
+    if not sets:
+        return []
+    n = max(tm for tm, _, _ in sets) + 1
+    frames, cur = [], {}
+    for c in range(n):
+        for tm, k, v in sets:
+            if tm == c:
+                cur[k] = v
+        frames.append(dict(cur))
+    return frames
+
+
+def mobj_textures(f, mobj, size, n_entries=8):
+    """Image and palette pointer arrays of an MObjSub (None where absent)."""
+    d, ptrs = f.char, f.char_int
+    fmt, siz = d[mobj + 2], d[mobj + 3]
+    sprites = ptrs.get(mobj + 4)
+    palettes = ptrs.get(mobj + 0x2C)
+    imgs = pointer_run(ptrs, sprites)
+    pals = pointer_run(ptrs, palettes)
+    return dict(fmt=fmt, siz=siz, flags=u16(d, mobj + 0x30), images=imgs, palettes=pals,
+                prim=tuple(d[mobj + 0x50:mobj + 0x54]))
+
+
+def model_lights(f):
+    """The model's light colors, set at the start of its display lists (DB0A0000 = light 1:
+    the directional light, DB0A0018 = light 2: ambient, i.e. the shadow color)."""
+    out = {}
+    for j in f.details['hi']['joints']:
+        if j.dl is not None and f.char[j.dl] != 0xDF:
+            o = j.dl
+            break
+    else:
+        o = None
+    while o is not None and o + 8 <= len(f.char) and f.char[o] not in (0x01, 0x05, 0x06, 0xDE, 0xDF, 0xFD):
+        w0, w1 = u32(f.char, o), u32(f.char, o + 4)
+        if w0 == 0xDB0A0000:
+            out['light'] = f'{w1 >> 8:06X}'
+        elif w0 == 0xDB0A0018:
+            out['shadow'] = f'{w1 >> 8:06X}'
+        o += 8
+    return out
+
+
+def srgb_to_linear(c):
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def linear_to_srgb(c):
+    c = min(max(c, 0.0), 1.0)
+    return c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+
