@@ -129,11 +129,16 @@ def pointer_list(d, ptrs, start, count):
     return [ptrs.get(start + 4 * i) for i in range(count)]
 
 
-def load(main_path, char_path, main_int_head=0x2CC, main_ext_head=0x0, char_int_head=0x4):
+def load(main_path, char_path, main_int_head=0x2CC, main_ext_head=0x0, char_int_head=0x4, char_ext=None):
+    """char_ext: extra character.bin pointers {field offset: target offset}, for data
+    appended to character.bin (ROM exports: other files its external chain points into,
+    e.g. the bone texture every vanilla electric-shock skeleton shares)."""
     main = open(main_path, 'rb').read()
     char = open(char_path, 'rb').read()
+    char_int = chain(char, char_int_head)
+    char_int.update(char_ext or {})
     f = Fighter(main, char, chain(main, main_int_head), chain(main, main_ext_head),
-                chain(char, char_int_head), attributes_offset(main))
+                char_int, attributes_offset(main))
     # ---- common parts (hi, lo)
     cp = f.ptr_main(f.attr + A_COMMONPARTS)
     if cp is None or cp[0] != 'main':
@@ -228,6 +233,30 @@ def row_bytes(w, siz):
     return (w * (4, 8, 16, 32)[siz] // 8 + 7) // 8 * 8
 
 
+def texture_dimensions(tile_size, wrap):
+    """Source image dimensions from the render tile's masks, falling back to its extents."""
+    w, h = tile_size
+    mask_s, mask_t = wrap[2:4]
+    return (1 << mask_s if mask_s else w, 1 << mask_t if mask_t else h)
+
+
+def clamp_fill(rgba, wrap, extent):
+    """Texels past a clamped tile's extent (never drawn: the tile clamps before them,
+    e.g. DK's tie: a 24x20 tile in a 32x32 texture, whatever data follows in the rest)
+    replaced by the edge texel, as the game samples them. wrap: the manifest's
+    ('clamp' per axis), extent: the tile's (w, h)."""
+    if not wrap or extent is None:
+        return rgba
+    out, (ew, eh) = rgba, extent
+    if wrap.get('s') == 'clamp' and 0 < ew < out.shape[1]:
+        out = out.copy()
+        out[:, ew:] = out[:, ew - 1:ew]
+    if wrap.get('t') == 'clamp' and 0 < eh < out.shape[0]:
+        out = out.copy()
+        out[eh:, :] = out[eh - 1:eh, :]
+    return out
+
+
 def decode_texture(d, addr, fmt, siz, w, h, pal_addr, stride=None):
     """N64 texture -> RGBA array (CI4/CI8/RGBA16/RGBA32/IA4/IA8/IA16/I4/I8).
     stride: bytes per row (default: 64-bit aligned rows, see row_bytes)."""
@@ -277,6 +306,7 @@ class Tri:
     joint: int               # the joint whose DL draws it
     corners: list            # [(source joint, local xyz, normal xyz, st texels, rgba bytes)] x3
     material: tuple          # key into Geometry.materials
+    tile_ul: tuple = (0.0, 0.0)   # render tile's upper-left (texels) when drawn: the RDP subtracts it from st
 
 
 @dataclass
@@ -290,11 +320,14 @@ def decode_model(f, joints, mobjs, dls, cache=None):
     vertex cache (joints reuse their parent's cached vertices: knees, elbows...).
     dls: [(joint index, dl offset)]."""
     char, ptrs = f.char, f.char_int
+    dls = [(joint, target) for joint, dl in dls if dl is not None
+           for target in linked_display_lists(char, ptrs, dl)]
     geo = Geometry()
     cache = cache if cache is not None else [None] * 32
     for j, dl in dls:
         # geometry mode: the game draws fighters lit, with back-face culling on
-        st = dict(img=None, tile=(2, 0), size=(32, 32), prim=(255, 255, 255, 255), tex_on=False,
+        st = dict(img=None, tile=(2, 0), size=(32, 32), ul=(0.0, 0.0), scale=(1.0, 1.0),
+                  prim=(255, 255, 255, 255), tex_on=False,
                   mobj=None, pal=None, wrap=(0, 0, 0, 0), geom=GEOM_DEFAULT,
                   state={(0xD9, 0): (GEOM_CMD, GEOM_DEFAULT)})
 
@@ -331,9 +364,19 @@ def decode_model(f, joints, mobjs, dls, cache=None):
                     st['state'] = dict(st['state'])
                     st['state'][k] = (w0, w1)
                 elif op == 0xF2 and ((w1 >> 24) & 7) == 0:      # SETTILESIZE render tile
-                    st['size'] = (((w1 >> 12) & 0xFFF) // 4 + 1, (w1 & 0xFFF) // 4 + 1)
+                    # 10.2 fixed point; vanilla fighters use a non-zero upper-left to shift the
+                    # texture (Remix ones keep it at 0). size = the tile's extent from that corner.
+                    uls, ult = ((w0 >> 12) & 0xFFF) / 4, (w0 & 0xFFF) / 4
+                    lrs, lrt = ((w1 >> 12) & 0xFFF) / 4, (w1 & 0xFFF) / 4
+                    st['ul'] = (uls, ult)
+                    st['size'] = (int(lrs - uls) + 1, int(lrt - ult) + 1)
                 elif op == 0xFA:
                     st['prim'] = (w1 >> 24, (w1 >> 16) & 255, (w1 >> 8) & 255, w1 & 255)
+                    if st['mobj'] is not None and st.get('drawn') and not st['tex_on']:
+                        # a new color after an MObj's last material was drawn (vanilla Mario's hair,
+                        # nose, ears after the cap): the MObj set prim when it was called, this
+                        # replaces it, and nothing calls the MObj again: it no longer applies
+                        st['mobj'], st['drawn'] = None, False
                     st['state'] = dict(st['state'])
                     st['state'][(0xFA, 0)] = (w0, w1)
                 elif op == 0xD9:                                 # geometry mode: keep lighting + culling
@@ -345,6 +388,8 @@ def decode_model(f, joints, mobjs, dls, cache=None):
                     st['state'][(0xDB, w0 & 0xFFFF)] = (w0, w1)
                 elif op == 0xD7:
                     st['tex_on'] = bool((w0 >> 1) & 0x7F)
+                    if st['tex_on']:     # S/T scale (0.16; 0xFFFF = 1.0), applied by the RSP at vertex load
+                        st['scale'] = tuple(1.0 if v == 0xFFFF else v / 65536 for v in (w1 >> 16, w1 & 0xFFFF))
                 elif op == 0x01:                                 # VTX
                     n = (w0 >> 12) & 0xFF
                     v0 = ((w0 & 0xFF) >> 1) - n
@@ -356,7 +401,22 @@ def decode_model(f, joints, mobjs, dls, cache=None):
                             x, y, z, _, s, t = struct.unpack_from('>hhhHhh', char, a + 16 * k)
                             nx, ny, nz = struct.unpack_from('>bbb', char, a + 16 * k + 12)
                             rgba = tuple(char[a + 16 * k + 12:a + 16 * k + 16])   # = color when unlit
-                            cache[v0 + k] = (j, (x, y, z), (nx, ny, nz), (s / 32.0, t / 32.0), rgba)
+                            ss, ts = st['scale']
+                            cache[v0 + k] = (j, (x, y, z), (nx, ny, nz), (s / 32.0 * ss, t / 32.0 * ts), rgba)
+                elif op == 0x02:                                 # MODIFYVTX: edit a cached vertex
+                    # vanilla fighters re-texture vertices they share with the parent joint
+                    # (DK's belly / tie seams): G_MWO_POINT_ST (0x14) sets s,t (s10.5, written
+                    # straight into the vertex buffer: no texture scale), 0x10 sets the color
+                    where, k = (w0 >> 16) & 0xFF, (w0 & 0xFFFF) // 2
+                    if k < len(cache) and cache[k] is not None:
+                        cj, xyz, n3, stc, rgba = cache[k]
+                        if where == 0x14:
+                            s, t = struct.unpack('>hh', struct.pack('>I', w1))
+                            cache[k] = (cj, xyz, n3, (s / 32.0, t / 32.0), rgba)
+                        elif where == 0x10:
+                            rgba = tuple(struct.pack('>I', w1))
+                            n3 = tuple(b - 256 if b > 127 else b for b in rgba[:3])
+                            cache[k] = (cj, xyz, n3, stc, rgba)
                 elif op in (0x05, 0x06):
                     st['drawn'] = True
                     tl = [[(w0 >> 16 & 0xFF) // 2, (w0 >> 8 & 0xFF) // 2, (w0 & 0xFF) // 2]]
@@ -368,7 +428,7 @@ def decode_model(f, joints, mobjs, dls, cache=None):
                     for t in tl:
                         cs = [cache[i] for i in t]
                         if all(c is not None for c in cs):
-                            geo.tris.append(Tri(j, cs, k))
+                            geo.tris.append(Tri(j, cs, k, st['ul']))
                 elif op == 0xDE:
                     if (w1 >> 24) == 0x0E:                       # MObj material (segment 0x0E)
                         i = (w1 & 0xFFFFFF) // 8
@@ -395,6 +455,26 @@ class BadDL(ValueError):
 # commands a fighter display list starts with (sync, geometry mode, lights, combiner, render
 # mode, texture, color, vertex, call)
 DL_START_OPS = {0xE7, 0xD9, 0xDB, 0xD7, 0xFC, 0xE2, 0xE3, 0xDE, 0x01, 0xF5, 0xFD, 0xFA, 0xFB, 0xE8, 0xE6, 0xDF}
+
+
+def linked_display_lists(char, ptrs, offset):
+    """Resolve a direct display list or the two-list DObjDLLink form."""
+    if offset < len(char) and char[offset] in DL_START_OPS:
+        return [offset]
+
+    linked = []
+    for field in (offset, offset + 4):
+        target = ptrs.get(field)
+        if target in (None, 0):
+            continue
+        if target >= len(char) or char[target] not in DL_START_OPS:
+            raise BadDL(f'DObjDLLink at 0x{offset:X} has invalid display list pointer '
+                        f'0x{target:X}')
+        linked.append(target)
+    if linked:
+        return linked
+    raise BadDL(f'0x{offset:X} does not start like a display list or DObjDLLink '
+                f'({char[offset:offset + 8].hex()})')
 
 
 _TARGETS = {}
@@ -491,8 +571,14 @@ def model_lights(f):
     the directional light, DB0A0018 = light 2: ambient, i.e. the shadow color)."""
     out = {}
     for j in f.details['hi']['joints']:
-        if j.dl is not None and f.char[j.dl] != 0xDF:
-            o = j.dl
+        if j.dl is None:
+            continue
+        try:
+            candidates = linked_display_lists(f.char, f.char_int, j.dl)
+        except BadDL:
+            continue
+        o = next((dl for dl in candidates if f.char[dl] != 0xDF), None)
+        if o is not None:
             break
     else:
         o = None
@@ -513,4 +599,3 @@ def srgb_to_linear(c):
 def linear_to_srgb(c):
     c = min(max(c, 0.0), 1.0)
     return c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
-

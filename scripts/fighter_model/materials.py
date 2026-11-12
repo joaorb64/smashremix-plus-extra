@@ -189,6 +189,7 @@ class Material:
         else:
             self.h, self.w = costume_imgs[0].shape[:2]
         w, h = self.w, self.h
+        self.tile_w, self.tile_h = e.get('tile_size', (w, h))
         if (w & (w - 1) or h & (h - 1)) and (w * BPP[self.siz] // 8) % 8:
             raise SystemExit(f'{name}: {w}x{h} {fmt_name}: sizes that aren\'t powers of two need rows of a multiple '
                              'of 8 bytes')
@@ -197,9 +198,13 @@ class Material:
         if nbytes > (2048 if self.ci else 4096):
             raise SystemExit(f'{name}: {w}x{h} {fmt_name} does not fit the texture memory')
         wrap = e.get('wrap') or {}
+        self.wrap_dict = wrap                          # as exported (costume PNGs: FF.clamp_fill)
         self.masks = (wrap['mask_s'], wrap['mask_t']) if 'mask_s' in wrap and 'mask_t' in wrap else None
         self.wrap_s = props.get('n64_wrap_s') or wrap.get('s', 'clamp')
         self.wrap_t = props.get('n64_wrap_t') or wrap.get('t', 'clamp')
+        # tile clamped past the texture's size (vanilla fighters): keep the clamp bit
+        self.clamp_bits = tuple(2 if (props.get(f'n64_clamp_{a}') or wrap.get(f'clamp_{a}')) else 0
+                                for a in 'st')
         for ax in (self.wrap_s, self.wrap_t):
             if ax not in WRAP_BITS:
                 raise SystemExit(f'{name}: wrap mode {ax!r} (use repeat, mirror or clamp)')
@@ -265,7 +270,8 @@ class Material:
             im = resize(im, w, h)
             # not painted in Blender (still the exported costume image): the entry PNGs decide
             orig = orig_imgs[ti] if not self.ci else orig_pals[pi][orig_imgs[ti]].reshape(h, w, 4)
-            if same_image(orig, im):
+            # the export fills past a clamped tile's extent with the edge texel (FF.clamp_fill)
+            if same_image(FF.clamp_fill(orig, self.wrap_dict, (self.tile_w, self.tile_h)), im):
                 continue
             if not self.ci:
                 imgs[ti] = im
@@ -514,7 +520,7 @@ class Material:
         if self.untextured:                      # texture off; its colors: the MObj's, or prim in the state
             return g(0xD7000000, 0) + (g(0xDE000000, 0x0E000000 + 8 * mobj_index) if self.needs_mobj else b''), []
         w, h, fmt, siz = self.w, self.h, self.fmt, self.siz
-        cms, cmt = WRAP_BITS[self.wrap_s], WRAP_BITS[self.wrap_t]
+        cms, cmt = WRAP_BITS[self.wrap_s] | self.clamp_bits[0], WRAP_BITS[self.wrap_t] | self.clamp_bits[1]
         ms, mt = int(np.ceil(np.log2(w))), int(np.ceil(np.log2(h)))      # masks (rounded up: clamped edges)
         if self.masks:                                                  # the original's (may repeat a part)
             ms, mt = self.masks
@@ -533,7 +539,7 @@ class Material:
         out.append(g(0xF5000000 | (fmt << 21) | (siz << 19) | (line << 9), tile))         # render tile 0
         out.append(g(0xE6000000))
         out.append(g(0xD7000002, 0xFFFFFFFF))
-        out.append(g(0xF2000000, ((w - 1) << 2) << 12 | ((h - 1) << 2)))
+        out.append(g(0xF2000000, ((self.tile_w - 1) << 2) << 12 | ((self.tile_h - 1) << 2)))
         if self.uses_mobj():
             out.append(g(0xDE000000, 0x0E000000 + 8 * mobj_index))   # MObj: its palette / image list entry
         # the MObj loads the TLUT itself only together with its image (flags 0x1); otherwise

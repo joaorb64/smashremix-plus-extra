@@ -20,16 +20,69 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
+import tempfile
 
 import numpy as np
 from PIL import Image
 
+APPENDER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, APPENDER_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fighter_files as FF  # noqa: E402
+from SSB import N64, SSBtbl  # noqa: E402
 
 FLOAT, USHORT, UINT = 5126, 5123, 5125
-NEAREST, REPEAT = 9728, 10497
+
+VANILLA_FIGHTER_FILES = {
+    'MARIO': (0xCB, 0x128),
+    'FOX': (0xD1, 0x139),
+    'DK': (0xD5, 0x13D),
+    'SAMUS': (0xD9, 0x140),
+    'LUIGI': (0xDD, 0x143),
+    'LINK': (0xE1, 0x144),
+    'YOSHI': (0xF7, 0x152),
+    'CAPTAIN': (0xEC, 0x14C),
+    'KIRBY': (0xE5, 0x148),
+    'PIKACHU': (0xF3, 0x155),
+    'JIGGLYPUFF': (0xE9, 0x14A),
+    'NESS': (0xEF, 0x14F),
+    'BOSS': (0xFA, 0x158),
+    'METAL': (0xCE, 0x12C),
+}
+VANILLA_FIGHTER_COSTUMES = {
+    **dict.fromkeys(('MARIO', 'FOX', 'DK', 'SAMUS', 'LUIGI', 'LINK', 'YOSHI',
+                     'CAPTAIN', 'KIRBY', 'PIKACHU', 'JIGGLYPUFF', 'NESS'), 4),
+    'BOSS': 1,
+    'METAL': 1,
+}
+NEAREST, REPEAT, MIRRORED_REPEAT, CLAMP_TO_EDGE = 9728, 10497, 33648, 33071
+
+def remix_fighter_files():
+    """ROM file IDs for Remix fighters with both main and character files."""
+    file_asm = os.path.join(APPENDER_DIR, 'smashremix', 'src', 'File.asm')
+    if not os.path.isfile(file_asm):
+        return {}
+    pattern = re.compile(
+        r'^\s*constant\s+([A-Z0-9_]+)_(MAIN|CHARACTER)\((0x[0-9A-Fa-f]+|\d+)\)'
+    )
+    parts = {}
+    with open(file_asm, encoding='utf-8') as source:
+        for line in source:
+            match = pattern.match(line)
+            if match:
+                name, kind, value = match.groups()
+                parts.setdefault(name, {})[kind] = int(value, 0)
+    return {
+        name: (files['MAIN'], files['CHARACTER'])
+        for name, files in parts.items()
+        if 'MAIN' in files and 'CHARACTER' in files
+    }
+
+
+REMIX_FIGHTER_FILES = remix_fighter_files()
+FIGHTER_FILES = VANILLA_FIGHTER_FILES | REMIX_FIGHTER_FILES
 
 
 def quat_from_matrix(R):
@@ -65,6 +118,24 @@ COLOR_FLAG_OF = {'prim': 0x200, 'env': 0x400, 'blend': 0x800, 'light1': 0x1000, 
 COLOR_FLAGS = 0x3E00
 
 
+def wrap_mode(cm, extent, size):
+    """(manifest wrap mode, clamp extent) for one N64 tile axis (cm bit 0 = mirror,
+    bit 1 = clamp). The RDP clamps texel coordinates to the tile's extent first,
+    then wraps / mirrors them with the mask (= the texture size). When the extent
+    fits in the texture, the clamp is what shows: 'clamp'. Vanilla fighters shift
+    the tile and make it wider than the texture (Mario's face: 64 wide, a 32-texel
+    half mirrored): the mode is then the mask's ('mirror' / 'repeat') and the clamp
+    extent (in texture widths, e.g. 2.0) is returned too (else None). A clamped
+    tile smaller than its texture (Meta Knight's skeleton cheeks: 21 of 32 rows
+    loaded) returns its extent too: it clamps there, not at the texture's edge."""
+    if cm & 2 and extent <= size:
+        return 'clamp', (extent / size if extent < size else None)
+    return ('mirror' if cm & 1 else 'repeat'), (extent / size if cm & 2 else None)
+
+
+GL_WRAP = {'repeat': REPEAT, 'mirror': MIRRORED_REPEAT, 'clamp': CLAMP_TO_EDGE}
+
+
 class Exporter:
     def __init__(self, f, out_dir, costumes):
         self.f, self.out, self.costumes = f, out_dir, costumes
@@ -75,6 +146,7 @@ class Exporter:
                                                                'wrapS': REPEAT, 'wrapT': REPEAT}],
                    'skins': [], 'accessors': [], 'bufferViews': [], 'buffers': []}
         self.blob = bytearray()
+        self.sampler_index = {(REPEAT, REPEAT): 0}
         self.manifest = dict(costumes=costumes, joints=[], materials={}, objects={}, model_parts=[],
                              expressions=[], attributes_offset=f.attr,
                              character_sha1=hashlib.sha1(bytes(f.char)).hexdigest())
@@ -125,7 +197,31 @@ class Exporter:
     # ---- materials
     FMT = {(0, 2): 'RGBA16', (0, 3): 'RGBA32', (2, 0): 'CI4', (2, 1): 'CI8', (3, 0): 'IA4', (3, 1): 'IA8',
            (3, 2): 'IA16', (4, 0): 'I4', (4, 1): 'I8'}
-    WRAP = {0: 'repeat', 1: 'mirror', 2: 'clamp', 3: 'clamp'}
+
+    @staticmethod
+    def wrap_entry(wrap, extent, size):
+        """Manifest 'wrap': per axis mode, masks, and clamp_s / clamp_t (the tile's
+        clamp extent in texture widths) when it clamps past the texture's size."""
+        out = {}
+        for i, a in enumerate('st'):
+            mode, clamp = wrap_mode(wrap[i], extent[i], size[i])
+            out[a] = mode
+            if clamp is not None:
+                out[f'clamp_{a}'] = clamp
+        return dict(s=out['s'], t=out['t'], mask_s=wrap[2], mask_t=wrap[3],
+                    **{k: v for k, v in out.items() if k.startswith('clamp_')})
+
+    def sampler(self, entry):
+        """glTF sampler index matching the material's wrap modes."""
+        wrap = entry.get('wrap')
+        if not wrap:
+            return 0
+        key = (GL_WRAP[wrap['s']], GL_WRAP[wrap['t']])
+        if key not in self.sampler_index:
+            self.sampler_index[key] = len(self.gl['samplers'])
+            self.gl['samplers'].append({'magFilter': NEAREST, 'minFilter': NEAREST,
+                                        'wrapS': key[0], 'wrapT': key[1]})
+        return self.sampler_index[key]
 
     def material(self, key, desc, owner):
         i = self._material(key, desc)
@@ -206,11 +302,13 @@ class Exporter:
                 self.mat_index[key] = self.mat_sig[sig]
                 return self.mat_index[key]
         else:
-            w, h = desc['size']
-            fmt, siz = desc['tile']
+            tile_w, tile_h = desc['size']
             wrap, state = (key[6], key[7]) if key[0] == 'mobj' else (key[5], key[6])
-            entry.update(size=[w, h], fmt=fmt, siz=siz, format=self.FMT.get((fmt, siz), f'{fmt}/{siz}'),
-                         wrap=dict(s=self.WRAP[wrap[0]], t=self.WRAP[wrap[1]], mask_s=wrap[2], mask_t=wrap[3]),
+            w, h = FF.texture_dimensions(desc['size'], wrap)
+            fmt, siz = desc['tile']
+            entry.update(size=[w, h], tile_size=[tile_w, tile_h], fmt=fmt, siz=siz,
+                         format=self.FMT.get((fmt, siz), f'{fmt}/{siz}'),
+                         wrap=self.wrap_entry(wrap, (tile_w, tile_h), (w, h)),
                          state=[[f'{v[0]:08X}', f'{v[1]:08X}']
                                 for k, v in state if not self.model_light(v)])
             if key[0] == 'mobj':
@@ -261,7 +359,7 @@ class Exporter:
             if ms:
                 ms[0x04:0x08] = ms[0x2C:0x30] = b'\0' * 4
             nb, npb = w * h * (4, 8, 16, 32)[siz] // 8, 2 * (256 if siz == 1 else 16)
-            sig = (key[0], w, h, fmt, siz, json.dumps(entry['wrap']), json.dumps(entry['state']),
+            sig = (key[0], w, h, tile_w, tile_h, fmt, siz, json.dumps(entry['wrap']), json.dumps(entry['state']),
                    entry.get('image_source'), entry.get('palette_source'),
                    tuple(bytes(f.char[a:a + nb]) if a is not None else None for a in imgs),
                    tuple(bytes(f.char[a:a + npb]) if a is not None else None for a in pals),
@@ -271,14 +369,18 @@ class Exporter:
                 return self.mat_index[key]
             entry['images'] = [self.save_tex(name, f'img{i}', im, fmt, siz, w, h, p0) for i, im in enumerate(imgs)]
             entry['palettes'] = [self.save_tex(name, f'pal{i}', i0, fmt, siz, w, h, pl) for i, pl in enumerate(pals)]
-            entry['costumes'] = [self.save_tex(name, f'c{c}', imgs[ti], fmt, siz, w, h, pals[pi] if pals else None)
+            # costume images (what Blender shows): past a clamped tile's extent, the edge
+            # texel (the game never draws what's there). The img / pal PNGs keep it all.
+            entry['costumes'] = [self.save_tex(name, f'c{c}', imgs[ti], fmt, siz, w, h, pals[pi] if pals else None,
+                                               fill=(entry['wrap'], (tile_w, tile_h)))
                                  for c, (ti, pi) in enumerate(cmap)]
         self.manifest['materials'][name] = entry
         m = {'name': name, 'pbrMetallicRoughness': {'metallicFactor': 0.0, 'roughnessFactor': 1.0},
              'doubleSided': True}
         if entry['costumes'] and entry['costumes'][0]:
             self.gl['images'].append({'uri': entry['costumes'][0]})
-            self.gl['textures'].append({'source': len(self.gl['images']) - 1, 'sampler': 0})
+            self.gl['textures'].append({'source': len(self.gl['images']) - 1,
+                                        'sampler': self.sampler(entry)})
             m['pbrMetallicRoughness']['baseColorTexture'] = {'index': len(self.gl['textures']) - 1}
             m['alphaMode'] = 'MASK'
         else:
@@ -291,10 +393,12 @@ class Exporter:
             self.mat_sig[sig] = self.mat_index[key]
         return self.mat_index[key]
 
-    def save_tex(self, name, suffix, img, fmt, siz, w, h, pal):
+    def save_tex(self, name, suffix, img, fmt, siz, w, h, pal, fill=None):
         if img is None:
             return None
         rgba = FF.decode_texture(self.f.char, img, fmt, siz, w, h, pal)
+        if fill:
+            rgba = FF.clamp_fill(rgba, *fill)
         rel = f'textures/{name}_{suffix}.png'
         Image.fromarray(rgba, 'RGBA').save(os.path.join(self.out, rel))
         return rel
@@ -310,7 +414,8 @@ class Exporter:
             for t in tris:
                 desc = geo.materials[t.material]
                 mi = self.material(t.material, desc, None)
-                w, h = desc['size']
+                wrap = desc['wrap']
+                w, h = FF.texture_dimensions(desc['size'], wrap)
                 lit = desc['state'].get((0xD9, 0), (0, FF.GEOM_DEFAULT))[1] & FF.G_LIGHTING
                 idx = []
                 world = [self.joints[c[0]].world @ np.array([*c[1], 1.0]) for c in t.corners]
@@ -328,7 +433,7 @@ class Exporter:
                         # glTF colors are linear; Blender stores them as sRGB bytes: written as
                         # sRGB -> linear, Blender holds (and shows) the game's exact byte values
                         col.append(tuple(FF.srgb_to_linear(x / 255) for x in rgba[:3]) + (rgba[3] / 255,))
-                    uv.append((st[0] / w, st[1] / h))
+                    uv.append(((st[0] - t.tile_ul[0]) / w, (st[1] - t.tile_ul[1]) / h))
                     jnt.append(src)
                     idx.append(len(pos) - 1)
                 prims.setdefault(mi, []).extend(idx)
@@ -446,23 +551,91 @@ def costumes_in_scripts(f):
     return best
 
 
+def rom_external_data(entries, entry):
+    """A ROM file's data, followed by the files its external relocation chain points
+    into, and {field offset: target offset} for those pointers (into the appended
+    copies). Vanilla electric-shock skeletons take their bone texture from a shared
+    file this way. Each external pointer's file ID comes from the entry's ID list,
+    in chain order."""
+    data = bytearray(entry.extract('data'))
+    if entry.res is None:
+        return bytes(data), {}
+    ids = [int.from_bytes(entry.idx[i:i + 2], 'big') for i in range(0, len(entry.idx or b''), 2)]
+    links = list(FF.chain(data, entry.res).items())
+    base, ext = {}, {}
+    for (field_off, target), file_id in zip(links, ids):
+        if not 0 <= file_id < len(entries):
+            continue
+        if file_id not in base:
+            data.extend(bytes(-len(data) % 8))
+            base[file_id] = len(data)
+            data.extend(entries[file_id].extract('data'))
+        ext[field_off] = base[file_id] + target
+    return bytes(data), ext
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('char_dir', nargs='?')
-    ap.add_argument('out_dir')
+    ap.add_argument('paths', nargs='+', metavar='PATH',
+                    help='OUT_DIR, or CHAR_DIR OUT_DIR')
     ap.add_argument('--main')
     ap.add_argument('--char')
+    ap.add_argument('--rom', help='extract the source fighter files from an N64 ROM')
+    ap.add_argument('--fighter', type=str.upper, choices=FIGHTER_FILES,
+                    help='fighter name to extract from --rom (vanilla name or File.asm constant)')
+    ap.add_argument('--main-file-id', type=lambda value: int(value, 16),
+                    help='hex ROM file ID for main.bin (use with --char-file-id)')
+    ap.add_argument('--char-file-id', type=lambda value: int(value, 16),
+                    help='hex ROM file ID for character.bin (use with --main-file-id)')
     ap.add_argument('--costumes', type=int)
     ap.add_argument('--no-preview', action='store_true', help="don't render previews/*.png")
     a = ap.parse_args()
-    cfg = read_config(a.char_dir) if a.char_dir else {}
-    main_path = a.main or os.path.join(a.char_dir, 'main.bin')
-    char_path = a.char or os.path.join(a.char_dir, 'character.bin')
+    if len(a.paths) == 1:
+        char_dir, out_dir = None, a.paths[0]
+    elif len(a.paths) == 2:
+        char_dir, out_dir = a.paths
+    else:
+        ap.error('expected OUT_DIR or CHAR_DIR OUT_DIR')
+
+    if a.rom and (a.main or a.char):
+        ap.error('--rom cannot be combined with --main or --char')
+    if not a.rom and (a.fighter or a.main_file_id is not None or a.char_file_id is not None):
+        ap.error('--fighter and ROM file IDs require --rom')
+
+    cfg = read_config(char_dir) if char_dir else {}
     off = cfg.get('offsets', {})
     mi, me = (int(x, 16) for x in off.get('main', ['02CC', '0000']))
     ci = int(off.get('character', ['0004'])[0], 16)
-    f = FF.load(main_path, char_path, mi, me, ci)
-    tf = (cfg.get('attributes') or {}).get('texture_forms')
+    if a.rom:
+        if a.fighter:
+            if a.main_file_id is not None or a.char_file_id is not None:
+                ap.error('--fighter cannot be combined with explicit ROM file IDs')
+            main_id, char_id = FIGHTER_FILES[a.fighter]
+        elif a.main_file_id is None or a.char_file_id is None:
+            ap.error('--rom requires --fighter or both --main-file-id and --char-file-id')
+        else:
+            main_id, char_id = a.main_file_id, a.char_file_id
+
+        entries = SSBtbl.fromROM(N64(open(a.rom, 'rb').read()))
+        if not (0 <= main_id < len(entries) and 0 <= char_id < len(entries)):
+            ap.error(f'ROM file ID out of range (ROM has {len(entries)} entries)')
+        main_entry, char_entry = entries[main_id], entries[char_id]
+        char_data, char_ext = rom_external_data(entries, char_entry)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            main_path = os.path.join(temp_dir, 'main.bin')
+            char_path = os.path.join(temp_dir, 'character.bin')
+            with open(main_path, 'wb') as main_file:
+                main_file.write(main_entry.extract('data'))
+            with open(char_path, 'wb') as char_file:
+                char_file.write(char_data)
+            f = FF.load(main_path, char_path, main_entry.tbl or 0,
+                        main_entry.res or 0, char_entry.tbl or 0, char_ext)
+    else:
+        main_path = a.main or os.path.join(char_dir, 'main.bin')
+        char_path = a.char or os.path.join(char_dir, 'character.bin')
+        f = FF.load(main_path, char_path, mi, me, ci)
+
+    tf = (cfg.get('attributes') or {}).get('texture_forms') if not a.rom else None
     if tf:   # texture parts the build writes into main.bin (config.yaml attributes.texture_forms)
         seen = {}
         f.textureparts = []
@@ -472,8 +645,10 @@ def main():
             seen[gj] = occ + 1
             f.textureparts.append(dict(index=k, joint=gj - FF.JOINT_COMMON_START, mobj_hi=occ, mobj_lo=occ,
                                        source='config.yaml texture_forms'))
-    n = a.costumes or cfg.get('num_costumes') or costumes_in_scripts(f) or 1
-    ex = Exporter(f, a.out_dir, n)
+    n = (a.costumes or cfg.get('num_costumes')
+         or (VANILLA_FIGHTER_COSTUMES.get(a.fighter, 4) if a.fighter else None)
+         or (1 if a.rom else costumes_in_scripts(f)) or 1)
+    ex = Exporter(f, out_dir, n)
     ex.run()
     m = ex.manifest
     tris = sum(o['triangles'] for o in m['objects'].values())
@@ -481,10 +656,10 @@ def main():
           f"{len(m['materials'])} materials x {n} costumes, {len(m['model_parts'])} model parts, "
           f"{len(m['expressions'])} expression slots, "
           f"{sum(len(v['images']) for v in m['materials'].values())} image + "
-          f"{sum(len(v['palettes']) for v in m['materials'].values())} palette entries -> {a.out_dir}")
+          f"{sum(len(v['palettes']) for v in m['materials'].values())} palette entries -> {out_dir}")
     if not a.no_preview:
         import preview
-        for p in preview.save_sheets(a.out_dir):
+        for p in preview.save_sheets(out_dir):
             print(f'preview: {p}')
 
 

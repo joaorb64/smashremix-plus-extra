@@ -6,8 +6,10 @@ edited .blend back into its `main.bin` / `character.bin`.
 
 Status: export and import work. Unedited round trips of Meta Knight, Mega Man and
 Snake render identically (same textures in every costume, same expressions/palettes,
-same MObj order). Not yet: adding model-part variants, DObjDLLink (multi-DL joints),
-build-process wiring (planned: .blend files in the repo, compiled at build).
+same MObj order). ROM export discovers Remix fighters from `File.asm` and handles
+two-display-list joints used by fighters such as Bowser. Not yet: importing
+DObjDLLink joints, adding model-part variants, build-process wiring (planned:
+.blend files in the repo, compiled at build).
 
 Blender commands are given twice: as `blender`, and for Blender installed from
 Flatpak (`flatpak run org.blender.Blender`, with absolute paths: Flatpak Blender
@@ -20,6 +22,24 @@ The glTF exporter's "Vertex Color alpha without color" warnings are harmless.
 ```
 python3 appender/scripts/fighter_model/export_fighter.py extra_characters/<Name> OUT_DIR
 ```
+To export a Remix fighter directly from `original_extra.z64`, select it by the
+constant name from `appender/smashremix/src/File.asm`:
+```
+python3 appender/scripts/fighter_model/export_fighter.py --rom appender/smashremix/roms/original_extra.z64 --fighter FALCO OUT_DIR
+```
+Paired `*_MAIN` and `*_CHARACTER` IDs are discovered from `File.asm`.
+Named fighters default to four costumes; override with `--costumes N` when needed.
+Vanilla fighters are also available by name (for example `MARIO`); their IDs
+are the original US 1.0 file-table IDs, so the selected ROM must contain those
+files (`original.z64` or `original_extra.z64`).
+For another Remix fighter pair, provide its hexadecimal table IDs instead:
+```
+python3 appender/scripts/fighter_model/export_fighter.py --rom ROM.z64 --main-file-id 0xCB --char-file-id 0x128 OUT_DIR
+```
+ROM file IDs can be found in `appender/scripts/gen_editable_rom.py`. ROM exports
+read relocation-chain offsets from the ROM file table; ordinary `main.bin` /
+`character.bin` exports continue using their config offsets.
+
 ```
 blender -b --factory-startup --python appender/scripts/fighter_model/build_blend.py -- OUT_DIR
 ```
@@ -64,7 +84,9 @@ Blender compute them. Scene custom properties `n64_light_color` / `n64_shadow_co
 | `<mat>_pal<p>.png` | palette list entry p, shown on the costume-0 image | recolor: each pixel's color becomes that palette slot's color |
 
 The img/pal PNGs are loaded in the .blend as images (Image Editor) to paint.
-Unedited entries keep their exact original bytes.
+Unedited entries keep their exact original bytes. PNG dimensions follow the
+texture's render-tile masks; the render-tile extents are kept separately so
+rebuilding preserves repeated or clamped sampling.
 
 ### Material settings (Blender: Material > N64 Fighter)
 

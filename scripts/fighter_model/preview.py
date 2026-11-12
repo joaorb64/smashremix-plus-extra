@@ -135,7 +135,9 @@ def combine(cc, T, S, P, E):
     return comb
 
 
-def wrap_coord(x, n, mode):
+def wrap_coord(x, n, mode, clamp=None):
+    if clamp:                     # the tile's clamp extent (in texture sizes), applied before the mask
+        x = np.clip(x, 0, int(round(clamp * n)) - 1)
     if mode == 'clamp':
         return np.clip(x, 0, n - 1)
     if mode == 'mirror':
@@ -205,8 +207,8 @@ def render(tris, yaw, H, bounds=None, pitch=0.0):
             u = (a * UV[0, 0] + b * UV[1, 0] + cc * UV[2, 0]) * tw
             v = (a * UV[0, 1] + b * UV[1, 1] + cc * UV[2, 1]) * th
             ws, wt = (wrap or {}).get('s', 'repeat'), (wrap or {}).get('t', 'repeat')
-            tx = wrap_coord(np.floor(u).astype(int), tw, ws)
-            ty = wrap_coord(np.floor(v).astype(int), th, wt)
+            tx = wrap_coord(np.floor(u).astype(int), tw, ws, (wrap or {}).get('clamp_s'))
+            ty = wrap_coord(np.floor(v).astype(int), th, wt, (wrap or {}).get('clamp_t'))
             texel = tex[ty, tx] / 255
         else:
             texel = np.concatenate([np.broadcast_to(col / 255, xs.shape + (3,)), np.ones(xs.shape + (1,))], -1)

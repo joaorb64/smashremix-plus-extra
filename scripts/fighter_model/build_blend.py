@@ -32,7 +32,12 @@ N = man['costumes']
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
-bpy.ops.import_scene.gltf(filepath=os.path.join(DIR, 'model.gltf'))
+try:     # bone tails toward the child joints (the default keeps each joint's own axes: bones
+         # sticking out sideways, with sphere shapes). Display only: import_fighter.py takes
+         # the joints from the game file and the vertices as they are, not the bones' rest.
+    bpy.ops.import_scene.gltf(filepath=os.path.join(DIR, 'model.gltf'), bone_heuristic='TEMPERANCE')
+except TypeError:
+    bpy.ops.import_scene.gltf(filepath=os.path.join(DIR, 'model.gltf'))
 imported = list(bpy.context.selected_objects) or list(scene.objects)
 
 
@@ -74,7 +79,19 @@ def costume_material(base, k):
     cc = entry.get('costume_colors') or []
     if entry.get('untextured') and m.node_tree and cc and 'prim' in cc[min(k, len(cc) - 1)]:
         set_base_color(m, cc[min(k, len(cc) - 1)]['prim'])   # this costume's color (edit it here)
+    set_costume_lights(m, cc[min(k, len(cc) - 1)] if cc else {})
     return m
+
+
+def set_costume_lights(m, colors):
+    """An MObj's own light colors for this costume (vanilla Mario's shoes are white, lit
+    by a brown light). Shown in Blender only (n64_costume_light / n64_costume_shadow):
+    the importer keeps the MObj's colors from the manifest."""
+    for key, track in (('n64_costume_light', 'light1'), ('n64_costume_shadow', 'light2')):
+        if colors.get(track):
+            m[key] = colors[track][:6]
+        elif key in m:
+            del m[key]
 
 
 def set_base_color(m, hex_rgba):
@@ -106,6 +123,9 @@ for m in bpy.data.materials:
             m['n64_format'] = entry.get('format', 'CI4')
             m['n64_wrap_s'] = wrap.get('s', 'clamp')
             m['n64_wrap_t'] = wrap.get('t', 'clamp')
+            for a in 'st':          # tile clamped past the texture's size (vanilla fighters)
+                if wrap.get(f'clamp_{a}'):
+                    m[f'n64_clamp_{a}'] = float(wrap[f'clamp_{a}'])
         state = entry.get('state') or []
         cull = next((int(b, 16) for a, b in state if a.startswith('D9')), 0x400)
         m['n64_cull'] = {0: 'none', 0x400: 'back', 0x200: 'front', 0x600: 'both'}.get(cull & 0x600, 'back')
@@ -122,6 +142,12 @@ for m in bpy.data.materials:
         m['n64_state'] = '; '.join(f'{a} {b}' for a, b in state if not a.startswith(('D9', 'DB', 'E3001201', 'E3001001')))
     if entry and entry.get('untextured') and m.node_tree and (entry.get('costume_colors') or [{}])[0].get('prim'):
         set_base_color(m, entry['costume_colors'][0]['prim'])
+    if entry and entry.get('costume_colors'):
+        set_costume_lights(m, entry['costume_colors'][0])
+    elif entry and entry.get('kind') == 'prim' and m.node_tree and entry.get('color'):
+        # one DL prim color, no MObj: the glTF import leaves Blender's default gray, and
+        # import_fighter.py reads the base color back as the prim color
+        set_base_color(m, ''.join(f'{v:02X}' for v in entry['color'][:3]))
     if m.node_tree:
         for node in m.node_tree.nodes:
             if node.type == 'TEX_IMAGE':
@@ -169,10 +195,55 @@ for ob in [o for o in scene.objects if o.type == 'MESH']:
     me.normals_split_custom_set(normals)
     me.update()
 
+def tidy_bones(arm):
+    """Readable bones (display only, see the glTF import above): each bone reaches to its
+    children; a joint stacked on its child (N64 fighters chain joints at one spot for
+    separate rotations: shoulders, neck, ankles) becomes a short stub along that child;
+    end bones are half their parent's length. Colored by side: Left / Right / Center
+    bone collections (the fighter's left is +X)."""
+    bpy.context.view_layer.objects.active = arm
+    arm.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    eb = arm.data.edit_bones
+
+    def depth(b):
+        return 0 if b.parent is None else 1 + depth(b.parent)
+    for b in sorted(eb, key=depth, reverse=True):     # children first: stubs follow them
+        apart = [c for c in b.children if (c.head - b.head).length > 1.0]
+        if len(apart) > 1:      # not toward a child at the origin (the ground point)
+            apart = [c for c in apart if c.head.length > 1.0] or apart
+        stacked = [c for c in b.children if (c.head - b.head).length <= 1.0]
+        if apart:
+            tgt = sum((c.head for c in apart), b.head * 0) / len(apart)
+            if (tgt - b.head).length > 1.0:
+                b.tail = tgt
+        elif stacked:
+            c = stacked[0]
+            b.tail = b.head + (c.tail - c.head).normalized() * max(c.length * 0.35, 10.0)
+        elif b.parent is not None:
+            b.length = max(b.parent.length * 0.5, 15.0)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    arm.show_in_front = True            # Viewport Display > Show: In Front, Names
+    arm.data.show_names = True
+    try:
+        groups = {}
+        for name, theme in (('Center', 'THEME09'), ('Left', 'THEME01'), ('Right', 'THEME04')):
+            groups[name] = arm.data.collections.get(name) or arm.data.collections.new(name)
+            groups[name]['theme'] = theme
+        for b in arm.data.bones:
+            x = b.head_local.x
+            side = 'Left' if x > 5 else 'Right' if x < -5 else 'Center'
+            groups[side].assign(b)
+            b.color.palette = groups[side]['theme']
+    except AttributeError:      # Blender < 4: no bone collections / colors
+        pass
+
+
 arm = next((o for o in scene.objects if o.type == 'ARMATURE'), None)
 c_arm = coll('Armature')
 if arm:
     move(arm, c_arm)
+    tidy_bones(arm)
 meshes = [o for o in scene.objects if o.type == 'MESH']
 hi = [o for o in meshes if o.name.startswith('hi_')]
 lo = [o for o in meshes if o.name.startswith('lo_')]

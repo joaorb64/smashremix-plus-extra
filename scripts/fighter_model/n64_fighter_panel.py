@@ -145,6 +145,24 @@ def update_view(m, context=None):
         nt.links.new(uv.outputs['UV'], sep.inputs[0])
         for i, (axis, mode) in enumerate((('X', ws), ('Y', wt))):
             mth = _node(nt, f'N64 Wrap {axis}', 'ShaderNodeMath', x - 450, y + 120 - 240 * i)
+            src = sep.outputs[axis]
+            if axis == 'Y':
+                # glTF import flips V (v = 1 - t): wrap / clamp in the N64's t, flip back after.
+                # (Clamping at a tile extent isn't symmetric, so this matters: DK's fur.)
+                fin = _node(nt, 'N64 Flip In Y', 'ShaderNodeMath', x - 820, y - 120)
+                fin.operation, fin.inputs[0].default_value = 'SUBTRACT', 1.0
+                nt.links.new(src, fin.inputs[1])
+                src = fin.outputs[0]
+            clamp = m.get('n64_clamp_' + 'st'[i])
+            if clamp and mode != 'clamp':      # the tile clamps first, past the texture's size
+                cl = _node(nt, f'N64 Clamp {axis}', 'ShaderNodeClamp', x - 580, y + 120 - 240 * i)
+                cl.inputs['Min'].default_value, cl.inputs['Max'].default_value = 0.0, float(clamp)
+                nt.links.new(src, cl.inputs['Value'])
+                src = cl.outputs[0]
+            else:
+                cl = nt.nodes.get(f'N64 Clamp {axis}')
+                if cl is not None:
+                    nt.nodes.remove(cl)
             mth.use_clamp = False
             if mode == 'repeat':
                 mth.operation = 'WRAP'
@@ -152,12 +170,22 @@ def update_view(m, context=None):
             elif mode == 'mirror':
                 mth.operation = 'PINGPONG'
                 mth.inputs[1].default_value = 1.0
+            elif clamp and clamp < 1:          # clamp at the tile's extent, inside the texture
+                mth.operation = 'MINIMUM'
+                mth.inputs[1].default_value = float(clamp)
+                mth.use_clamp = True
             else:                              # clamp: the edge pixels repeat
                 mth.operation = 'ADD'
                 mth.inputs[1].default_value = 0.0
                 mth.use_clamp = True
-            nt.links.new(sep.outputs[axis], mth.inputs[0])
-            nt.links.new(mth.outputs[0], comb.inputs[axis])
+            nt.links.new(src, mth.inputs[0])
+            res = mth.outputs[0]
+            if axis == 'Y':
+                fout = _node(nt, 'N64 Flip Out Y', 'ShaderNodeMath', x - 320, y - 120)
+                fout.operation, fout.inputs[0].default_value = 'SUBTRACT', 1.0
+                nt.links.new(res, fout.inputs[1])
+                res = fout.outputs[0]
+            nt.links.new(res, comb.inputs[axis])
         nt.links.new(comb.outputs[0], tex.inputs['Vector'])
     if out is None or bsdf is None:
         return
@@ -214,7 +242,18 @@ def build_combiner(m, nt, tex, out, bsdf):
     tex_c = tex.outputs['Color'] if tex is not None else one_c
     tex_a = tex.outputs['Alpha'] if tex is not None else one
     if lit:
-        shade_c, shade_a = one_c, one
+        # Blender's lighting stands in for the model's light. A material lit by its own
+        # light color (n64_light_color, or its MObj's: n64_costume_light) is tinted by
+        # how that color compares with the model's (vanilla Mario's shoes: white, lit brown)
+        own = m.get('n64_light_color') or m.get('n64_costume_light')
+        if own:
+            scn = bpy.context.scene.get('n64_light_color', 'FFFFFF') if bpy.context.scene else 'FFFFFF'
+            a = [_srgb_lin(((int(str(own), 16) >> sh) & 255) / 255) for sh in (16, 8, 0)]
+            b = [_srgb_lin(((int(str(scn), 16) >> sh) & 255) / 255) for sh in (16, 8, 0)]
+            shade_c = rgb([min(x / y, 1.0) if y > 0 else x for x, y in zip(a, b)])
+        else:
+            shade_c = one_c
+        shade_a = one
     else:
         vc = node('ShaderNodeVertexColor')
         shade_c, shade_a = vc.outputs['Color'], vc.outputs['Alpha']
