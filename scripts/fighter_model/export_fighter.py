@@ -79,12 +79,12 @@ VANILLA_STAGES = {
 
 
 def remix_stages():
-    """Remix stages' header (Map) files: File.asm STG_<NAME>_HEADER constants."""
+    """Remix stages' header (Map) files: File.asm *_HEADER constants."""
     file_asm = os.path.join(APPENDER_DIR, 'smashremix', 'src', 'File.asm')
     out = {}
     if os.path.isfile(file_asm):
         for line in open(file_asm, encoding='utf-8'):
-            m = re.match(r'^\s*constant\s+STG_([A-Z0-9_]+)_HEADER\((0x[0-9A-Fa-f]+|\d+)\)', line)
+            m = re.match(r'^\s*constant\s+(?:STG_)?([A-Z0-9_]+)_HEADER\((0x[0-9A-Fa-f]+|\d+)\)', line)
             if m:
                 out[m.group(1)] = int(m.group(2), 0)
     return out

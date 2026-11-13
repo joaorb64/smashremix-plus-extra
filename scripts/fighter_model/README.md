@@ -113,7 +113,8 @@ To export a stage directly from a Smash Remix ROM, give its name to `--stage`:
 python3 appender/scripts/fighter_model/export_fighter.py --rom ROM.z64 --stage BATTLEFIELD OUT_DIR
 ```
 Use a stage name such as `BATTLEFIELD`, `DEKU`, or `MUTE` (`File.asm`'s
-`STG_<NAME>_HEADER` constants; the `STG_` prefix and `_HEADER` suffix are optional;
+`*_HEADER` constants (with or without the `STG_` prefix); the prefix and suffix
+are optional;
 `--help` lists them all), or the stage header file's hexadecimal ID (the decomp calls
 it the Map file). The ROM supplies the stage header and its referenced geometry files.
 Without `--rom`, `--stage` (with no name) means the folder given is a stage folder.
