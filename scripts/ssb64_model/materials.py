@@ -24,7 +24,7 @@ import struct
 import numpy as np
 from PIL import Image
 
-import fighter_files as FF
+import model_files as MF
 import matanim as MA
 
 FORMATS = {'RGBA16': (0, 2), 'RGBA32': (0, 3), 'CI4': (2, 0), 'CI8': (2, 1), 'IA4': (3, 0), 'IA8': (3, 1),
@@ -61,7 +61,7 @@ def rgba5551(c):
 
 
 def decode_pal(raw):
-    return np.array([FF.rgba16(v) for v in struct.unpack(f'>{len(raw) // 2}H', raw)], np.uint8)
+    return np.array([MF.rgba16(v) for v in struct.unpack(f'>{len(raw) // 2}H', raw)], np.uint8)
 
 
 def encode_pal(pal):
@@ -208,12 +208,12 @@ class Material:
         if (w & (w - 1) or h & (h - 1)) and (w * BPP[self.siz] // 8) % 8:
             raise SystemExit(f'{name}: {w}x{h} {fmt_name}: sizes that aren\'t powers of two need rows of a multiple '
                              'of 8 bytes')
-        self.stride = FF.row_bytes(w, self.siz)        # rows are stored 64-bit aligned
+        self.stride = MF.row_bytes(w, self.siz)        # rows are stored 64-bit aligned
         nbytes = self.stride * h
         if nbytes > (2048 if self.ci else 4096):
             raise SystemExit(f'{name}: {w}x{h} {fmt_name} does not fit the texture memory')
         wrap = e.get('wrap') or {}
-        self.wrap_dict = wrap                          # as exported (costume PNGs: FF.clamp_fill)
+        self.wrap_dict = wrap                          # as exported (costume PNGs: MF.clamp_fill)
         self.masks = (wrap['mask_s'], wrap['mask_t']) if 'mask_s' in wrap and 'mask_t' in wrap else None
         self.wrap_s = props.get('n64_wrap_s') or wrap.get('s', 'clamp')
         self.wrap_t = props.get('n64_wrap_t') or wrap.get('t', 'clamp')
@@ -295,8 +295,8 @@ class Material:
             im = resize(im, w, h)
             # not painted in Blender (still the exported costume image): the entry PNGs decide
             orig = orig_imgs[ti] if not self.ci else orig_pals[pi][orig_imgs[ti]].reshape(h, w, 4)
-            # the export fills past a clamped tile's extent with the edge texel (FF.clamp_fill)
-            if same_image(FF.clamp_fill(orig, self.wrap_dict, (self.tile_w, self.tile_h)), im):
+            # the export fills past a clamped tile's extent with the edge texel (MF.clamp_fill)
+            if same_image(MF.clamp_fill(orig, self.wrap_dict, (self.tile_w, self.tile_h)), im):
                 continue
             if not self.ci:
                 imgs[ti] = im
@@ -367,7 +367,7 @@ class Material:
         return b''.join(raw[y * self.stride:y * self.stride + row] for y in range(self.h))
 
     def _decode(self, raw):
-        return FF.decode_texture(raw + b'\0' * 8, 0, self.fmt, self.siz, self.w, self.h, None)
+        return MF.decode_texture(raw + b'\0' * 8, 0, self.fmt, self.siz, self.w, self.h, None)
 
     def _init_state(self, e, props):
         name = self.name
@@ -385,14 +385,14 @@ class Material:
             raise SystemExit(f'{name}: n64_lighting {lighting!r} (use on or off)')
         old_geom = next((b for a, b in self.state if a >> 24 == 0xD9),
                         next((int(b, 16) for a, b in e.get('state') or [] if a.startswith('D9')), None))
-        geom = FF.GEOM_DEFAULT if old_geom is None else old_geom & FF.GEOM_BITS
+        geom = MF.GEOM_DEFAULT if old_geom is None else old_geom & MF.GEOM_BITS
         if cull is not None:
             geom = (geom & ~0x600) | CULL[cull]
         if lighting is not None:
-            geom = (geom & ~FF.G_LIGHTING) | (FF.G_LIGHTING if lighting == 'on' else 0)
-        self.state = [s for s in self.state if s[0] >> 24 != 0xD9] + [(FF.GEOM_CMD, geom)]
+            geom = (geom & ~MF.G_LIGHTING) | (MF.G_LIGHTING if lighting == 'on' else 0)
+        self.state = [s for s in self.state if s[0] >> 24 != 0xD9] + [(MF.GEOM_CMD, geom)]
         self.cull = next(k for k, v in CULL.items() if v == geom & 0x600)
-        self.lit = bool(geom & FF.G_LIGHTING)
+        self.lit = bool(geom & MF.G_LIGHTING)
         # texture filtering: bilinear is the game's (not written); point / average are
         filt = props.get('n64_filter')
         if filt is not None and filt not in FILTER:

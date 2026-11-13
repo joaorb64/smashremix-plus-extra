@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Build a fighter's main.bin + character.bin from an edited fighter.blend.
+"""Build a fighter's main.bin + character.bin from an edited model.blend.
 
+    # (ssb64_model.py import OUT_DIR does both steps)
     # 1. inside Blender: export the .blend's geometry + costume material table
-    blender -b fighter.blend --python blend_to_gltf.py -- WORK_DIR
+    blender -b model.blend --python blend_to_gltf.py -- WORK_DIR
     # 2. compile into the character's .bin files
     python3 import_fighter.py extra_characters/<Name> WORK_DIR [--out OUT_DIR] [--manifest EXPORT_DIR/manifest.json]
 
@@ -31,7 +32,7 @@ from PIL import Image
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))     # appender root
-import fighter_files as FF  # noqa: E402
+import model_files as MF  # noqa: E402
 import materials as MAT  # noqa: E402
 import gbi_writer as GW  # noqa: E402
 from smashremix_extra import ge_bin as ge  # noqa: E402
@@ -91,7 +92,7 @@ def load_gltf(path):
                 c = acc(at['COLOR_0'])
                 if c.shape[1] == 3:
                     c = np.hstack([c, np.ones((len(c), 1))])
-                c[:, :3] = [[FF.linear_to_srgb(x) for x in row] for row in c[:, :3]]
+                c[:, :3] = [[MF.linear_to_srgb(x) for x in row] for row in c[:, :3]]
             else:
                 c = np.ones((len(P), 4))
             col.append(c)
@@ -409,7 +410,7 @@ def prologue_of(f, dl):
     return out
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('char_dir')
     ap.add_argument('work_dir', help='blend_to_gltf.py output')
@@ -424,15 +425,15 @@ def main():
                          'so the cloaking device fades them like the rest of the fighter)')
     ap.add_argument('--preview', metavar='DIR', help='render what was built (body, expressions, parts, skeleton '
                                                     'sheets) into DIR')
-    a = ap.parse_args()
-    import export_fighter as EX
+    a = ap.parse_args(argv)
+    import export_model as EX
     cfg = EX.read_config(a.char_dir)
     off = cfg.get('offsets', {})
     mi_head, me_head = (int(x, 16) for x in off.get('main', ['02CC', '0000']))
     ci_head = int(off.get('character', ['0004'])[0], 16)
     main_path = a.main or os.path.join(a.char_dir, 'main.bin')
     char_path = a.char or os.path.join(a.char_dir, 'character.bin')
-    f = FF.load(main_path, char_path, mi_head, me_head, ci_head)
+    f = MF.load(main_path, char_path, mi_head, me_head, ci_head)
     N = a.costumes or cfg.get('num_costumes') or 1
     textures = Materials(a.work_dir, N, f.char, a.manifest)
     if not (a.costumes or cfg.get('num_costumes')) and textures.manifest.get('costumes'):
@@ -462,7 +463,7 @@ def main():
         template_ms = None
         for lst in f.details['hi']['mobjs'].values():
             for ms in lst:
-                if FF.u16(f.char, ms + 0x30) & 0x0005 == 0x0005:
+                if MF.u16(f.char, ms + 0x30) & 0x0005 == 0x0005:
                     template_ms = ms
                     break
             if template_ms:
@@ -534,7 +535,7 @@ def main():
                 blob.ptr(p_an + 4 * j, an)
             return p_ms, p_an
 
-        cp = f.ptr_main(f.attr + FF.A_COMMONPARTS)[1]
+        cp = f.ptr_main(f.attr + MF.A_COMMONPARTS)[1]
         for k, (detail, gltf) in enumerate((('hi', 'body.gltf'), ('lo', 'lo.gltf'))):
             path = os.path.join(a.work_dir, gltf)
             d = f.details.get(detail)
@@ -546,12 +547,12 @@ def main():
                                      mobj_order=order)
             p_ms, p_an = lists_for(mats, len(d['joints']))
             body_mats[detail] = mats
-            arr = bytearray(f.char[d['dobjdesc']:d['dobjdesc'] + FF.DOBJDESC_SIZE * len(d['joints']) + 4])
+            arr = bytearray(f.char[d['dobjdesc']:d['dobjdesc'] + MF.DOBJDESC_SIZE * len(d['joints']) + 4])
             for j in range(len(d['joints'])):
-                struct.pack_into('>I', arr, FF.DOBJDESC_SIZE * j + 4, 0)
+                struct.pack_into('>I', arr, MF.DOBJDESC_SIZE * j + 4, 0)
             do = blob.add(bytes(arr), 8)
             for j, dl in dls.items():
-                blob.ptr(do + FF.DOBJDESC_SIZE * j + 4, dl)
+                blob.ptr(do + MF.DOBJDESC_SIZE * j + 4, dl)
             base = cp + 0x10 * k
             retarget[base] = do
             retarget[base + 4] = p_ms
@@ -624,7 +625,7 @@ def main():
 
     def char_fields_of(main_bytes, lines):
         reqlist = [ln.strip() for ln in lines if not ln.startswith('END OF')]
-        ext_fields = list(FF.chain(bytes(main_bytes), me_head).keys())
+        ext_fields = list(MF.chain(bytes(main_bytes), me_head).keys())
         if len(reqlist) != len(ext_fields) + extend:
             raise SystemExit(f'main_reqlist.txt has {len(reqlist)} lines but main.bin has '
                              f'{len(ext_fields)} external pointers (+{extend} extend_main_reqlist)')
@@ -647,15 +648,15 @@ def main():
     blob, retarget = build(len(char))
 
     # ---- write character.bin (+ new data), re-point main.bin
-    newc = GW.append_blob(char + b'\0' * ((-len(char)) % 8), blob, ci_head, lambda d, h: FF.chain(d, h))
+    newc = GW.append_blob(char + b'\0' * ((-len(char)) % 8), blob, ci_head, lambda d, h: MF.chain(d, h))
     added = 0
     for fld, tgt in sorted(retarget.items()):
         if fld not in f.main_ext:
-            if FF.u32(main, fld) != 0:
+            if MF.u32(main, fld) != 0:
                 raise SystemExit(f'main.bin 0x{fld:X} holds data, not an (empty) pointer field')
             # new pointer into character.bin: append it to main.bin's external chain and
             # add its file (${CHARACTER}) at the end of the reqlist, in the same order
-            ext_tail = list(FF.chain(bytes(main), me_head).keys())[-1]
+            ext_tail = list(MF.chain(bytes(main), me_head).keys())[-1]
             struct.pack_into('>H', main, ext_tail, fld // 4)
             struct.pack_into('>H', main, fld, 0xFFFF)
             end = next((i for i, ln in enumerate(reqlist_lines) if ln.startswith('END OF')), len(reqlist_lines))
@@ -669,17 +670,23 @@ def main():
     # ---- remove what nothing reaches anymore (roots: main.bin's pointers into character.bin)
     if not a.no_gc:
         char_fields = char_fields_of(main, reqlist_lines)
-        roots = [0, ci_head] + [FF.u16(main, fld + 2) * 4 for fld in char_fields]
+        roots = [0, ci_head] + [MF.u16(main, fld + 2) * 4 for fld in char_fields]
         res = ge.gc(bytes(newc), roots, head=ci_head)
         if res.new_head != ci_head:
             raise SystemExit(f'character.bin chain head moved 0x{ci_head:X} -> 0x{res.new_head:X}')
         for fld in char_fields:
-            t = FF.u16(main, fld + 2) * 4
+            t = MF.u16(main, fld + 2) * 4
             struct.pack_into('>H', main, fld + 2, res.remap[t] // 4)
         print('  ' + res.report[2])
         newc = res.data
     if len(newc) > 0x3FFFC:
         raise SystemExit(f'character.bin is {len(newc)} bytes: over the 0x3FFFC limit')
+    # hurtboxes (the .blend's Hurtboxes): main.bin, and config.yaml's list when it has one
+    import gamedata as GD
+    msg = GD.apply_hurtboxes(f, main, cfg, a.work_dir, getattr(textures, 'manifest', None) or {},
+                             os.path.join(a.char_dir, 'config.yaml'), write_cfg=a.out is None)
+    if msg:
+        print('  ' + msg)
     out = a.out or a.char_dir
     os.makedirs(out, exist_ok=True)
     open(os.path.join(out, 'character.bin'), 'wb').write(newc)
@@ -687,12 +694,12 @@ def main():
     open(os.path.join(out, 'main_reqlist.txt'), 'w', encoding='utf-8', newline='').write(
         newline.join(reqlist_lines) + (newline if reqlist_raw.endswith(b'\n') else ''))
     print(f'wrote {out}/character.bin ({len(newc)} bytes), main.bin, main_reqlist.txt')
-    built = FF.load(os.path.join(out, 'main.bin'), os.path.join(out, 'character.bin'), mi_head, me_head, ci_head)
+    built = MF.load(os.path.join(out, 'main.bin'), os.path.join(out, 'character.bin'), mi_head, me_head, ci_head)
     check_cloaking(cfg, built)
     if a.preview:                     # what was built, read back like any fighter: export it, render that
         import shutil
         import tempfile
-        import export_fighter as EXP
+        import export_model as EXP
         import preview
         tmp = tempfile.mkdtemp(prefix='fighter_preview_')
         try:
@@ -728,7 +735,7 @@ def check_cloaking(cfg, f):
             for label, dl in dls:
                 offs, o = [], dl
                 while o + 8 <= len(f.char) and f.char[o] != 0xDF:
-                    if FF.u32(f.char, o) == 0xE200001C:          # set render mode (not alpha compare)
+                    if MF.u32(f.char, o) == 0xE200001C:          # set render mode (not alpha compare)
                         offs.append(o - dl)
                     o += 8
                 found.setdefault(tuple(offs), []).append(label)

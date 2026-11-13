@@ -1,4 +1,5 @@
-"""Build an editable .blend from an export_fighter.py folder (run inside Blender).
+"""Build an editable .blend from an export_model.py folder (run inside Blender;
+ssb64_model.py export runs it).
 
   blender -b --python build_blend.py -- EXPORT_DIR
 
@@ -18,7 +19,7 @@ Layout of the .blend:
 Every image / palette list entry (facial expressions, extra palettes) is loaded
 as an image (<mat>_img<i>, <mat>_pal<p>) to paint in the Image Editor.
 Materials carry n64_format / n64_wrap_s / n64_wrap_t / n64_state properties.
-Writes EXPORT_DIR/fighter.blend.
+Writes EXPORT_DIR/model.blend.
 """
 import json
 import re
@@ -274,7 +275,7 @@ if IS_STAGE:
         a.name = 'Stage'                   # every layer's bones (L<n>_joint_NN), and the animation
 if man.get('animations'):                  # joint animations (stage layers: L<n>_joint_NN; items,
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))          # projectiles: joint_NN)
-    import n64_fighter_panel as _P  # noqa: E402
+    import n64_panel as _P  # noqa: E402
 
     def _bone(L, j):
         return f'{L}_joint_{int(j):02d}' if L != 'hi' else f'joint_{int(j):02d}'
@@ -323,7 +324,7 @@ if IS_STAGE:
         # Layer 0 is painted first in the game, with no depth test: whatever comes after it
         # covers it, even where it's closer (Gym Leader's horn feet under the floor); layers 2 / 3
         # cover everything: renders composite the layers in that order (render passes below).
-        o.show_in_front = False                  # (see n64_fighter_panel LAYER_DEPTH)
+        o.show_in_front = False                  # (see n64_panel LAYER_DEPTH)
 meshes = [o for o in scene.objects if o.type == 'MESH']
 hi = [o for o in meshes if o.name.startswith('hi_')]
 lo = [o for o in meshes if o.name.startswith('lo_')]
@@ -372,7 +373,7 @@ for name, entry in man['materials'].items():
 # palette list entries as 'N64 Frame <i>' / 'N64 Palette <i>' texture nodes the preview flips
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import matanim as MA  # noqa: E402
-import n64_fighter_panel as PANEL  # noqa: E402
+import n64_panel as PANEL  # noqa: E402
 anim_frames = 0
 IS_OBJECT = bool(man.get('object'))
 for m in list(bpy.data.materials):
@@ -433,9 +434,9 @@ try:
                     'material is shaded by it with its light / shadow colors', step=100, precision=1)
 except (TypeError, AttributeError):
     pass
-if man.get('object'):                         # items / projectiles: see n64_fighter_panel build_combiner
+if man.get('object'):                         # items / projectiles: see n64_panel build_combiner
     scene['n64_default_env'] = '00000000'  # ambient = shadow color (hex RGB)
-scene['fighter_export_dir'] = '//'
+scene['n64_export_dir'] = '//'
 scene['n64_collapse_outliner'] = True        # the panel script collapses the outliner on the first open          # where manifest.json + textures/ are (relative to the .blend)
 
 # ---- the game's camera (gmcamera.c): 38 degrees vertical field of view, 320 x 240, tilted down
@@ -574,6 +575,13 @@ if not os.environ.get('N64_NO_VIEW'):
     for m in bpy.data.materials:
         PANEL.update_view(m)
 
+# hurtboxes (fighters), collision lines / map objects / spawns / bounds (stages): objects to edit
+import blend_gamedata as GDB  # noqa: E402
+GDB.build(man)
+for ob in bpy.data.objects:
+    if ob.get('n64_gamedata') == 'collision_group':
+        PANEL._set_collision_group_renderer(ob)
+
 # tooltips on the raw custom properties (also without the panel)
 PROP_DESC = {
     'n64_format': 'Texture format: CI4, CI8, IA4, IA8, IA16, I4, I8, RGBA16',
@@ -594,13 +602,13 @@ for idb in list(bpy.data.materials) + [scene]:
             except (TypeError, AttributeError):
                 pass
 
-# the N64 Fighter panel (dropdowns / color pickers for the n64_* properties), registered
-# when the .blend is opened with its scripts allowed (or install n64_fighter_panel.py as an add-on)
-panel_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'n64_fighter_panel.py')
+# the N64 Model panel (dropdowns / color pickers for the n64_* properties), registered
+# when the .blend is opened with its scripts allowed (or install n64_panel.py as an add-on)
+panel_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'n64_panel.py')
 if os.path.exists(panel_src):
-    txt = bpy.data.texts.get('n64_fighter_panel.py') or bpy.data.texts.new('n64_fighter_panel.py')
+    txt = bpy.data.texts.get('n64_panel.py') or bpy.data.texts.new('n64_panel.py')
     txt.from_string(open(panel_src, encoding='utf-8').read())
     txt.use_module = True                          # 'Register': runs when the file is opened
-bpy.ops.wm.save_as_mainfile(filepath=os.path.join(DIR, 'fighter.blend'), relative_remap=True)
-print(f'built fighter.blend: {len(hi)} body pieces x {N} costumes (shared meshes), '
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(DIR, 'model.blend'), relative_remap=True)
+print(f'built model.blend: {len(hi)} body pieces x {N} costumes (shared meshes), '
       f'{len(lo)} low-detail, {len(parts)} part objects, {n_entries} image/palette entries')

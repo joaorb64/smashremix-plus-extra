@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Export a fighter's model (main.bin + character.bin) for editing in Blender.
+"""Export a Smash 64 model (fighter, item / projectile, stage) for editing in Blender.
+Usually run through ssb64_model.py export, which picks the options and builds the .blend.
 
-    python3 export_fighter.py CHAR_DIR OUT_DIR [--costumes N]
-    python3 export_fighter.py --main main.bin --char character.bin OUT_DIR
+    python3 export_model.py CHAR_DIR OUT_DIR [--costumes N]          fighter
+    python3 export_model.py --main main.bin --char character.bin OUT_DIR
+    python3 export_model.py FOLDER OUT_DIR --object NAME             item / projectile
+    python3 export_model.py STAGE_DIR OUT_DIR --stage                stage
+    python3 export_model.py --rom ROM.z64 --fighter X | --stage X | --item X OUT_DIR
 
 CHAR_DIR is an extra_characters/<Name> folder (main.bin, character.bin,
 config.yaml: pointer chain offsets and num_costumes are read from it).
@@ -31,9 +35,10 @@ from PIL import Image
 APPENDER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, APPENDER_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import fighter_files as FF  # noqa: E402
+import model_files as MF  # noqa: E402
 import matanim as MA  # noqa: E402
 import jointanim as JA  # noqa: E402
+import gamedata as GD  # noqa: E402
 from SSB import N64, SSBtbl  # noqa: E402
 
 FLOAT, USHORT, UINT = 5126, 5123, 5125
@@ -137,7 +142,7 @@ def quat_from_matrix(R):
 def object_files(cfg, char_dir, name):
     """An extra character's item / projectile by name (e.g. 'knuckle'): its attributes file
     (config.yaml files: <name>_hitbox or <name>) and model file (append_files: <name>_gfx),
-    with their chain heads -> dict for FF.load_object."""
+    with their chain heads -> dict for MF.load_object."""
     def entries(lst):
         for e in lst or []:
             if e and isinstance(e[0], list):
@@ -211,7 +216,7 @@ class Exporter:
     def __init__(self, f, out_dir, costumes):
         self.f, self.out, self.costumes = f, out_dir, costumes
         os.makedirs(os.path.join(out_dir, 'textures'), exist_ok=True)
-        self.gl = {'asset': {'version': '2.0', 'generator': 'smashremix-extra fighter_model/export_fighter.py'},
+        self.gl = {'asset': {'version': '2.0', 'generator': 'smashremix-extra ssb64_model/export_model.py'},
                    'scene': 0, 'scenes': [{'nodes': []}], 'nodes': [], 'meshes': [], 'materials': [],
                    'textures': [], 'images': [], 'samplers': [{'magFilter': NEAREST, 'minFilter': NEAREST,
                                                                'wrapS': REPEAT, 'wrapT': REPEAT}],
@@ -249,7 +254,7 @@ class Exporter:
         self.joint_node = {}
         for j in joints:
             self.joint_node[j.index] = len(self.gl['nodes'])
-            R = FF.rot_zyx(*j.r)
+            R = MF.rot_zyx(*j.r)
             self.gl['nodes'].append({'name': f'{prefix}joint_{j.index:02d}', 'translation': [float(x) for x in j.t],
                                      'rotation': [float(x) for x in quat_from_matrix(R)],
                                      'scale': [float(x) for x in j.s]})
@@ -288,9 +293,9 @@ class Exporter:
                     t[k] = v.get(4 + k, t[k])
                     sc[k] = v.get(7 + k, sc[k])
                 T.append(list(t))
-                R.append(quat_from_matrix(FF.rot_zyx(*r)))
+                R.append(quat_from_matrix(MF.rot_zyx(*r)))
                 S.append(list(sc))
-            rest = {'translation': list(j.t), 'rotation': quat_from_matrix(FF.rot_zyx(*j.r)), 'scale': list(j.s)}
+            rest = {'translation': list(j.t), 'rotation': quat_from_matrix(MF.rot_zyx(*j.r)), 'scale': list(j.s)}
             for path, vals, typ in (('translation', T, 'VEC3'), ('rotation', R, 'VEC4'), ('scale', S, 'VEC3')):
                 arr = np.array(vals, '<f4')
                 if np.allclose(arr, arr[0]) and np.allclose(arr[0], np.array(rest[path], '<f4')):
@@ -339,7 +344,7 @@ class Exporter:
                     sc = f.char_int.get(an + 4 * i) if an is not None else None
                     if sc is not None:
                         self.script_of.setdefault(ms, sc)
-        self.manifest['lights'] = FF.model_lights(f)
+        self.manifest['lights'] = MF.model_lights(f)
         self.manifest['expressions'] = []
         # MPGroundData: light_angle (x, y degrees: the scene light's direction, which every lit
         # model is shaded with; z: the camera's tilt, radians) and the camera bounds
@@ -354,7 +359,7 @@ class Exporter:
             L = int(name[1:])
             self.skeleton(d['joints'], prefix=f'{name}_', name=f'Layer {L}')
             n_frames = max(n_frames, self.joint_animations(name, d, anims))
-            geo, _ = FF.decode_model(f, d['joints'], d['mobjs'], [(j.index, j.dl) for j in d['joints']],
+            geo, _ = MF.decode_model(f, d['joints'], d['mobjs'], [(j.index, j.dl) for j in d['joints']],
                                      carry_state=True)
             self.mesh(name, geo, extra=dict(detail=name, layer=L), preserve_order=True)
             self.manifest.setdefault('mobj_order', {})[name] = {
@@ -405,11 +410,11 @@ class Exporter:
         """Per costume, the MObj colors it draws with (those its flags enable): the MObjSub's,
         changed by its costume script's color events. Hex RRGGBBAA."""
         f = self.f
-        flags = FF.u16(f.char, mobj + 0x30)
-        base = {k: FF.u32(f.char, mobj + off) for k, off in COLOR_FIELDS.items()}
+        flags = MF.u16(f.char, mobj + 0x30)
+        base = {k: MF.u32(f.char, mobj + off) for k, off in COLOR_FIELDS.items()}
         on = [k for k, bit in COLOR_FLAG_OF.items() if flags & bit]
         sc = self.script_of.get(mobj)
-        frames = FF.decode_script(f.char, sc) if sc else []
+        frames = MF.decode_script(f.char, sc) if sc else []
         out = []
         for c in range(self.costumes):
             fr = frames[min(c, len(frames) - 1)] if frames else {}
@@ -488,7 +493,7 @@ class Exporter:
         elif key[0] == 'mobj' and key[2] is None:
             # untextured, colored by its MObj (prim / env / light colors, may change per costume)
             mobj = key[1]
-            entry.update(untextured=True, mobj=mobj, flags=FF.u16(f.char, mobj + 0x30),
+            entry.update(untextured=True, mobj=mobj, flags=MF.u16(f.char, mobj + 0x30),
                          state=[[f'{v[0]:08X}', f'{v[1]:08X}'] for k, v in key[7] if not self.model_light(v)],
                          costume_map=[[0, 0]] * self.costumes)
             entry['costume_colors'] = self.costume_colors(mobj)
@@ -506,7 +511,7 @@ class Exporter:
         else:
             tile_w, tile_h = desc['size']
             wrap, state = (key[6], key[7]) if key[0] == 'mobj' else (key[5], key[6])
-            w, h = FF.texture_dimensions(desc['size'], wrap)
+            w, h = MF.texture_dimensions(desc['size'], wrap)
             fmt, siz = desc['tile']
             entry.update(size=[w, h], tile_size=[tile_w, tile_h], fmt=fmt, siz=siz,
                          format=self.FMT.get((fmt, siz), f'{fmt}/{siz}'),
@@ -515,9 +520,9 @@ class Exporter:
                                 for k, v in state if not self.model_light(v)])
             if key[0] == 'mobj':
                 mobj = key[1]
-                info = FF.mobj_textures(f, mobj, (w, h))
+                info = MF.mobj_textures(f, mobj, (w, h))
                 flags = info['flags']
-                imgs = self.real_entries(info['images'] if flags & 0x11 else [], FF.row_bytes(w, siz) * h, name, 'image')
+                imgs = self.real_entries(info['images'] if flags & 0x11 else [], MF.row_bytes(w, siz) * h, name, 'image')
                 # palette size: what's loaded (the DL's TLUT load, or the MObj's: 256 if sub.siz is 8b)
                 n_cols = desc.get('tlut_n') or (256 if f.char[mobj + 3] == 1 else 16)
                 if flags & 0x04 and flags & 0x03:    # the MObj loads its palette itself (objdisplay.c)
@@ -538,7 +543,7 @@ class Exporter:
                     entry['palette_source'] = 'inline'
                 else:
                     entry['palette_source'] = 'list' if pals else None
-                frames = FF.decode_script(f.char, self.script_of.get(mobj)) if self.script_of.get(mobj) else []
+                frames = MF.decode_script(f.char, self.script_of.get(mobj)) if self.script_of.get(mobj) else []
             else:
                 imgs, pals = [key[1]], ([key[2]] if fmt == 2 else [])
                 if fmt == 2 and desc.get('tlut_n'):
@@ -603,9 +608,9 @@ class Exporter:
     def save_tex(self, name, suffix, img, fmt, siz, w, h, pal, fill=None):
         if img is None:
             return None
-        rgba = FF.decode_texture(self.f.char, img, fmt, siz, w, h, pal)
+        rgba = MF.decode_texture(self.f.char, img, fmt, siz, w, h, pal)
         if fill:
-            rgba = FF.clamp_fill(rgba, *fill)
+            rgba = MF.clamp_fill(rgba, *fill)
         rel = f'textures/{name}_{suffix}.png'
         Image.fromarray(rgba, 'RGBA').save(os.path.join(self.out, rel))
         return rel
@@ -625,8 +630,8 @@ class Exporter:
                 if t.link:                # drawn from a DObjDLLink list other than 0 (translucent...)
                     self.manifest['materials'][self.gl['materials'][mi]['name']]['dl_link'] = t.link
                 wrap = desc['wrap']
-                w, h = FF.texture_dimensions(desc['size'], wrap)
-                lit = desc['state'].get((0xD9, 0), (0, FF.GEOM_DEFAULT))[1] & FF.G_LIGHTING
+                w, h = MF.texture_dimensions(desc['size'], wrap)
+                lit = desc['state'].get((0xD9, 0), (0, MF.GEOM_DEFAULT))[1] & MF.G_LIGHTING
                 idx = []
                 world = [self.joints[c[0]].world @ np.array([*c[1], 1.0]) for c in t.corners]
                 face_n = np.cross(world[1][:3] - world[0][:3], world[2][:3] - world[0][:3])
@@ -642,7 +647,7 @@ class Exporter:
                         nrm.append(face_n)
                         # glTF colors are linear; Blender stores them as sRGB bytes: written as
                         # sRGB -> linear, Blender holds (and shows) the game's exact byte values
-                        col.append(tuple(FF.srgb_to_linear(x / 255) for x in rgba[:3]) + (rgba[3] / 255,))
+                        col.append(tuple(MF.srgb_to_linear(x / 255) for x in rgba[:3]) + (rgba[3] / 255,))
                     uv.append(((st[0] - t.tile_ul[0]) / w, (st[1] - t.tile_ul[1]) / h))
                     jnt.append(src)
                     idx.append(len(pos) - 1)
@@ -701,21 +706,21 @@ class Exporter:
             for pair in variants:
                 for part in pair:
                     an = f.ptr_main(part['field'] + 8)
-                    ms_list = FF.pointer_run(f.char_int, part['mobjsubs']) if part['mobjsubs'] is not None else []
+                    ms_list = MF.pointer_run(f.char_int, part['mobjsubs']) if part['mobjsubs'] is not None else []
                     if an and an[0] == 'char':
                         for i, ms in enumerate(ms_list):
                             sc = f.char_int.get(an[1] + 4 * i)
                             if sc is not None:
                                 self.script_of.setdefault(ms, sc)
         self.skeleton(hi['joints'])
-        self.manifest['lights'] = FF.model_lights(f)       # light / shadow (ambient) colors
+        self.manifest['lights'] = MF.model_lights(f)       # light / shadow (ambient) colors
         self.manifest['expressions'] = f.textureparts      # (texture-index switches: joint + material index)
         for detail in ('hi', 'lo'):
             d = f.details.get(detail)
             if not d:
                 continue
             dls = [(j.index, j.dl) for j in d['joints']]
-            geo, _ = FF.decode_model(f, d['joints'], d['mobjs'], dls,
+            geo, _ = MF.decode_model(f, d['joints'], d['mobjs'], dls,
                                      carry_state=bool(getattr(f, 'object', None)))
             self.mesh(detail, geo, extra=dict(detail=detail))
             self.manifest.setdefault('mobj_order', {})[detail] = {
@@ -730,10 +735,10 @@ class Exporter:
                     part = pair[k]
                     if part['dl'] is None:
                         continue
-                    lst = FF.pointer_run(f.char_int, part['mobjsubs']) if part['mobjsubs'] is not None else []
+                    lst = MF.pointer_run(f.char_int, part['mobjsubs']) if part['mobjsubs'] is not None else []
                     try:
-                        geo, _ = FF.decode_model(f, self.joints, {joint: lst}, [(joint, part['dl'])])
-                    except FF.BadDL as err:
+                        geo, _ = MF.decode_model(f, self.joints, {joint: lst}, [(joint, part['dl'])])
+                    except MF.BadDL as err:
                         print(f'  note: joint {joint} part {v} {detail}: {err}; not exported (kept as is)')
                         continue
                     name = f'part{v}_{detail}'
@@ -749,8 +754,8 @@ class Exporter:
                     print(f'  note: skeleton {sid} joint {j}: two-DL entry, not exported (kept as is)')
                     continue
                 try:
-                    geo, _ = FF.decode_model(f, self.joints, {j: hi_mobjs.get(j, [])}, [(j, e['dl'])])
-                except FF.BadDL as err:
+                    geo, _ = MF.decode_model(f, self.joints, {j: hi_mobjs.get(j, [])}, [(j, e['dl'])])
+                except MF.BadDL as err:
                     print(f'  note: skeleton {sid} joint {j}: {err}; not exported (kept as is)')
                     continue
                 name = f'skel{sid}'
@@ -780,7 +785,7 @@ def costumes_in_scripts(f):
             for i in range(len(lst)):
                 sc = f.char_int.get(an + 4 * i) if an is not None else None
                 if sc is not None:
-                    best = max(best, len(FF.decode_script(f.char, sc)))
+                    best = max(best, len(MF.decode_script(f.char, sc)))
     return best
 
 
@@ -794,7 +799,7 @@ def rom_external_data(entries, entry):
     if entry.res is None:
         return bytes(data), {}
     ids = [int.from_bytes(entry.idx[i:i + 2], 'big') for i in range(0, len(entry.idx or b''), 2)]
-    links = list(FF.chain(data, entry.res).items())
+    links = list(MF.chain(data, entry.res).items())
     base, ext = {}, {}
     for (field_off, target), file_id in zip(links, ids):
         if not 0 <= file_id < len(entries):
@@ -807,7 +812,7 @@ def rom_external_data(entries, entry):
     return bytes(data), ext
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('paths', nargs='+', metavar='PATH',
                     help='OUT_DIR, or CHAR_DIR OUT_DIR')
@@ -839,10 +844,10 @@ def main():
                     help='alone: CHAR_DIR is a stage folder (its geometry layers: header.bin -> stage.bin); '
                          'with a name and --rom: a stage to extract from the ROM (vanilla name or File.asm '
                          'STG_<NAME>_HEADER constant), or its header file\'s hex ID')
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if isinstance(a.stage, str) and not a.rom:
         # no ROM: what followed --stage is the stage folder (--stage STAGE_DIR OUT_DIR)
-        a.paths.insert(0, os.path.normpath(next(x for x in sys.argv[1:] if x.upper() == a.stage)))
+        a.paths.insert(0, os.path.normpath(next(x for x in (sys.argv[1:] if argv is None else argv) if x.upper() == a.stage)))
         a.stage = True
     if len(a.paths) == 1:
         char_dir, out_dir = None, a.paths[0]
@@ -865,9 +870,16 @@ def main():
         elif not char_dir:
             ap.error('--stage needs the stage folder (STAGE_DIR OUT_DIR)')
         else:
-            f = FF.load_stage(**stage_files(cfg, char_dir))
+            f = MF.load_stage(**stage_files(cfg, char_dir))
         ex = Exporter(f, out_dir, 1)
         ex.manifest['object'] = f.object
+        ex.manifest['source'] = source_info('stage', char_dir, a, a.stage if isinstance(a.stage, str) else None)
+        try:                       # collision lines, map objects, spawns, bounds (Blender: 'Collision')
+            head = None if a.rom else stage_files(cfg, char_dir)['stage_int_head']
+            ex.manifest['stage_collision'] = GD.stage_collision(f.char, head, f.main, f.object['ground'],
+                                                                {} if a.rom else cfg)
+        except Exception as e:     # (a stage whose geometry isn't found: the model still exports)
+            print(f'  note: no collision exported ({e})')
         ex.run()
         m = ex.manifest
         tris = sum(o['triangles'] for o in m['objects'].values())
@@ -883,6 +895,7 @@ def main():
         f = load_object_args(a, ap, cfg, char_dir, out_dir)
         ex = Exporter(f, out_dir, a.costumes or costumes_in_scripts(f) or 1)
         ex.manifest['object'] = f.object
+        ex.manifest['source'] = source_info('object', char_dir if a.object else None, a, a.object or a.item)
         ex.run()
         m = ex.manifest
         tris = sum(o['triangles'] for o in m['objects'].values())
@@ -920,12 +933,12 @@ def main():
                 main_file.write(main_entry.extract('data'))
             with open(char_path, 'wb') as char_file:
                 char_file.write(char_data)
-            f = FF.load(main_path, char_path, main_entry.tbl or 0,
+            f = MF.load(main_path, char_path, main_entry.tbl or 0,
                         main_entry.res or 0, char_entry.tbl or 0, char_ext)
     else:
         main_path = a.main or os.path.join(char_dir, 'main.bin')
         char_path = a.char or os.path.join(char_dir, 'character.bin')
-        f = FF.load(main_path, char_path, mi, me, ci)
+        f = MF.load(main_path, char_path, mi, me, ci)
 
     tf = (cfg.get('attributes') or {}).get('texture_forms') if not a.rom else None
     if tf:   # texture parts the build writes into main.bin (config.yaml attributes.texture_forms)
@@ -935,12 +948,14 @@ def main():
             gj = int(str(part), 16)
             occ = seen.get(gj, 0)
             seen[gj] = occ + 1
-            f.textureparts.append(dict(index=k, joint=gj - FF.JOINT_COMMON_START, mobj_hi=occ, mobj_lo=occ,
+            f.textureparts.append(dict(index=k, joint=gj - MF.JOINT_COMMON_START, mobj_hi=occ, mobj_lo=occ,
                                        source='config.yaml texture_forms'))
     n = (a.costumes or cfg.get('num_costumes')
          or (VANILLA_FIGHTER_COSTUMES.get(a.fighter, 4) if a.fighter else None)
          or (1 if a.rom else costumes_in_scripts(f)) or 1)
     ex = Exporter(f, out_dir, n)
+    ex.manifest['source'] = source_info('fighter', None if (a.main or a.char) else char_dir, a, a.fighter)
+    ex.manifest['hurtboxes'] = GD.hurtboxes(f, {} if a.rom else cfg)     # (Blender: 'Hurtboxes')
     ex.run()
     m = ex.manifest
     tris = sum(o['triangles'] for o in m['objects'].values())
@@ -953,6 +968,13 @@ def main():
         import preview
         for p in preview.save_sheets(out_dir):
             print(f'preview: {p}')
+
+
+def source_info(kind, folder, a, name=None):
+    """What was exported, for the import (ssb64_model.py import finds the folder to write back to):
+    kind fighter / object / stage, the folder it came from (None: a ROM or loose files), its name."""
+    return dict(kind=kind, folder=os.path.abspath(folder) if folder and not a.rom else None,
+                rom=os.path.abspath(a.rom) if a.rom else None, name=name)
 
 
 def load_rom_stage(rom, name, ap):
@@ -985,9 +1007,9 @@ def load_rom_stage(rom, name, ap):
     entry = entries[header_id]
     header = entry.extract('data')
     ids = [int.from_bytes(entry.idx[i:i + 2], 'big') for i in range(0, len(entry.idx or b''), 2)]
-    links = list(FF.chain(header, entry.res).keys()) if entry.res is not None else []
-    layer_files = {ids[links.index(FF.GROUND_DATA + 0x10 * L)] for L in range(FF.GROUND_LAYERS)
-                   if FF.GROUND_DATA + 0x10 * L in links}
+    links = list(MF.chain(header, entry.res).keys()) if entry.res is not None else []
+    layer_files = {ids[links.index(MF.GROUND_DATA + 0x10 * L)] for L in range(MF.GROUND_LAYERS)
+                   if MF.GROUND_DATA + 0x10 * L in links}
     if not layer_files:
         raise SystemExit(f'stage header file 0x{header_id:X}: no geometry layers')
     stage_id = min(layer_files)
@@ -999,7 +1021,7 @@ def load_rom_stage(rom, name, ap):
         hp, sp = os.path.join(temp_dir, 'header.bin'), os.path.join(temp_dir, 'stage.bin')
         open(hp, 'wb').write(header)
         open(sp, 'wb').write(stage_data)
-        f = FF.load_stage(hp, sp, entry.tbl if entry.tbl is not None else 0x3FFFC,
+        f = MF.load_stage(hp, sp, entry.tbl if entry.tbl is not None else 0x3FFFC,
                           entry.res if entry.res is not None else 0x3FFFC,
                           entries[stage_id].tbl if entries[stage_id].tbl is not None else 0x3FFFC,
                           stage_ext=stage_ext, only_file=(ids, links, stage_id))
@@ -1008,7 +1030,7 @@ def load_rom_stage(rom, name, ap):
 
 
 def load_object_args(a, ap, cfg, char_dir, out_dir):
-    """FF.load_object from --object / --attr [--model] / --rom --item."""
+    """MF.load_object from --object / --attr [--model] / --rom --item."""
     if a.item:
         if not a.rom:
             ap.error('--item requires --rom')
@@ -1019,7 +1041,7 @@ def load_object_args(a, ap, cfg, char_dir, out_dir):
         # external pointer goes to: the entry's ID list, in chain order
         attr = entry.extract('data')
         ids = [int.from_bytes(entry.idx[i:i + 2], 'big') for i in range(0, len(entry.idx or b''), 2)]
-        links = list(FF.chain(attr, entry.res).keys()) if entry.res is not None else []
+        links = list(MF.chain(attr, entry.res).keys()) if entry.res is not None else []
         if off not in links:
             raise SystemExit(f'{a.item}: no model pointer at 0x{off:X}')
         model_id = ids[links.index(off)]
@@ -1028,7 +1050,7 @@ def load_object_args(a, ap, cfg, char_dir, out_dir):
             ap_, mp_ = os.path.join(temp_dir, 'attr.bin'), os.path.join(temp_dir, 'model.bin')
             open(ap_, 'wb').write(attr)
             open(mp_, 'wb').write(model_data)
-            f = FF.load_object(ap_, mp_, entry.tbl, entry.res, entries[model_id].tbl, off, model_ext)
+            f = MF.load_object(ap_, mp_, entry.tbl, entry.res, entries[model_id].tbl, off, model_ext)
         f.object.update(kind='item', rom_file=ITCOMMON_FILE, model_file=model_id, name=a.item)
         return f
     if a.object:
@@ -1037,11 +1059,11 @@ def load_object_args(a, ap, cfg, char_dir, out_dir):
         kw = object_files(cfg, char_dir, a.object)
         if a.attr_offset is not None:
             kw['attr_offset'] = a.attr_offset
-        f = FF.load_object(**kw)
+        f = MF.load_object(**kw)
         f.object.update(name=a.object, char_dir=char_dir, **{k: v for k, v in kw.items() if k.endswith('path')})
         return f
     ih, eh = (int(x, 16) for x in a.attr_heads.split(','))
-    f = FF.load_object(a.attr, a.model, ih, eh, a.model_head,
+    f = MF.load_object(a.attr, a.model, ih, eh, a.model_head,
                        a.attr_offset if a.attr_offset is not None else (eh if a.model and eh < 0x3FFFC else 0))
     f.object.update(attr_path=a.attr, model_path=a.model)
     return f

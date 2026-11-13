@@ -1,8 +1,9 @@
-"""N64 fighter material settings as a panel (Properties > Material > "N64 Fighter")
-and scene light colors (Properties > Scene > "N64 Fighter"), with dropdowns, toggles
-and color pickers instead of typed text.
+"""N64 material settings as a panel (Properties > Material > "N64 Model"), for every
+model ssb64_model exports (fighters, items, projectiles, stages), and scene light
+colors (Properties > Scene > "N64 Model"), with dropdowns, toggles and color pickers
+instead of typed text.
 
-They edit the same custom properties import_fighter.py reads (n64_format,
+They edit the same custom properties the import reads (n64_format,
 n64_wrap_s, ...), so a .blend works the same with or without this panel.
 
 build_blend.py embeds this file in the .blend as a text block that registers
@@ -10,16 +11,19 @@ itself when Blender is allowed to run the file's scripts. It also installs as an
 add-on: Edit > Preferences > Add-ons > Install from Disk.
 """
 import os
+import re
+import math
 
 import bpy
+import mathutils
 
 bl_info = {
-    'name': 'N64 Fighter Materials',
+    'name': 'N64 Model Materials',
     'author': 'smashremix-extra',
     'version': (1, 0, 0),
     'blender': (3, 6, 0),
-    'location': 'Properties > Material / Scene > N64 Fighter',
-    'description': 'Texture format, wrap, culling, lighting and light colors for fighter_model',
+    'location': 'Properties > Material / Scene > N64 Model',
+    'description': 'Texture format, wrap, culling, lighting and light colors for ssb64_model',
     'category': 'Material',
 }
 
@@ -1328,7 +1332,7 @@ PROPS = {
                     'Attribute) instead, like glows and effects'),
     'n64ui_own_light': own_flag('n64_light_color', 'FFFFFF', name='Own Light Color',
                                 description='Give this material its own light color instead of the model\'s '
-                                            '(Scene > N64 Fighter)'),
+                                            '(Scene > N64 Model)'),
     'n64ui_light': hex_color('n64_light_color', 'FFFFFF', name='Light Color',
                              description='Color of the lit side'),
     'n64ui_own_shadow': own_flag('n64_shadow_color', '808080', name='Own Shadow Color',
@@ -1348,7 +1352,7 @@ SCENE_PROPS = {
 
 
 class N64_PT_material(bpy.types.Panel):
-    bl_label = 'N64 Fighter'
+    bl_label = 'N64 Model'
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = 'material'
@@ -1359,11 +1363,13 @@ class N64_PT_material(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
+        if context.object is not None and context.object.get('n64_gamedata'):
+            return False                   # (hurtboxes, collision: Object > N64 Game Data)
         return context.object is not None or context.material is not None
 
     def draw(self, context):
         lay = self.layout
-        lay.label(text='N64 Fighter', icon='MATERIAL')
+        lay.label(text='N64 Model', icon='MATERIAL')
         ob = context.object
         if ob is not None and ob.type == 'MESH':             # which material (the object's slots)
             row = lay.row()
@@ -1814,7 +1820,7 @@ class N64_PT_joint(bpy.types.Panel):
 
 
 class N64_PT_scene(bpy.types.Panel):
-    bl_label = 'N64 Fighter'
+    bl_label = 'N64 Model'
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = 'scene'
@@ -1828,8 +1834,1220 @@ class N64_PT_scene(bpy.types.Panel):
             lay.prop(context.scene, '["n64_light_angle"]', text='Light Angle')
 
 
+# ---------------------------------------------------------------------------- game data objects
+# hurtboxes / collision lines / map objects made by build_blend.py (blend_gamedata.py); these
+# edit their custom properties, which blend_to_gltf.py reads
+
+HB_PLACEMENTS = [('low', 'Low', 'Legs: hit here, the fighter reacts as hit low'),
+                 ('mid', 'Mid', 'Torso, arms'), ('high', 'High', 'Head')]
+HB_COLORS = {'low': (0.2, 0.45, 1.0, 0.3), 'mid': (1.0, 0.85, 0.1, 0.3), 'high': (1.0, 0.2, 0.2, 0.3)}
+LINE_KINDS = [('floor', 'Floor', 'Stood on (from above)'), ('ceil', 'Ceiling', 'Bumped into from below'),
+              ('rwall', 'Right Wall', 'A wall facing right (its solid side to the left: hit moving left)'),
+              ('lwall', 'Left Wall', 'A wall facing left (its solid side to the right: hit moving right)')]
+FLAG_LEDGE, FLAG_DROP = 0x8000, 0x4000
+LINE_COLORS = {'floor': (0.1, 0.85, 0.2, 1), 'ceil': (0.9, 0.15, 0.15, 1),
+               'rwall': (0.15, 0.4, 1.0, 1), 'lwall': (1.0, 0.55, 0.1, 1)}
+LINE_RADIUS, LINE_VERTEX_RADIUS = 48.0, 72.0    # game units: the line tube and vertex dots
+LINE_PIXEL_WIDTH, VERTEX_PIXEL_RADIUS, LEDGE_PIXEL_RADIUS = 6.0, 3.5, 9.0
+COLLISION_DRAW_HANDLER = 'n64_collision_draw_handler'
+COLL_EDGE_TYPE = 'n64_collision_type'
+COLL_EDGE_FLAGS = 'n64_collision_flags'
+COLL_EDGE_ORDER = 'n64_collision_line_order'
+COLL_EDGE_SEGMENT = 'n64_collision_segment'
+COLL_EDGE_START_SIDE = 'n64_collision_start_side'
+COLL_EDGE_END_FLAGS = 'n64_collision_end_flags'
+COLL_EDGE_POINT_FLAGS = 'n64_collision_has_point_flags'
+MAPOBJ_KINDS = {
+    0x00: 'P1 start', 0x01: 'P2 start', 0x02: 'P3 start', 0x03: 'P4 start', 0x04: 'item spawn',
+    0x05: 'scale L', 0x06: 'scale R', 0x07: 'pakkun L', 0x08: 'pakkun R', 0x09: 'power block',
+    0x0A: 'pipe L', 0x0B: 'pipe R', 0x0C: 'acid', 0x0D: 'twister', 0x0E: 'monster', 0x13: 'bumper',
+    0x14: 'pipe wall', 0x15: 'movie player 1', 0x16: 'movie player 2', 0x17: 'movie player 3',
+    0x18: 'demo P1', 0x19: 'demo P2', 0x1A: 'demo P3', 0x1B: 'demo P4', 0x1C: 'demo P5', 0x1D: 'demo P6',
+    0x1E: 'demo P7', 0x1F: 'demo P8', 0x20: 'rebirth platform', 0x21: '1P player', 0x22: '1P ally 1',
+    0x23: '1P ally 2', 0x24: '1P ally 3', 0x25: '1P enemy 1', 0x26: '1P enemy 2', 0x27: '1P enemy 3',
+    0x28: '1P enemy 4', 0x29: 'bonus3 taru bomb', 0x2B: '1P enemy team', 0x2C: 'challenger player'}
+
+
+def _helper_mat(name, rgba):
+    m = bpy.data.materials.get(name)
+    if m is None:
+        m = bpy.data.materials.new(name)
+        m['n64_helper'] = True
+        m.diffuse_color = rgba
+        m.use_nodes = True
+        bsdf = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if bsdf is not None:
+            bsdf.inputs['Base Color'].default_value = rgba
+            bsdf.inputs['Alpha'].default_value = rgba[3]
+        if rgba[3] < 1:
+            for attr, val in (('surface_render_method', 'BLENDED'), ('blend_method', 'BLEND')):
+                try:
+                    setattr(m, attr, val)
+                except (AttributeError, TypeError):
+                    pass
+    return m
+
+
+def _set_mat(ob, m):
+    if ob.data is None:
+        return
+    if ob.data.materials:
+        ob.data.materials[0] = m
+    else:
+        ob.data.materials.append(m)
+
+
+def _refresh_look(ob):
+    kind = ob.get('n64_gamedata')
+    if kind == 'hurtbox':
+        p = ob.get('n64_hurtbox_placement', 'mid')
+        _set_mat(ob, _helper_mat(f'N64 Hurtbox {p}', HB_COLORS.get(p, HB_COLORS['mid'])))
+        ob.name = f'hurtbox {ob.parent_bone or "joint_%02d" % ob.get("n64_hurtbox_joint", 0)} {p}'
+    elif kind == 'collision':
+        t = ob.get('n64_coll_type', 'floor')
+        r, g, b, a = LINE_COLORS.get(t, LINE_COLORS['floor'])
+        drop = bool(ob.get('n64_drop_through'))
+        if drop:
+            r, g, b = (r + 1) / 2, (g + 1) / 2, (b + 1) / 2
+        _set_mat(ob, _helper_mat(f'N64 Collision {t}' + (' drop-through' if drop else ''), (r, g, b, a)))
+        m = re.match(r'(floor|ceil|rwall|lwall)\b(.*)$', ob.name)
+        if m and m.group(1) != t:
+            ob.name = t + m.group(2)
+
+
+def obj_enum(key, items, default, name='', description=''):
+    ids = [i[0] for i in items]
+
+    def get(self):
+        v = self.get(key, default)
+        return ids.index(v) if v in ids else ids.index(default)
+
+    def set(self, value):
+        self[key] = ids[value]
+        _refresh_look(self)
+    return bpy.props.EnumProperty(items=items, get=get, set=set, name=name, description=description)
+
+
+def obj_bool(key, name='', description=''):
+    def get(self):
+        return bool(self.get(key, False))
+
+    def set(self, value):
+        self[key] = bool(value)
+        if key == 'n64_ledge' or key == 'n64_drop_through':
+            self.pop('n64_point_flags', None)          # (a whole-line setting now)
+        _refresh_look(self)
+    return bpy.props.BoolProperty(get=get, set=set, name=name, description=description)
+
+
+def obj_int(key, lo, hi, name='', description=''):
+    def get(self):
+        return int(self.get(key, 0))
+
+    def set(self, value):
+        self[key] = int(value)
+        if key == 'n64_surface':
+            self.pop('n64_point_flags', None)
+        _refresh_look(self)
+    return bpy.props.IntProperty(get=get, set=set, min=lo, max=hi, name=name, description=description)
+
+
+def _collision_edit_selection(context=None):
+    context = context or bpy.context
+    ob = context.object
+    if ob is None or ob.get('n64_gamedata') != 'collision_group' or context.mode != 'EDIT_MESH':
+        return None
+    import bmesh
+    bm = bmesh.from_edit_mesh(ob.data)
+    layers = {name: bm.edges.layers.int.get(name) for name in
+              (COLL_EDGE_TYPE, COLL_EDGE_FLAGS, COLL_EDGE_START_SIDE, COLL_EDGE_END_FLAGS)}
+    if any(layer is None for layer in layers.values()):
+        return None
+    selected_vertices = [vertex for vertex in bm.verts if vertex.select]
+    vertex_mode = context.tool_settings.mesh_select_mode[0]
+    if vertex_mode and selected_vertices:
+        selected_edges = [edge for edge in bm.edges
+                          if edge.verts[0] in selected_vertices or edge.verts[1] in selected_vertices]
+    else:
+        selected_edges = [edge for edge in bm.edges if edge.select]
+    if not selected_edges and selected_vertices:
+        selected_edges = [edge for edge in bm.edges
+                          if edge.verts[0] in selected_vertices or edge.verts[1] in selected_vertices]
+    if not selected_vertices:
+        selected_vertices = list({vertex for edge in selected_edges for vertex in edge.verts})
+    bm.verts.index_update()
+    selected_vertices.sort(key=lambda vertex: vertex.index)
+    active = bm.select_history.active
+    active_edge = active if active in selected_edges else None
+    active_vertex = active if active in selected_vertices else None
+    if active_vertex is None and active_edge is not None:
+        side = int(active_edge[layers[COLL_EDGE_START_SIDE]])
+        active_vertex = active_edge.verts[side] if side in (0, 1) else active_edge.verts[0]
+    if active_vertex is None and selected_vertices:
+        active_vertex = selected_vertices[-1]
+    if active_edge is None and active_vertex is not None:
+        active_edge = next((edge for edge in selected_edges if active_vertex in edge.verts), None)
+    if active_edge is None and selected_edges:
+        active_edge = selected_edges[-1]
+    return dict(ob=ob, bm=bm, layers=layers, edges=selected_edges, vertices=selected_vertices,
+                active_vertex=active_vertex, active_edge=active_edge, vertex_mode=vertex_mode)
+
+
+def _collision_vertex_flags(selection, vertex):
+    bm, layers = selection['bm'], selection['layers']
+    values, active_value = [], None
+    for edge in bm.edges:
+        if vertex not in edge.verts:
+            continue
+        start_side = int(edge[layers[COLL_EDGE_START_SIDE]])
+        if start_side not in (0, 1):
+            continue
+        flags = int(edge[layers[COLL_EDGE_FLAGS if edge.verts[start_side] == vertex
+                                 else COLL_EDGE_END_FLAGS]])
+        values.append(flags)
+        if edge == selection['active_edge']:
+            active_value = flags
+    if active_value is not None:
+        return active_value
+    return values[0] if values and len(set(values)) == 1 else None
+
+
+def _active_collision_flags(selection):
+    if selection is None:
+        return None
+    vertex = selection['active_vertex']
+    if vertex is not None:
+        flags = _collision_vertex_flags(selection, vertex)
+        if flags is not None:
+            return flags
+    edge = selection['active_edge']
+    if edge is None:
+        return None
+    layers = selection['layers']
+    return int(edge[layers[COLL_EDGE_FLAGS]])
+
+
+def _set_collision_point_flags(selection, flag=None, value=None, surface=None):
+    if selection is None or not selection['vertices']:
+        return
+    bm, layers = selection['bm'], selection['layers']
+    vertices = set(selection['vertices'])
+    for edge in bm.edges:
+        for side, vertex in enumerate(edge.verts):
+            if vertex not in vertices:
+                continue
+            start_side = int(edge[layers[COLL_EDGE_START_SIDE]])
+            if start_side not in (0, 1):
+                continue
+            layer = layers[COLL_EDGE_FLAGS if side == start_side else COLL_EDGE_END_FLAGS]
+            flags = int(edge[layer])
+            if flag is not None:
+                flags = flags | flag if value else flags & ~flag
+            if surface is not None:
+                flags = (flags & ~0xFF) | (surface & 0xFF)
+            edge[layer] = flags
+    import bmesh
+    bmesh.update_edit_mesh(selection['ob'].data, loop_triangles=False, destructive=False)
+
+
+def _collision_type_get(_scene):
+    selection = _collision_edit_selection()
+    if selection is None or not selection['edges']:
+        return 0
+    if selection['vertex_mode'] and selection['active_vertex'] is not None:
+        edges = [edge for edge in selection['bm'].edges
+                 if selection['active_vertex'] in edge.verts]
+    else:
+        edges = selection['edges']
+    types = {int(edge[selection['layers'][COLL_EDGE_TYPE]]) for edge in edges}
+    if len(types) != 1:
+        return len(LINE_KINDS)
+    kind = next(iter(types))
+    return kind if 0 <= kind < len(LINE_KINDS) else 0
+
+
+def _collision_type_set(_scene, value):
+    if value >= len(LINE_KINDS):
+        return
+    selection = _collision_edit_selection()
+    if selection is None:
+        return
+    for edge in selection['edges']:
+        edge[selection['layers'][COLL_EDGE_TYPE]] = value
+    import bmesh
+    bmesh.update_edit_mesh(selection['ob'].data, loop_triangles=False, destructive=False)
+
+
+def _collision_bool_prop(flag, name):
+    def get(_scene):
+        flags = _active_collision_flags(_collision_edit_selection())
+        return bool(flags is not None and flags & flag)
+
+    def set(_scene, value):
+        _set_collision_point_flags(_collision_edit_selection(), flag=flag, value=bool(value))
+
+    return bpy.props.BoolProperty(get=get, set=set, name=name)
+
+
+def _collision_surface_get(_scene):
+    flags = _active_collision_flags(_collision_edit_selection())
+    return flags & 0xFF if flags is not None else 0
+
+
+def _collision_surface_set(_scene, value):
+    _set_collision_point_flags(_collision_edit_selection(), surface=int(value))
+
+
+COLLISION_TYPE_ITEMS = LINE_KINDS + [('mixed', 'Mixed', 'Selected collision edges have different types')]
+COLLISION_SCENE_PROPS = {
+    'n64ui_coll_type': bpy.props.EnumProperty(items=COLLISION_TYPE_ITEMS, get=_collision_type_get,
+                                              set=_collision_type_set, name='Type',
+                                              description='Collision type; changes apply to selected edges'),
+    'n64_ui_drop': _collision_bool_prop(FLAG_DROP, 'Drop-Through'),
+    'n64_ui_ledge': _collision_bool_prop(FLAG_LEDGE, 'Ledge'),
+    'n64_ui_surface': bpy.props.IntProperty(get=_collision_surface_get, set=_collision_surface_set,
+                                            min=0, max=255, name='Surface'),
+}
+
+
+GAME_TO_BLENDER = mathutils.Matrix(((1, 0, 0, 0), (0, 0, -1, 0), (0, 1, 0, 0), (0, 0, 0, 1)))
+
+
+def _hb_bone(ob):
+    if ob.parent is not None and ob.parent.type == 'ARMATURE' and ob.parent_type == 'BONE' and \
+            ob.parent_bone in ob.parent.data.bones:
+        return ob.parent, ob.parent.data.bones[ob.parent_bone]
+    return None, None
+
+
+def _joint_world(arm, bone_name):
+    """The joint's rest matrix in game space (stored by build_blend.py), or None."""
+    w = (arm.get('n64_joint_worlds') or {}).get(bone_name) if arm is not None else None
+    return mathutils.Matrix([list(w[r * 4:r * 4 + 4]) for r in range(4)]) if w else None
+
+
+def _bone_parent_rest(arm, bone):
+    """What a bone-parented object's matrix is relative to, at the rest pose."""
+    return arm.matrix_world @ bone.matrix_local @ mathutils.Matrix.Translation((0, bone.length, 0))
+
+
+def _hb_local(ob):
+    """(offset, size) in the joint's space, game units; zeros when it can't be known."""
+    arm, bone = _hb_bone(ob)
+    W = _joint_world(arm, bone.name) if bone else None
+    if W is None:
+        return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+    world = _bone_parent_rest(arm, bone) @ ob.matrix_parent_inverse @ ob.matrix_basis
+    L = W.inverted() @ GAME_TO_BLENDER.inverted() @ world
+    half = 2.0 if ob.get('n64_hurtbox_half', True) else 1.0
+    return tuple(L.translation), tuple(half * L.col[k].xyz.length for k in range(3))
+
+
+def _hb_set(ob, offset=None, size=None):
+    arm, bone = _hb_bone(ob)
+    W = _joint_world(arm, bone.name) if bone else None
+    if W is None:
+        return
+    off, sz = _hb_local(ob)
+    off, sz = offset if offset is not None else off, size if size is not None else sz
+    L = mathutils.Matrix.Translation(off) @ mathutils.Matrix.Diagonal((*(max(v, 0.001) / 2 for v in sz), 1.0))
+    ob['n64_hurtbox_half'] = True
+    ob.matrix_basis = (_bone_parent_rest(arm, bone) @ ob.matrix_parent_inverse).inverted() @ \
+        GAME_TO_BLENDER @ W @ L
+
+
+def line_node_group():
+    """'N64 Collision Line': draws a line mesh (an open chain of vertices) as a thick square
+    tube with a dot on every vertex. Display only: the import reads the mesh's vertices."""
+    ng = bpy.data.node_groups.get('N64 Collision Line')
+    if ng is None:
+        ng = bpy.data.node_groups.new('N64 Collision Line', 'GeometryNodeTree')
+        ng.interface.new_socket('Geometry', in_out='INPUT', socket_type='NodeSocketGeometry')
+        ng.interface.new_socket('Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')
+        n_in, n_out = ng.nodes.new('NodeGroupInput'), ng.nodes.new('NodeGroupOutput')
+        curve = ng.nodes.new('GeometryNodeMeshToCurve')
+        prof = ng.nodes.new('GeometryNodeCurvePrimitiveQuadrilateral')
+        tube = ng.nodes.new('GeometryNodeCurveToMesh')
+        dots = ng.nodes.new('GeometryNodeMeshToPoints')
+        join = ng.nodes.new('GeometryNodeJoinGeometry')
+        for k, n in enumerate((n_in, curve, prof, tube, dots, join, n_out)):
+            n.location = (180 * k, -80 * (k % 2))
+        link = ng.links.new
+        link(n_in.outputs[0], curve.inputs['Mesh'])
+        link(curve.outputs['Curve'], tube.inputs['Curve'])
+        link(prof.outputs['Curve'], tube.inputs['Profile Curve'])
+        link(n_in.outputs[0], dots.inputs['Mesh'])
+        link(tube.outputs['Mesh'], join.inputs[0])
+        link(dots.outputs['Points'], join.inputs[0])
+    prof = next((n for n in ng.nodes if n.bl_idname == 'GeometryNodeCurvePrimitiveQuadrilateral'), None)
+    dots = next((n for n in ng.nodes if n.bl_idname == 'GeometryNodeMeshToPoints'), None)
+    if prof is None or dots is None:
+        raise RuntimeError('N64 Collision Line node group is missing its profile or vertex-marker node')
+    prof.inputs['Width'].default_value = prof.inputs['Height'].default_value = 2 * LINE_RADIUS
+    dots.inputs['Radius'].default_value = LINE_VERTEX_RADIUS
+    return ng
+
+
+def _collision_display_material(kind, drop=False):
+    r, g, b, a = LINE_COLORS[kind]
+    if drop:
+        r, g, b = (r + 1) / 2, (g + 1) / 2, (b + 1) / 2
+    suffix = ' drop-through' if drop else ''
+    return _helper_mat(f'N64 Collision {kind}{suffix}', (r, g, b, a))
+
+
+def collision_group_node_group():
+    """Persistent viewport display for editable collision-group edge meshes."""
+    ng = bpy.data.node_groups.get('N64 Collision Group Renderer')
+    if ng is not None:
+        return ng
+    ng = bpy.data.node_groups.new('N64 Collision Group Renderer', 'GeometryNodeTree')
+    ng.interface.new_socket('Geometry', in_out='INPUT', socket_type='NodeSocketGeometry')
+    ng.interface.new_socket('Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')
+    nodes, links = ng.nodes, ng.links
+    group_in, group_out = nodes.new('NodeGroupInput'), nodes.new('NodeGroupOutput')
+    join = nodes.new('GeometryNodeJoinGeometry')
+    link = links.new
+    link(group_in.outputs['Geometry'], join.inputs['Geometry'])
+    link(join.outputs['Geometry'], group_out.inputs['Geometry'])
+    line_profile = nodes.new('GeometryNodeCurvePrimitiveCircle')
+    line_profile.inputs['Resolution'].default_value = 8
+    line_profile.inputs['Radius'].default_value = LINE_RADIUS / 2
+
+    type_attr = nodes.new('GeometryNodeInputNamedAttribute')
+    type_attr.data_type = 'INT'
+    type_attr.inputs['Name'].default_value = COLL_EDGE_TYPE
+    flags_attr = nodes.new('GeometryNodeInputNamedAttribute')
+    flags_attr.data_type = 'INT'
+    flags_attr.inputs['Name'].default_value = COLL_EDGE_FLAGS
+    drop_modulo = nodes.new('ShaderNodeMath')
+    drop_modulo.operation = 'MODULO'
+    drop_modulo.inputs[1].default_value = 32768
+    link(flags_attr.outputs['Attribute'], drop_modulo.inputs[0])
+    drop_test = nodes.new('FunctionNodeCompare')
+    drop_test.data_type = 'FLOAT'
+    drop_test.operation = 'GREATER_EQUAL'
+    drop_test.inputs['B'].default_value = 16384
+    link(drop_modulo.outputs[0], drop_test.inputs['A'])
+
+    def compare(field, data_type, operation, value, x, y):
+        test = nodes.new('FunctionNodeCompare')
+        test.data_type = data_type
+        test.operation = operation
+        test.inputs['B'].default_value = value
+        link(field, test.inputs['A'])
+        test.location = (x, y)
+        return test.outputs['Result']
+
+    for kind_index, (kind, _label, _description) in enumerate(LINE_KINDS):
+        type_test = compare(type_attr.outputs['Attribute'], 'INT', 'EQUAL', kind_index, -760, -kind_index * 520)
+        type_sep = nodes.new('GeometryNodeSeparateGeometry')
+        type_sep.domain = 'EDGE'
+        type_sep.location = (-520, -kind_index * 520)
+        link(group_in.outputs['Geometry'], type_sep.inputs['Geometry'])
+        link(type_test, type_sep.inputs['Selection'])
+        flag_sep = nodes.new('GeometryNodeSeparateGeometry')
+        flag_sep.domain = 'EDGE'
+        flag_sep.location = (-300, -kind_index * 520)
+        link(type_sep.outputs['Selection'], flag_sep.inputs['Geometry'])
+        link(drop_test.outputs['Result'], flag_sep.inputs['Selection'])
+
+        for is_drop, selection in ((False, flag_sep.outputs['Inverted']),
+                                   (True, flag_sep.outputs['Selection'])):
+            to_curve = nodes.new('GeometryNodeMeshToCurve')
+            to_curve.location = (-80, -kind_index * 520 - int(is_drop) * 220)
+            link(selection, to_curve.inputs['Mesh'])
+            to_mesh = nodes.new('GeometryNodeCurveToMesh')
+            to_mesh.location = (120, -kind_index * 520 - int(is_drop) * 220)
+            link(to_curve.outputs['Curve'], to_mesh.inputs['Curve'])
+            link(line_profile.outputs['Curve'], to_mesh.inputs['Profile Curve'])
+            material = nodes.new('GeometryNodeSetMaterial')
+            material.location = (320, -kind_index * 520 - int(is_drop) * 220)
+            material.inputs['Material'].default_value = _collision_display_material(kind, is_drop)
+            link(to_mesh.outputs['Mesh'], material.inputs['Geometry'])
+            link(material.outputs['Geometry'], join.inputs['Geometry'])
+
+    points = nodes.new('GeometryNodeMeshToPoints')
+    points.location = (-300, 240)
+    link(group_in.outputs['Geometry'], points.inputs['Mesh'])
+    sphere = nodes.new('GeometryNodeMeshIcoSphere')
+    sphere.location = (-300, 40)
+    sphere.inputs['Radius'].default_value = LINE_VERTEX_RADIUS / 3
+    sphere.inputs['Subdivisions'].default_value = 1
+    sphere_material = nodes.new('GeometryNodeSetMaterial')
+    sphere_material.location = (-80, 40)
+    sphere_material.inputs['Material'].default_value = _helper_mat('N64 Collision Vertices', (1, 1, 1, 1))
+    link(sphere.outputs['Mesh'], sphere_material.inputs['Geometry'])
+    instances = nodes.new('GeometryNodeInstanceOnPoints')
+    instances.location = (120, 240)
+    link(points.outputs['Points'], instances.inputs['Points'])
+    link(sphere_material.outputs['Geometry'], instances.inputs['Instance'])
+    realize_spheres = nodes.new('GeometryNodeRealizeInstances')
+    realize_spheres.location = (320, 240)
+    link(instances.outputs['Instances'], realize_spheres.inputs['Geometry'])
+    link(realize_spheres.outputs['Geometry'], join.inputs['Geometry'])
+
+    floor_test = compare(type_attr.outputs['Attribute'], 'INT', 'EQUAL', 0, -760, 280)
+    ledge_test = compare(flags_attr.outputs['Attribute'], 'INT', 'GREATER_EQUAL', 32768, -760, 80)
+    ledge_and = nodes.new('FunctionNodeBooleanMath')
+    ledge_and.operation = 'AND'
+    ledge_and.location = (-520, 200)
+    link(floor_test, ledge_and.inputs[0])
+    link(ledge_test, ledge_and.inputs[1])
+    ledge_sep = nodes.new('GeometryNodeSeparateGeometry')
+    ledge_sep.domain = 'EDGE'
+    ledge_sep.location = (-300, -240)
+    link(group_in.outputs['Geometry'], ledge_sep.inputs['Geometry'])
+    link(ledge_and.outputs['Boolean'], ledge_sep.inputs['Selection'])
+    ledge_curve = nodes.new('GeometryNodeMeshToCurve')
+    ledge_curve.location = (-80, -240)
+    link(ledge_sep.outputs['Selection'], ledge_curve.inputs['Mesh'])
+    ledge_points = nodes.new('GeometryNodeCurveToPoints')
+    ledge_points.mode = 'COUNT'
+    ledge_points.inputs['Count'].default_value = 2
+    ledge_points.location = (120, -240)
+    link(ledge_curve.outputs['Curve'], ledge_points.inputs['Curve'])
+    ring_circle = nodes.new('GeometryNodeMeshCircle')
+    ring_circle.inputs['Vertices'].default_value = 16
+    ring_circle.inputs['Radius'].default_value = LINE_VERTEX_RADIUS
+    ring_path = nodes.new('GeometryNodeMeshToCurve')
+    ring_path.location = (-80, -520)
+    link(ring_circle.outputs['Mesh'], ring_path.inputs['Mesh'])
+    ring_profile = nodes.new('GeometryNodeCurvePrimitiveCircle')
+    ring_profile.inputs['Resolution'].default_value = 6
+    ring_profile.inputs['Radius'].default_value = 5
+    ring_mesh = nodes.new('GeometryNodeCurveToMesh')
+    ring_mesh.location = (120, -520)
+    link(ring_path.outputs['Curve'], ring_mesh.inputs['Curve'])
+    link(ring_profile.outputs['Curve'], ring_mesh.inputs['Profile Curve'])
+    ring_transform = nodes.new('GeometryNodeTransform')
+    ring_transform.location = (320, -520)
+    ring_transform.inputs['Rotation'].default_value = (math.pi / 2, 0, 0)
+    link(ring_mesh.outputs['Mesh'], ring_transform.inputs['Geometry'])
+    ring_material = nodes.new('GeometryNodeSetMaterial')
+    ring_material.location = (520, -520)
+    ring_material.inputs['Material'].default_value = _helper_mat('N64 Collision Ledge', (1, 1, 0.2, 1))
+    link(ring_transform.outputs['Geometry'], ring_material.inputs['Geometry'])
+    ring_instances = nodes.new('GeometryNodeInstanceOnPoints')
+    ring_instances.location = (520, -240)
+    link(ledge_points.outputs['Points'], ring_instances.inputs['Points'])
+    link(ring_material.outputs['Geometry'], ring_instances.inputs['Instance'])
+    realize_rings = nodes.new('GeometryNodeRealizeInstances')
+    realize_rings.location = (720, -240)
+    link(ring_instances.outputs['Instances'], realize_rings.inputs['Geometry'])
+    link(realize_rings.outputs['Geometry'], join.inputs['Geometry'])
+    return ng
+
+
+def _set_collision_group_renderer(ob):
+    ob.show_in_front = True
+    modifier = next((mod for mod in ob.modifiers if mod.type == 'NODES'
+                     and mod.name == 'N64 Collision Display'), None)
+    if modifier is None:
+        modifier = ob.modifiers.new('N64 Collision Display', 'NODES')
+    modifier.node_group = collision_group_node_group()
+    modifier.show_render = False
+
+
+def new_line(name, pts):
+    """A collision line object: vertices (x, 0, y) chained by edges, with the tube modifier."""
+    me = bpy.data.meshes.new(name)
+    me.from_pydata([(x, 0.0, y) for x, y in pts], [(i, i + 1) for i in range(len(pts) - 1)], [])
+    ob = bpy.data.objects.new(name, me)
+    ob.show_in_front = True
+    ob.modifiers.new('N64 Line Look', 'NODES').node_group = line_node_group()
+    return ob
+
+
+def _line_group(ob):
+    if ob is None:
+        return None
+    return next((int(c.name[6:]) for c in ob.users_collection if re.match(r'Group \d+$', c.name)), None)
+
+
+def _sel_lines(context):
+    sel = [o for o in context.selected_objects if o.get('n64_gamedata') in ('collision', 'collision_group')]
+    act = context.object
+    if act is not None and act.get('n64_gamedata') in ('collision', 'collision_group') and act not in sel:
+        sel.insert(0, act)
+    return sel
+
+
+def _collision_paths(ob):
+    line_flags = (FLAG_DROP if ob.get('n64_drop_through') else 0) | \
+        (FLAG_LEDGE if ob.get('n64_ledge') else 0) | int(ob.get('n64_surface', 0))
+    point_flags = ob.get('n64_point_flags') or []
+
+    def path(locals_, cyclic=False, flag_indices=None):
+        indices = flag_indices if flag_indices is not None else range(len(locals_))
+        coords = [ob.matrix_world @ local for local in locals_]
+        flags = [int(point_flags[i]) if i < len(point_flags) else line_flags for i in indices]
+        return coords, flags, cyclic
+
+    paths = []
+    if ob.type == 'MESH':
+        adjacency = [set() for _ in ob.data.vertices]
+        for edge in ob.data.edges:
+            a, b = edge.vertices
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+        ends = [i for i, neighbors in enumerate(adjacency) if len(neighbors) == 1]
+        ordered, seen = [], set()
+        if len(ends) == 2 and all(len(n) in (1, 2) for n in adjacency):
+            previous, current = None, min(ends)
+            while current not in seen:
+                ordered.append(current)
+                seen.add(current)
+                following = [i for i in adjacency[current] if i != previous]
+                if not following:
+                    break
+                previous, current = current, following[0]
+        if ordered and len(seen) == len(ob.data.vertices):
+            paths.append(path([ob.data.vertices[i].co for i in ordered], flag_indices=ordered))
+        else:
+            paths.extend(path([ob.data.vertices[i].co for i in (a, b)], flag_indices=(a, b))
+                         for a, b in (e.vertices for e in ob.data.edges))
+    elif ob.type == 'CURVE':
+        offset = 0
+        for spline in ob.data.splines:
+            points = spline.points if spline.type in ('POLY', 'NURBS') else spline.bezier_points
+            paths.append(path([p.co.xyz if hasattr(p.co, 'xyz') else p.co for p in points],
+                              spline.use_cyclic_u, range(offset, offset + len(points))))
+            offset += len(points)
+        return paths
+    return paths
+
+
+def _collision_group_paths(ob):
+    me = ob.data
+    if ob.mode == 'EDIT':
+        import bmesh
+        bm = bmesh.from_edit_mesh(me)
+        layers = {name: bm.edges.layers.int.get(name) for name in
+                  (COLL_EDGE_TYPE, COLL_EDGE_FLAGS, COLL_EDGE_START_SIDE)}
+        if any(layer is None for layer in layers.values()):
+            raise RuntimeError(f'{ob.name}: collision edge type/flags are missing')
+        edge_data = ((edge.verts, edge[layers[COLL_EDGE_TYPE]], edge[layers[COLL_EDGE_FLAGS]],
+                      edge[layers[COLL_EDGE_START_SIDE]]) for edge in bm.edges)
+        vertices = bm.verts
+    else:
+        attributes = {name: me.attributes.get(name) for name in
+                      (COLL_EDGE_TYPE, COLL_EDGE_FLAGS, COLL_EDGE_START_SIDE)}
+        if any(attr is None or attr.domain != 'EDGE' or attr.data_type != 'INT'
+               for attr in attributes.values()):
+            raise RuntimeError(f'{ob.name}: collision edge type/flags are missing')
+        edge_data = ((edge.vertices, attributes[COLL_EDGE_TYPE].data[i].value,
+                      attributes[COLL_EDGE_FLAGS].data[i].value,
+                      attributes[COLL_EDGE_START_SIDE].data[i].value)
+                     for i, edge in enumerate(me.edges))
+        vertices = me.vertices
+    group = _line_group(ob) or int(ob.get('n64_collision_group', 0))
+    paths = []
+    for endpoints, kind_index, flags, start_side in edge_data:
+        a, b = endpoints
+        if start_side:
+            a, b = b, a
+        kind_index = int(kind_index)
+        if not 0 <= kind_index < len(LINE_KINDS):
+            continue
+        flags = int(flags)
+        a = a.co if hasattr(a, 'co') else vertices[a].co
+        b = b.co if hasattr(b, 'co') else vertices[b].co
+        coords = [ob.matrix_world @ a, ob.matrix_world @ b]
+        paths.append((LINE_KINDS[kind_index][0], group, coords, [flags, flags], False))
+    return paths
+
+
+def _floor_continues_both_sides(floor_segments, point):
+    left = right = False
+    for a, b in floor_segments:
+        if a == point:
+            other = b
+        elif b == point:
+            other = a
+        else:
+            continue
+        left |= other.x < point.x
+        right |= other.x > point.x
+    return left and right
+
+
+def _draw_collision_overlay():
+    import gpu
+    from bpy_extras import view3d_utils
+    from gpu_extras.batch import batch_for_shader
+
+    context = bpy.context
+    region, rv3d = context.region, context.region_data
+    if region is None or rv3d is None:
+        return
+    lines = []
+    floor_segments = {}
+    for ob in context.scene.objects:
+        if ob.get('n64_gamedata') not in ('collision', 'collision_group') or not ob.visible_get():
+            continue
+        if ob.get('n64_gamedata') == 'collision_group':
+            lines.extend(_collision_group_paths(ob))
+            continue
+        kind = ob.get('n64_coll_type', 'floor')
+        group = _line_group(ob) or 0
+        for coords, flags, cyclic in _collision_paths(ob):
+            if len(coords) < 2:
+                continue
+            lines.append((kind, group, coords, flags, cyclic))
+
+    for kind, group, coords, _flags, cyclic in lines:
+        if kind == 'floor':
+            segments = zip(coords, coords[1:] + ([coords[0]] if cyclic else []))
+            floor_segments.setdefault(group, []).extend(segments)
+
+    if not lines:
+        return
+
+    kinds = [item[0] for item in LINE_KINDS]
+    solid, dashed, vertices, ledges = ({kind: [] for kind in kinds} for _ in range(4))
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+
+    def screen_pos(world):
+        return view3d_utils.location_3d_to_region_2d(region, rv3d, world)
+
+    def add_circle(target, world, radius):
+        center = screen_pos(world)
+        if center is None:
+            return
+        points = []
+        for i in range(12):
+            for step in (i, i + 1):
+                angle = 2 * math.pi * step / 12
+                screen = center + mathutils.Vector((math.cos(angle) * radius, math.sin(angle) * radius))
+                points.append(view3d_utils.region_2d_to_location_3d(region, rv3d, screen, world))
+        target.extend(points)
+
+    for kind, group, coords, flags, cyclic in lines:
+        segments = list(zip(coords, coords[1:] + ([coords[0]] if cyclic else [])))
+        segment_flags = flags[:len(segments)]
+        for (a, b), fl in zip(segments, segment_flags):
+            if fl & FLAG_DROP:
+                sa, sb = screen_pos(a), screen_pos(b)
+                if sa is None or sb is None:
+                    continue
+                length = (sb - sa).length
+                if length <= 0:
+                    continue
+                for start in range(0, int(length), 15):
+                    end = min(start + 10, length)
+                    dashed[kind].extend((a.lerp(b, start / length), a.lerp(b, end / length)))
+            else:
+                solid[kind].extend((a, b))
+        for i, point in enumerate(coords):
+            add_circle(vertices[kind], point, VERTEX_PIXEL_RADIUS)
+            previous = flags[(i - 1) % len(flags)] if i or cyclic else 0
+            following = flags[i] if i < len(segments) else 0
+            ledge = bool((previous | following) & FLAG_LEDGE)
+            if kind == 'floor' and ledge and not _floor_continues_both_sides(
+                    floor_segments.get(group, ()), point):
+                add_circle(ledges[kind], point, LEDGE_PIXEL_RADIUS)
+
+    try:
+        gpu.state.depth_test_set('NONE')
+        for kind in kinds:
+            color = LINE_COLORS[kind]
+            for width, positions in ((LINE_PIXEL_WIDTH, solid[kind]),
+                                     (LINE_PIXEL_WIDTH, dashed[kind]),
+                                     (2.0, vertices[kind]),
+                                     (2.5, ledges[kind])):
+                if not positions:
+                    continue
+                gpu.state.line_width_set(width)
+                batch = batch_for_shader(shader, 'LINES', {'pos': positions})
+                shader.bind()
+                shader.uniform_float('color', color)
+                batch.draw(shader)
+    finally:
+        gpu.state.line_width_set(1.0)
+        gpu.state.depth_test_set('LESS_EQUAL')
+
+
+def _register_collision_draw_handler():
+    if bpy.app.background:
+        return
+    namespace = bpy.app.driver_namespace
+    previous = namespace.pop(COLLISION_DRAW_HANDLER, None)
+    if previous is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(previous, 'WINDOW')
+        except ValueError:
+            pass
+    namespace[COLLISION_DRAW_HANDLER] = bpy.types.SpaceView3D.draw_handler_add(
+        _draw_collision_overlay, (), 'WINDOW', 'POST_VIEW')
+
+
+def _unregister_collision_draw_handler():
+    handler = bpy.app.driver_namespace.pop(COLLISION_DRAW_HANDLER, None)
+    if handler is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(handler, 'WINDOW')
+        except ValueError:
+            pass
+
+
+class N64_OT_coll_apply(bpy.types.Operator):
+    bl_idname = 'n64.coll_apply'
+    bl_label = 'Copy Collision Properties'
+    bl_description = 'Copy the active legacy collision line properties to selected line objects'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        act = context.object
+        if act is None or act.get('n64_gamedata') != 'collision':
+            return {'CANCELLED'}
+        flags = (bool(act.get('n64_drop_through')), bool(act.get('n64_ledge')), int(act.get('n64_surface', 0)))
+        for ob in _sel_lines(context):
+            if ob is act:
+                continue
+            if (bool(ob.get('n64_drop_through')), bool(ob.get('n64_ledge')), int(ob.get('n64_surface', 0))) != flags:
+                ob.pop('n64_point_flags', None)
+            ob['n64_coll_type'] = act.get('n64_coll_type', 'floor')
+            ob['n64_drop_through'], ob['n64_ledge'], ob['n64_surface'] = flags
+            _refresh_look(ob)
+        return {'FINISHED'}
+
+
+def _collision_group_object(group):
+    root = bpy.data.collections.get('Collision')
+    if root is None:
+        raise RuntimeError('No Collision collection (not a stage export)')
+    collection = bpy.data.collections.get(f'Group {group}')
+    if collection is None:
+        collection = bpy.data.collections.new(f'Group {group}')
+        collection.hide_render = True
+    if collection.name not in root.children:
+        root.children.link(collection)
+    ob = next((o for o in collection.objects if o.get('n64_gamedata') == 'collision_group'), None)
+    if ob is None:
+        mesh = bpy.data.meshes.new(f'Collision Group {group}')
+        for name in (COLL_EDGE_TYPE, COLL_EDGE_FLAGS, COLL_EDGE_ORDER, COLL_EDGE_SEGMENT,
+                     COLL_EDGE_START_SIDE, COLL_EDGE_END_FLAGS, COLL_EDGE_POINT_FLAGS):
+            mesh.attributes.new(name, 'INT', 'EDGE')
+        ob = bpy.data.objects.new(f'Collision Group {group}', mesh)
+        ob['n64_gamedata'] = 'collision_group'
+        ob['n64_collision_group'] = group
+        ob.show_in_front = True
+        collection.objects.link(ob)
+    _set_collision_group_renderer(ob)
+    return ob
+
+
+class N64_OT_coll_group(bpy.types.Operator):
+    bl_idname = 'n64.coll_group'
+    bl_label = 'Set Collision Group'
+    bl_description = 'Move selected collision to this group; group meshes merge (the id hazards toggle)'
+    bl_options = {'REGISTER', 'UNDO'}
+    group: bpy.props.IntProperty(min=1, max=6)
+
+    def execute(self, context):
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        root = bpy.data.collections.get('Collision')
+        if root is None:
+            return {'CANCELLED'}
+        gc = bpy.data.collections.get(f'Group {self.group}')
+        if gc is None:
+            gc = bpy.data.collections.new(f'Group {self.group}')
+            gc.hide_render = True
+        if gc.name not in root.children:
+            root.children.link(gc)
+        selected = _sel_lines(context)
+        group_meshes = [ob for ob in selected if ob.get('n64_gamedata') == 'collision_group']
+        other_selected = [ob for ob in selected if ob.get('n64_gamedata') != 'collision_group']
+        targets = [ob for ob in gc.objects if ob.get('n64_gamedata') == 'collision_group'
+                   and ob not in group_meshes]
+        if not targets and group_meshes:
+            target, *group_meshes = group_meshes
+            targets = [target]
+            for collection in target.users_collection:
+                collection.objects.unlink(target)
+            gc.objects.link(target)
+        if targets:
+            target = targets[0]
+            if group_meshes:
+                for ob in context.selected_objects:
+                    ob.select_set(False)
+                target.select_set(True)
+                for ob in group_meshes:
+                    ob.select_set(True)
+                context.view_layer.objects.active = target
+                bpy.ops.object.join()
+            target['n64_collision_group'] = self.group
+        for ob in other_selected:
+            for c in ob.users_collection:
+                c.objects.unlink(ob)
+            gc.objects.link(ob)
+        return {'FINISHED'}
+
+
+class N64_OT_coll_add(bpy.types.Operator):
+    bl_idname = 'n64.coll_add'
+    bl_label = 'Add Collision Edge'
+    bl_description = 'Add a floor edge at the 3D cursor to this group mesh'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if bpy.data.collections.get('Collision') is None:
+            self.report({'ERROR'}, 'No Collision collection (not a stage export)')
+            return {'CANCELLED'}
+        act = context.object if context.object and context.object.get('n64_gamedata') == 'collision_group' else None
+        group = _line_group(act) or 1
+        ob = _collision_group_object(group)
+        if context.mode != 'EDIT_MESH' or context.object is not ob:
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            for other in context.selected_objects:
+                other.select_set(False)
+            ob.hide_set(False)
+            ob.select_set(True)
+            context.view_layer.objects.active = ob
+            bpy.ops.object.mode_set(mode='EDIT')
+        import bmesh
+        bm = bmesh.from_edit_mesh(ob.data)
+        cursor = context.scene.cursor.location
+        v0 = bm.verts.new(ob.matrix_world.inverted() @ mathutils.Vector((cursor.x - 500, 0, cursor.z)))
+        v1 = bm.verts.new(ob.matrix_world.inverted() @ mathutils.Vector((cursor.x + 500, 0, cursor.z)))
+        edge = bm.edges.new((v0, v1))
+        bm.verts.index_update()
+        bm.edges.index_update()
+        names = (COLL_EDGE_TYPE, COLL_EDGE_FLAGS, COLL_EDGE_ORDER, COLL_EDGE_SEGMENT,
+                 COLL_EDGE_START_SIDE, COLL_EDGE_END_FLAGS, COLL_EDGE_POINT_FLAGS)
+        layers = {name: bm.edges.layers.int.get(name) or bm.edges.layers.int.new(name) for name in names}
+        flags = (FLAG_DROP if context.scene.n64_ui_drop else 0) | \
+            (FLAG_LEDGE if context.scene.n64_ui_ledge else 0) | int(context.scene.n64_ui_surface)
+        kind = _collision_type_get(context.scene)
+        edge[layers[COLL_EDGE_TYPE]] = kind if kind < len(LINE_KINDS) else 0
+        edge[layers[COLL_EDGE_FLAGS]] = flags
+        edge[layers[COLL_EDGE_ORDER]] = -1
+        edge[layers[COLL_EDGE_SEGMENT]] = -1
+        edge[layers[COLL_EDGE_START_SIDE]] = 0 if edge.verts[0] == v0 else 1
+        edge[layers[COLL_EDGE_END_FLAGS]] = flags
+        edge[layers[COLL_EDGE_POINT_FLAGS]] = 0
+        for vertex in bm.verts:
+            vertex.select = vertex in (v0, v1)
+        for other in bm.edges:
+            other.select = other == edge
+        bm.select_flush_mode()
+        bmesh.update_edit_mesh(ob.data, loop_triangles=False, destructive=True)
+        return {'FINISHED'}
+
+
+class N64_PT_collision_tools(bpy.types.Panel):
+    bl_label = 'N64 Collision'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'N64'
+
+    @classmethod
+    def poll(cls, context):
+        return bpy.data.collections.get('Collision') is not None
+
+    def draw(self, context):
+        lay = self.layout
+        if not bpy.app.background and COLLISION_DRAW_HANDLER not in bpy.app.driver_namespace:
+            _register_collision_draw_handler()
+        act = context.object if (context.object is not None
+                                 and context.object.get('n64_gamedata') in ('collision', 'collision_group')) else None
+        sel = _sel_lines(context)
+        if act is None:
+            lay.label(text='Select a collision group mesh', icon='INFO')
+        elif act.get('n64_gamedata') == 'collision_group':
+            group = _line_group(act) or int(act.get('n64_collision_group', 1))
+            lay.label(text=f'{act.name}: edit the mesh as collision edges', icon='MESH_DATA')
+            if context.mode == 'EDIT_MESH':
+                selection = _collision_edit_selection(context)
+                if selection is None:
+                    lay.label(text='Collision edge attributes are missing', icon='ERROR')
+                elif not selection['edges']:
+                    lay.label(text='Select a collision edge or vertex to edit')
+                else:
+                    lay.label(text=f'{len(selection["edges"])} edge(s), '
+                                   f'{len(selection["vertices"])} vertex/vertices selected')
+                col = lay.column()
+                col.enabled = bool(selection and selection['edges'])
+                col.use_property_split = True
+                col.label(text='Active vertex/edge values; edits update the selection:')
+                col.prop(context.scene, 'n64ui_coll_type')
+                col.prop(context.scene, 'n64_ui_drop')
+                col.prop(context.scene, 'n64_ui_ledge')
+                col.prop(context.scene, 'n64_ui_surface')
+            else:
+                lay.label(text='Tab into Edit Mode and select edges or vertices to edit properties')
+            lay.label(text='Group (hazards toggle 2+; 1 is always on):')
+            row = lay.row(align=True)
+            for g in range(1, 7):
+                row.operator('n64.coll_group', text=str(g), depress=(g == group)).group = g
+        else:
+            lay.label(text=act.name, icon='IPO_LINEAR')
+            lay.label(text='Type and flags apply to this whole line')
+            col = lay.column()
+            col.use_property_split = True
+            col.prop(act, 'n64ui_coll_type')
+            col.prop(act, 'n64_ui_drop')
+            col.prop(act, 'n64_ui_ledge')
+            col.prop(act, 'n64_ui_surface')
+            lay.label(text='Group (hazards toggle 2+; 1 is always on):')
+            cur = _line_group(act)
+            row = lay.row(align=True)
+            for g in range(1, 7):
+                row.operator('n64.coll_group', text=str(g), depress=(g == cur)).group = g
+            if len(sel) > 1:
+                lay.operator('n64.coll_apply', text=f'Copy to {len(sel) - 1} Selected', icon='DUPLICATE')
+        lay.operator('n64.coll_add', text='Add Collision Edge', icon='ADD')
+        lay.label(text='Floor green; ceiling red; right blue; left orange')
+        lay.label(text='Dashed: drop-through; ring: ledge; circles: vertices')
+        lay.label(text='Viewport overlay only; hidden in final renders', icon='INFO')
+
+
+def _kind_get(self):
+    return int(self.get('n64_mapobj_kind', 4))
+
+
+def _kind_set(self, value):
+    self['n64_mapobj_kind'] = int(value)
+    self.name = MAPOBJ_KINDS.get(int(value), f'kind 0x{int(value):02X}')
+
+
+OBJECT_PROPS = {
+    'n64ui_hb_placement': obj_enum('n64_hurtbox_placement', HB_PLACEMENTS, 'mid', name='Placement',
+                                   description='Where a hit on this box counts: low, mid or high (the '
+                                               'damage reaction)'),
+    'n64ui_hb_grabbable': obj_bool('n64_hurtbox_grabbable', name='Grabbable',
+                                   description='Grabs connect with this box (vanilla: torso, head; usually not '
+                                               'arms or lower legs)'),
+    'n64ui_hb_offset': bpy.props.FloatVectorProperty(
+        size=3, get=lambda self: _hb_local(self)[0], set=lambda self, v: _hb_set(self, offset=v), precision=2,
+        name='Offset', description='The box\'s center in its joint\'s space, game units (config.yaml offset)'),
+    'n64ui_hb_size': bpy.props.FloatVectorProperty(
+        size=3, get=lambda self: _hb_local(self)[1], set=lambda self, v: _hb_set(self, size=v), precision=2, min=0,
+        name='Size', description='The box\'s full width along the joint\'s x / y / z, game units (config.yaml '
+                                  'size; the game halves it)'),
+    'n64ui_coll_type': obj_enum('n64_coll_type', LINE_KINDS, 'floor', name='Type',
+                                description='Which side of the line is solid'),
+    'n64_ui_drop': obj_bool('n64_drop_through', name='Drop-Through',
+                            description='A platform: jumped through from below, dropped through by pressing down'),
+    'n64_ui_ledge': obj_bool('n64_ledge', name='Ledge',
+                             description='Its ends can be grabbed (a floor\'s edge where it doesn\'t continue)'),
+    'n64_ui_surface': obj_int('n64_surface', 0, 255, name='Surface',
+                              description='Surface kind (low byte of the vertex flags): 0 normal; others '
+                                          'damage / slide... per stage code'),
+    'n64ui_mapobj_kind': bpy.props.IntProperty(get=_kind_get, set=_kind_set, min=0, max=0xFF, name='Kind',
+                                               description='Map object kind (decomp mpdef.h nMPMapObjKind): '
+                                                           + ', '.join(f'{k}: {v}' for k, v in
+                                                                       MAPOBJ_KINDS.items())),
+}
+
+
+def draw_hurtbox(lay, ob):
+    lay.prop(ob, 'n64ui_hb_placement')
+    lay.prop(ob, 'n64ui_hb_grabbable')
+    arm, bone = _hb_bone(ob)
+    if bone is not None and _joint_world(arm, bone.name) is not None:
+        lay.prop(ob, 'n64ui_hb_offset')
+        lay.prop(ob, 'n64ui_hb_size')
+
+
+def hurtbox_objects(bone_name=None):
+    obs = [o for o in bpy.data.objects if o.get('n64_gamedata') == 'hurtbox' and o.users_collection]
+    if bone_name is not None:
+        obs = [o for o in obs if (_hb_bone(o)[1] is not None and o.parent_bone == bone_name)]
+    return sorted(obs, key=lambda o: o.name)
+
+
+def _hurtbox_lc(context):
+    return context.view_layer.layer_collection.children.get('Hurtboxes')
+
+
+def _show_get(self):
+    lc = _hurtbox_lc(bpy.context)
+    return lc is not None and not lc.hide_viewport
+
+
+def _show_set(self, value):
+    lc = _hurtbox_lc(bpy.context)
+    if lc is not None:
+        lc.hide_viewport = not value
+
+
+class N64_OT_hurtbox_add(bpy.types.Operator):
+    bl_idname = 'n64.hurtbox_add'
+    bl_label = 'Add Hurtbox'
+    bl_description = 'A new hurtbox on this joint (up to 11 in all)'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = context.object if context.object and context.object.type == 'ARMATURE' else None
+        bone = context.active_bone
+        if arm is None or bone is None or _joint_world(arm, bone.name) is None:
+            self.report({'ERROR'}, 'Select a joint bone of the fighter\'s armature')
+            return {'CANCELLED'}
+        if len(hurtbox_objects()) >= 11:
+            self.report({'ERROR'}, 'The game has room for 11 hurtboxes')
+            return {'CANCELLED'}
+        coll = bpy.data.collections.get('Hurtboxes') or bpy.data.collections.new('Hurtboxes')
+        if coll.name not in context.scene.collection.children and not coll.users:
+            context.scene.collection.children.link(coll)
+        src = bpy.data.meshes.get('N64 Hurtbox')
+        if src is None:
+            src = bpy.data.meshes.new('N64 Hurtbox')
+            v = [(x, y, z) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+            src.from_pydata(v, [], [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4),
+                                    (1, 5, 7, 3)])
+        ob = bpy.data.objects.new(f'hurtbox {bone.name} mid', src.copy())
+        coll.objects.link(ob)
+        ob['n64_gamedata'] = 'hurtbox'
+        ob['n64_hurtbox_placement'] = 'mid'
+        ob['n64_hurtbox_grabbable'] = False
+        ob['n64_hurtbox_joint'] = int(bone.name[6:])
+        ob['n64_hurtbox_half'] = True
+        ob.show_wire = True
+        ob.parent, ob.parent_type, ob.parent_bone = arm, 'BONE', bone.name
+        ob.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+        _refresh_look(ob)
+        _hb_set(ob, offset=(0.0, 0.0, 0.0), size=(100.0, 100.0, 100.0))
+        lc = _hurtbox_lc(context)
+        if lc is not None:
+            lc.hide_viewport = False
+        return {'FINISHED'}
+
+
+class N64_OT_hurtbox_remove(bpy.types.Operator):
+    bl_idname = 'n64.hurtbox_remove'
+    bl_label = 'Remove Hurtbox'
+    bl_description = 'Delete this hurtbox'
+    bl_options = {'REGISTER', 'UNDO'}
+    name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        ob = bpy.data.objects.get(self.name)
+        if ob is not None:
+            bpy.data.objects.remove(ob)
+        return {'FINISHED'}
+
+
+class N64_OT_hurtbox_select(bpy.types.Operator):
+    bl_idname = 'n64.hurtbox_select'
+    bl_label = 'Select Hurtbox'
+    bl_description = 'Select the box (Object Mode) to move / scale it in the viewport'
+    bl_options = {'REGISTER', 'UNDO'}
+    name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        ob = bpy.data.objects.get(self.name)
+        if ob is None:
+            return {'CANCELLED'}
+        lc = _hurtbox_lc(context)
+        if lc is not None:
+            lc.hide_viewport = False
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        for o in context.selected_objects:
+            o.select_set(False)
+        ob.hide_set(False)
+        ob.select_set(True)
+        context.view_layer.objects.active = ob
+        return {'FINISHED'}
+
+
+def _context_bone(context):
+    """The bone the Bone tab shows (Pose / Edit Mode), else the armature's active one."""
+    return getattr(context, 'bone', None) or getattr(context, 'edit_bone', None) or \
+        getattr(context, 'active_bone', None)
+
+
+class N64_PT_bone_hurtboxes(bpy.types.Panel):
+    bl_label = 'N64 Hurtboxes'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'bone'
+
+    @classmethod
+    def poll(cls, context):
+        bone = _context_bone(context)
+        return bone is not None and bool(re.match(r'joint_\d+$', bone.name)) and \
+            bpy.data.collections.get('Hurtboxes') is not None
+
+    def draw(self, context):
+        lay = self.layout
+        bone = _context_bone(context)
+        allboxes = hurtbox_objects()
+        row = lay.row()
+        row.prop(context.scene, 'n64ui_show_hurtboxes', text='Show Hurtboxes')
+        row.label(text=f'{len(allboxes)} / 11 in all')
+        for ob in hurtbox_objects(bone.name):
+            box = lay.box()
+            row = box.row()
+            row.label(text=ob.name, icon='MESH_CUBE')
+            row.operator('n64.hurtbox_select', text='', icon='RESTRICT_SELECT_OFF').name = ob.name
+            row.operator('n64.hurtbox_remove', text='', icon='X').name = ob.name
+            col = box.column()
+            col.use_property_split = True
+            draw_hurtbox(col, ob)
+        lay.operator('n64.hurtbox_add', icon='ADD')
+
+
+class N64_PT_gamedata(bpy.types.Panel):
+    bl_label = 'N64 Game Data'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'object'
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and bool(context.object.get('n64_gamedata'))
+
+    def draw(self, context):
+        lay = self.layout
+        lay.use_property_split = True
+        ob = context.object
+        kind = ob.get('n64_gamedata')
+        if kind == 'hurtbox':
+            joint = ob.parent_bone if ob.parent_type == 'BONE' else f'joint_{ob.get("n64_hurtbox_joint", 0):02d}'
+            lay.label(text=f'Hurtbox on {joint} (Relations > Parent Bone)', icon='MESH_CUBE')
+            lay.prop(ob, 'n64ui_hb_placement')
+            lay.prop(ob, 'n64ui_hb_grabbable')
+            draw_hurtbox(lay, ob)
+            lay.label(text='Move / scale it along the joint\'s axes (no rotation)', icon='INFO')
+            lay.label(text='Also in the bone\'s Bone tab (Pose / Edit Mode)')
+            lay.label(text='The import orders them like vanilla: torso, head, arms, legs')
+        elif kind == 'collision':
+            group = next((c.name for c in ob.users_collection if c.name.startswith('Group ')), '(no group)')
+            lay.label(text=f'Collision line, {group} (move it to another Group N collection)', icon='CURVE_PATH')
+            lay.prop(ob, 'n64ui_coll_type')
+            lay.prop(ob, 'n64_ui_drop')
+            lay.prop(ob, 'n64_ui_ledge')
+            lay.prop(ob, 'n64_ui_surface')
+            lay.label(text='Also in the 3D view sidebar (N): N64 tab', icon='INFO')
+            if 'n64_point_flags' in ob.keys():
+                lay.label(text='Flags per point (from the game file): kept while these are unchanged',
+                          icon='INFO')
+            lay.label(text='Mesh vertices: Edit Mode, on y = 0 (front view, numpad 1)', icon='INFO')
+        elif kind == 'collision_group':
+            group = _line_group(ob) or int(ob.get('n64_collision_group', 1))
+            lay.label(text=f'Collision group {group}: edit the mesh as edges', icon='MESH_DATA')
+            lay.label(text='Select edges in Edit Mode; set type and flags in the 3D View N64 tab')
+        elif kind == 'map_object':
+            lay.label(text='Map object', icon='EMPTY_AXIS')
+            lay.prop(ob, 'n64ui_mapobj_kind')
+            lay.label(text=MAPOBJ_KINDS.get(int(ob.get('n64_mapobj_kind', 0)), 'unknown kind'))
+        elif kind == 'spawn':
+            lay.label(text=f'Spawn location: {ob.get("n64_spawn_category")} {ob.get("n64_spawn_player")}',
+                      icon='EMPTY_SINGLE_ARROW')
+            lay.label(text='config.yaml spawn_locations (the fighter\'s feet)')
+        elif kind == 'bounds':
+            lay.label(text=f'{ob.name}: scale / move its points (Edit Mode)', icon='SELECT_SET')
+
+
 CLASSES = (N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
-           N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene)
+           N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene, N64_PT_gamedata,
+           N64_OT_hurtbox_add, N64_OT_hurtbox_remove, N64_OT_hurtbox_select, N64_PT_bone_hurtboxes,
+           N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools)
 
 
 def _collapse_outliner():
@@ -1856,6 +3074,17 @@ LOOP_DESC = 'The animation starts over after its length (its curves repeat: Cycl
 
 
 def register():
+    if bpy.data.node_groups.get('N64 Collision Line') is not None:
+        line_node_group()
+    for ob in bpy.data.objects:
+        if ob.get('n64_gamedata') == 'collision':
+            ob.show_in_front = True
+            if ob.type == 'CURVE':
+                ob.data.bevel_depth = LINE_RADIUS
+        elif ob.get('n64_gamedata') == 'collision_group':
+            ob.show_in_front = True
+            _set_collision_group_renderer(ob)
+    _register_collision_draw_handler()
     for name, prop in {**PROPS, **ADV_PROPS}.items():
         setattr(bpy.types.Material, name, prop)
     bpy.types.Material.n64ui_anim_loop = bpy.props.BoolProperty(get=_mat_loop_get, set=_mat_loop_set,
@@ -1868,6 +3097,12 @@ def register():
     handlers.append(_sync_loops_on_update)
     for name, prop in SCENE_PROPS.items():
         setattr(bpy.types.Scene, name, prop)
+    for name, prop in COLLISION_SCENE_PROPS.items():
+        setattr(bpy.types.Scene, name, prop)
+    for name, prop in OBJECT_PROPS.items():
+        setattr(bpy.types.Object, name, prop)
+    bpy.types.Scene.n64ui_show_hurtboxes = bpy.props.BoolProperty(
+        get=_show_get, set=_show_set, name='Show Hurtboxes', description='Show the Hurtboxes collection')
     for c in CLASSES:
         try:
             bpy.utils.register_class(c)
@@ -1881,6 +3116,7 @@ def register():
 
 
 def unregister():
+    _unregister_collision_draw_handler()
     bpy.msgbus.clear_by_owner(_MSGBUS_OWNER)
     for c in reversed(CLASSES):
         try:
@@ -1893,6 +3129,14 @@ def unregister():
     for name in SCENE_PROPS:
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
+    for name in COLLISION_SCENE_PROPS:
+        if hasattr(bpy.types.Scene, name):
+            delattr(bpy.types.Scene, name)
+    for name in OBJECT_PROPS:
+        if hasattr(bpy.types.Object, name):
+            delattr(bpy.types.Object, name)
+    if hasattr(bpy.types.Scene, 'n64ui_show_hurtboxes'):
+        delattr(bpy.types.Scene, 'n64ui_show_hurtboxes')
     for t in (bpy.types.Material, bpy.types.PoseBone):
         if hasattr(t, 'n64ui_anim_loop'):
             delattr(t, 'n64ui_anim_loop')

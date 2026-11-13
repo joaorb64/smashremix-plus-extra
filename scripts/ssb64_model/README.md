@@ -1,4 +1,36 @@
-# fighter_model: edit fighter, item, projectile and stage models in Blender
+# ssb64_model: edit Smash 64 models in Blender
+
+Fighters, items, projectiles and stages, from the repo's folders or from a ROM:
+
+```
+python3 appender/scripts/ssb64_model/ssb64_model.py export extra_characters/<Name> OUT_DIR          # -> OUT_DIR/model.blend
+# ... edit OUT_DIR/model.blend in Blender ...
+python3 appender/scripts/ssb64_model/ssb64_model.py import OUT_DIR                                  # -> back into extra_characters/<Name>
+```
+
+| Export | What |
+|---|---|
+| `export extra_characters/<Name> OUT_DIR` | a fighter (main.bin + character.bin) |
+| `export extra_stages/<Name> OUT_DIR` | a stage's geometry layers (header.bin + stage.bin) |
+| `export FOLDER NAME OUT_DIR` | the folder's item / projectile NAME (config.yaml `NAME_hitbox` + `NAME_gfx` / `NAME`) |
+| `export ROM.z64 NAME OUT_DIR` | a fighter (`MARIO`, `FALCO`...), stage (`DREAMLAND`, `BATTLEFIELD`, or the header file's hex ID) or common item (`HAMMER`...) by name; `--kind fighter\|stage\|object` when a name is several |
+
+`export` writes the model (glTF, textures, `manifest.json`, `previews/`) and runs Blender to build
+`model.blend` (`--no-blend` skips it). `import` runs Blender to read the .blend back
+(into `OUT_DIR/import_work/`) and writes the files to the folder the export came from (it's in
+`manifest.json`): give the folder after OUT_DIR for a ROM export or another folder, `--out DIR` to
+write elsewhere (the folder and its config.yaml stay untouched; the new chain heads are printed).
+`blend OUT_DIR` rebuilds only the .blend, `preview OUT_DIR` only the previews. `--help` lists the
+options; arguments after `--` go to the scripts below as they are.
+
+Blender: `--blender CMD`, else `$BLENDER`, else `blender` on the PATH, else the Flatpak
+(`org.blender.Blender`; it can't see /tmp, keep OUT_DIR elsewhere).
+
+The steps are scripts of their own, for doing one at a time: `export_model.py` (game files ->
+glTF + manifest), `build_blend.py` (in Blender: -> model.blend), `blend_to_gltf.py` (in Blender:
+model.blend -> work folder), `import_fighter.py` / `import_object.py` / `import_stage.py` (work
+folder -> game files), `preview.py`.
+
 
 Export a fighter's model (body, low detail, alternate parts, every costume,
 facial expressions, palettes, materials) to an editable .blend, then build the
@@ -13,25 +45,22 @@ same MObj order); so do items and projectiles (rebuilt model files have no lefto
 data). ROM export reads Remix fighters (from `File.asm`) and vanilla fighters and
 items, including vanilla display-list features (shifted / scaled texture tiles,
 mirrored clamped tiles, vertex edits across joints, shared files). Not yet: writing
-items back into the vanilla shared item file, editing stage joint animations in Blender
-(they're kept; material animations are editable, see [Material animations](#material-animations)), adding model-part variants,
+items back into the vanilla shared item file, adding model-part variants,
 build-process wiring (planned: .blend files in the repo, compiled at build).
 
-Blender commands are given twice: as `blender`, and for Blender installed from
-Flatpak (`flatpak run org.blender.Blender`, with absolute paths: Flatpak Blender
-can't see /tmp). `--factory-startup` keeps your installed add-ons out of it (some
-print errors when Blender runs without a window); the glTF add-on it needs is built in.
-The glTF exporter's "Vertex Color alpha without color" warnings are harmless.
+Blender runs with `--factory-startup` (installed add-ons stay out of it; the glTF add-on
+it needs is built in). The glTF exporter's "Vertex Color alpha without color" warnings are
+harmless.
 
 ## 1. Export
 
 ```
-python3 appender/scripts/fighter_model/export_fighter.py extra_characters/<Name> OUT_DIR
+python3 appender/scripts/ssb64_model/ssb64_model.py export extra_characters/<Name> OUT_DIR
 ```
 To export a Remix fighter directly from `original_extra.z64`, select it by the
 constant name from `appender/smashremix/src/File.asm`:
 ```
-python3 appender/scripts/fighter_model/export_fighter.py --rom appender/smashremix/roms/original_extra.z64 --fighter FALCO OUT_DIR
+python3 appender/scripts/ssb64_model/ssb64_model.py export appender/smashremix/roms/original_extra.z64 FALCO OUT_DIR
 ```
 Paired `*_MAIN` and `*_CHARACTER` IDs are discovered from `File.asm`.
 Named fighters default to four costumes; override with `--costumes N` when needed.
@@ -40,7 +69,8 @@ are the original US 1.0 file-table IDs, so the selected ROM must contain those
 files (`original.z64` or `original_extra.z64`).
 For another Remix fighter pair, provide its hexadecimal table IDs instead:
 ```
-python3 appender/scripts/fighter_model/export_fighter.py --rom ROM.z64 --main-file-id 0xCB --char-file-id 0x128 OUT_DIR
+python3 appender/scripts/ssb64_model/export_model.py --rom ROM.z64 --main-file-id 0xCB --char-file-id 0x128 OUT_DIR
+python3 appender/scripts/ssb64_model/ssb64_model.py blend OUT_DIR
 ```
 ROM file IDs can be found in `appender/scripts/gen_editable_rom.py`. ROM exports
 read relocation-chain offsets from the ROM file table; ordinary `main.bin` /
@@ -51,15 +81,15 @@ vanilla electric skeleton shares) is read too.
 ### Items and projectiles
 
 ```
-python3 appender/scripts/fighter_model/export_fighter.py FOLDER OUT_DIR --object NAME
+python3 appender/scripts/ssb64_model/ssb64_model.py export FOLDER NAME OUT_DIR
 ```
 FOLDER is a character or stage folder; NAME is found in its config.yaml: the
 attributes file `NAME_hitbox` (`files:`) and the model file `NAME_gfx`
 (`append_files:`, projectiles) or `NAME` (`files:`, stage items). Chain heads come
 from those entries; the attributes are at the attributes file's external chain head
-(`--attr-offset` to override). Other files: `--attr X_hitbox.bin --model X.bin
---attr-heads INT,EXT --model-head HEAD [--attr-offset OFF]`. Vanilla common items:
-`--rom ROM.z64 --item HAMMER` (see `VANILLA_ITEMS` in export_fighter.py).
+(`-- --attr-offset OFF` to override). Other files: `export_model.py OUT_DIR --attr X_hitbox.bin
+--model X.bin --attr-heads INT,EXT --model-head HEAD [--attr-offset OFF]`. Vanilla common items:
+`export ROM.z64 HAMMER OUT_DIR` (see `VANILLA_ITEMS` in export_model.py).
 
 The model is a DObj tree or a bare display list (sprite projectiles: one quad);
 the .blend has one costume. Materials with several images (e.g. damage stages a
@@ -70,7 +100,7 @@ draw them with env 00000000.
 ### Stages
 
 ```
-python3 appender/scripts/fighter_model/export_fighter.py STAGE_DIR OUT_DIR --stage
+python3 appender/scripts/ssb64_model/ssb64_model.py export STAGE_DIR OUT_DIR
 ```
 Reads the geometry layers of `header.bin`'s ground data (MPGroundData at 0x14:
 `gr_desc[0..3]`, each a DObj tree in `stage.bin` with its materials and material
@@ -106,18 +136,66 @@ one stage loop independently, e.g. 300 and 500 frames); a script that never loop
 animations loop the same way (cycles up to 16384 frames are found). Both are editable:
 see [Joint animations](#joint-animations) and [Material animations](#material-animations).
 Vanilla stages are available by name too (`DREAMLAND`, `CASTLE`, `SECTOR_Z`...:
-`VANILLA_STAGES` in export_fighter.py).
+`VANILLA_STAGES` in export_model.py).
 
-To export a stage directly from a Smash Remix ROM, give its name to `--stage`:
+To export a stage directly from a Smash Remix ROM, give its name:
 ```
-python3 appender/scripts/fighter_model/export_fighter.py --rom ROM.z64 --stage BATTLEFIELD OUT_DIR
+python3 appender/scripts/ssb64_model/ssb64_model.py export ROM.z64 BATTLEFIELD OUT_DIR
 ```
 Use a stage name such as `BATTLEFIELD`, `DEKU`, or `MUTE` (`File.asm`'s
 `*_HEADER` constants (with or without the `STG_` prefix); the prefix and suffix
 are optional;
-`--help` lists them all), or the stage header file's hexadecimal ID (the decomp calls
+`export_model.py --help` lists them all), or the stage header file's hexadecimal ID (the decomp calls
 it the Map file). The ROM supplies the stage header and its referenced geometry files.
-Without `--rom`, `--stage` (with no name) means the folder given is a stage folder.
+
+### Hurtboxes (fighters)
+
+The `Hurtboxes` collection (hidden at first: its eye in the outliner, or **Show Hurtboxes** in the
+bone panel): one cube per hurtbox (decomp `FTDamageCollDesc`, attributes + 0x104, up to 11),
+`hurtbox <joint> <placement>`, parented to its joint's bone, colored by placement (low blue, mid
+yellow, high red). The cube is the box: move / scale it along the joint's axes (a box can't turn
+against its joint; a rotation is ignored, with a warning).
+
+Edit them from the bone: select a bone (Pose or Edit Mode), **Bone > N64 Hurtboxes** lists its boxes
+with their placement (low / mid / high: the hit reaction), grabbable, and offset / size in the
+joint's space, game units (config.yaml's numbers; `size` is the full width, the game halves it).
+**Add Hurtbox** puts a new one on the bone, the select icon picks a box to drag in the viewport, X
+deletes it. The same settings are in **Object > N64 Game Data** with a box selected. Another joint:
+Relations > Parent Bone.
+
+Order is automatic: the game tests the boxes in order (the first one hit gives the placement and
+grabbability), and the import writes them the way vanilla fighters list them: torso (the joints
+the head hangs from, hip first), head (high), arms (other mid boxes), legs (low); upper joints
+first, the pair's higher joint index (right) before the lower. 64 of the ROM's 70 fighters already
+follow it (not: Master Hand, the piano, Wario, Mewtwo and their metal versions); an import that
+changes no box keeps the file's order.
+
+They're read from config.yaml `attributes: hurtboxes` when it has them (the build writes them into
+main.bin), else from main.bin. The import writes main.bin, and config.yaml's list when it has one
+(each box keeps its comments). Unchanged values stay exactly as they were.
+
+### Collision and stage objects (stages)
+
+| Collection | What | Written to |
+|---|---|---|
+| `Collision > Group N` | one editable edge mesh per collision group (the yakumono id hazards toggle); each edge has its own type and flags. A saved Geometry Nodes display draws thick, type-colored edges, vertex markers, lighter drop-through edges and ledge rings; the viewport GPU overlay adds drop-through dashes when scripts are enabled. Viewport only, not in final renders. Points on the game's z = 0 plane (front view, Blender y = 0) | config.yaml `collision:` when it has it, else stage.bin |
+| `Stage objects > Map objects` | empties: P1-P4 start, item spawns, rebirth platform, twister... (stage.bin map objects) | stage.bin (rebirth: config.yaml `rebirth:` when set) |
+| `Stage objects > Spawn locations (default / neutral)` | config.yaml `spawn_locations` (neutral hidden) | config.yaml |
+| `Stage objects > Bounds` | blast zones, camera bounds (team ones hidden): rectangles, edit their points or scale them | config.yaml when it has the key, else header.bin |
+
+Select a `Collision > Group N` mesh and edit it like a model made of edges. In Edit Mode, select
+edges or vertices and use the 3D View sidebar's **N64** tab to inspect the active selection's
+current type and flags; changes apply immediately to the selected edges or vertices. Group buttons
+move the whole mesh between collision groups, merging meshes when the destination already has one.
+The Geometry Nodes display is saved
+with the blend and the Collision collection is hidden in final renders. The game stores flags per
+point and reads a segment's flags from its first point; the editor
+preserves per-segment flags when it rebuilds a polyline. **Object > N64 Game Data** identifies
+the selected group mesh; it also exposes settings for older line-object blends. A map object's
+kind is edited there too. config.yaml blocks are rewritten only
+when something changed, in their order and with their comments. A stage has at most 6 collision
+groups (the Remix loader); the appender's collision writer numbers groups 1..N, so vanilla stages
+with gaps in their group ids (Saffron, Mushroom Kingdom) can't have their collision rewritten.
 
 ### Joint animations
 
@@ -158,7 +236,7 @@ changed). Fighters' MObj scripts are their costume scripts, not animations.
 
 In Blender each animated value is a custom property of the material, keyframed in
 the material's action (60 frames per second, like the game), shown in Material Preview
-while the timeline plays. The **N64 Fighter** panel's **Material Animation** box lists
+while the timeline plays. The **N64 Model** panel's **Material Animation** box lists
 them; hover one + I to keyframe, **Add** for another:
 
 | Property | Track | What |
@@ -194,16 +272,11 @@ them; hover one + I to keyframe, **Add** for another:
   none, with the flags its tracks need (0x20 tile offset, 0x40 second tile, 0x200..
   colors). Removing every key removes the script.
 
-```
-blender -b --factory-startup --python appender/scripts/fighter_model/build_blend.py -- OUT_DIR
-```
-Flatpak:
-```
-flatpak run org.blender.Blender -b --factory-startup --python $PWD/appender/scripts/fighter_model/build_blend.py -- $PWD/OUT_DIR
-```
-`--main`/`--char` export other files; `--costumes N` overrides config.yaml's
-`num_costumes`. Writes previews to `OUT_DIR/previews/` (`--no-preview` to skip;
-`preview.py OUT_DIR` renders them again), all with the model's normals, light /
+### What the export writes
+
+`--costumes N` overrides config.yaml's `num_costumes` (`export_model.py --main / --char`:
+other files). Previews go to `OUT_DIR/previews/` (`--no-preview` to skip;
+`ssb64_model.py preview OUT_DIR` renders them again), all with the model's normals, light /
 shadow colors and per-material culling:
 
 | Sheet | What |
@@ -214,7 +287,7 @@ shadow colors and per-material culling:
 | `skeleton.png` | the electric-shock skeleton model(s) |
 | `variants.png` | items / projectiles: every image of each material that has several (instead of expressions.png) |
 
-`OUT_DIR/fighter.blend` contains:
+`OUT_DIR/model.blend` contains:
 
 | Collection | What |
 |---|---|
@@ -223,6 +296,7 @@ shadow colors and per-material culling:
 | Model parts | alternate pieces per joint and variant: hands (open/fist...), held props, effects. Objects `part<variant>_<hi\|lo>_j<joint>` (hidden) |
 | Electric skeleton | the model drawn while electrocuted, `skel<id>_j<joint>` (hidden). It's drawn with the joint's body materials (MObjs) or its own inline textures (usually the shared skeleton texture) |
 | Armature | the skeleton, bones `joint_00`.. (shared). Shown as sticks, in front, with names; bones reach toward their child joints, joints stacked on one spot (separate rotation axes) are short stubs, and bone collections Left (red, the fighter's left: +X) / Right (blue) / Center (yellow) group them. Display only: the import takes the joints from the game file |
+| Hurtboxes / Collision / Stage objects | editing aids, never rendered: see [Hurtboxes](#hurtboxes-fighters) and [Collision and stage objects](#collision-and-stage-objects-stages) |
 | Stage types / rooms | `Layer 0 - Background`, `Layer 1 - Stage (Z-buffered)`, and `Layer 2/3 - Foreground`; each contains `Room <joint>` collections for its DObj joints. Moving a room to another layer changes its stage type. |
 
 Textures are external files (`textures/`, relative paths): keep the export folder
@@ -232,7 +306,7 @@ per texture and no combiner. What the preview does like the game:
 
 - **Lighting**: lit materials are shaded by the game's light, not Blender's: shadow color +
   light color x max(0, N . L), shown as emission (Blender's lights don't change it). The
-  direction is the scene's `n64_light_angle` (Scene > N64 Fighter > Light Angle): a stage's
+  direction is the scene's `n64_light_angle` (Scene > N64 Model > Light Angle): a stage's
   `light_angle` from its header, else the usual 20, 45. In battle the scene sets it once
   per frame for everything (decomp scvsbattle.c `scVSBattleFuncLights`): stage display
   lists set only their light colors, so stages and items are lit from the same direction.
@@ -268,9 +342,9 @@ Unedited entries keep their exact original bytes. PNG dimensions follow the
 texture's render-tile masks; the render-tile extents are kept separately so
 rebuilding preserves repeated or clamped sampling.
 
-### Material settings (Blender: Material > N64 Fighter)
+### Material settings (Blender: Material > N64 Model)
 
-The **N64 Fighter** panel is the first thing in the Material tab, and all a material
+The **N64 Model** panel is the first thing in the Material tab, and all a material
 needs: the object's material slots, the texture (pick, open or create its image, or
 remove it for a flat color with a color picker), dropdowns, toggles and color pickers
 with a description on each option, including Render Mode (game / cut-out / translucent
@@ -282,8 +356,8 @@ raw command). The .blend opens in Material Preview, where every material is draw
 through its real N64 color combiner (as nodes: prim / env colors, texture, vertex
 colors when unlit, blending), wrap modes and texture filtering, so it looks like the
 game; changing a setting updates the view. It's embedded in the .blend: allow the file's scripts when Blender asks
-(or Text Editor > `n64_fighter_panel.py` > Run Script). Or install
-`n64_fighter_panel.py` once as an add-on (Edit > Preferences > Add-ons > Install from
+(or Text Editor > `n64_panel.py` > Run Script). Or install
+`n64_panel.py` once as an add-on (Edit > Preferences > Add-ons > Install from
 Disk). The panel only edits these custom properties, which work without it too
 (Material > Custom Properties):
 
@@ -350,15 +424,15 @@ reduced if there are more), with a palette per costume.
 ## 2. Import
 
 ```
-blender -b --factory-startup OUT_DIR/fighter.blend --python appender/scripts/fighter_model/blend_to_gltf.py -- WORK_DIR
+python3 appender/scripts/ssb64_model/ssb64_model.py import OUT_DIR [TARGET] [--out BUILD_DIR] [--preview PREVIEW_DIR]
 ```
-Flatpak:
-```
-flatpak run org.blender.Blender -b --factory-startup $PWD/OUT_DIR/fighter.blend --python $PWD/appender/scripts/fighter_model/blend_to_gltf.py -- $PWD/WORK_DIR
-```
-```
-python3 appender/scripts/fighter_model/import_fighter.py extra_characters/<Name> WORK_DIR --out BUILD_DIR [--preview PREVIEW_DIR]
-```
+Blender reads `OUT_DIR/model.blend` into `OUT_DIR/import_work/` (`blend_to_gltf.py`), then
+`import_fighter.py`, `import_object.py` or `import_stage.py` (by what was exported) writes the
+files. TARGET defaults to the folder the export came from; `--out` writes the files to BUILD_DIR
+instead.
+
+### Fighters
+
 - The base `main.bin` / `character.bin` (`--main`/`--char`, default the character
   folder's) must be the ones that were exported (checked): original texture data
   is read from them. Everything that isn't the model is kept.
@@ -381,9 +455,7 @@ models were duplicate data), Mega Man 107,632 -> 115,360, Snake 180,748 -> 107,8
 
 ### Items and projectiles
 
-```
-python3 appender/scripts/fighter_model/import_object.py FOLDER NAME WORK_DIR [--out OUT_DIR]
-```
+(`import_object.py FOLDER NAME WORK_DIR [--out OUT_DIR]` on its own.)
 - The model file (`NAME_gfx.bin` / `NAME.bin`) is written from scratch: the new
   model, plus whatever the attributes reach that isn't the model (anim_joints) -
   nothing else from the old file (GoldEditor exports carry unused objects and
@@ -404,9 +476,7 @@ python3 appender/scripts/fighter_model/import_object.py FOLDER NAME WORK_DIR [--
 
 ### Stages
 
-```
-python3 appender/scripts/fighter_model/import_stage.py STAGE_DIR WORK_DIR [--out OUT_DIR]
-```
+(`import_stage.py STAGE_DIR WORK_DIR [--out OUT_DIR]` on its own.)
 `blend_to_gltf.py` writes `layer<N>.gltf` per layer collection. `stage.bin` is written
 from scratch: the rebuilt layers plus everything else `header.bin` points at in it
 (collision geometry, layer animations), and the layers' material scripts (texture

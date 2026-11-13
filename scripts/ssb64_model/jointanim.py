@@ -5,17 +5,17 @@ A joint's script animates its local transform's tracks (flag bits): 0..2 rotatio
 (radians; the joint's matrix is T * Rz Ry Rx * S), 3 the translation path (TraI: kept, not
 editable), 4..6 translation, 7..9 scale. The commands are the same as the material scripts'
 (matanim.py), so a script is written with matanim.encode and checked by playing it with
-fighter_files.simulate_anim.
+model_files.simulate_anim.
 
 play(): a joint's original script -> its values per frame, cycle / end. decompose(): a local
-matrix -> those values (the inverse of fighter_files.rot_zyx). build(): values per frame (from
+matrix -> those values (the inverse of model_files.rot_zyx). build(): values per frame (from
 Blender) -> a script, as keyframes where they're exact, frame by frame otherwise.
 """
 import math
 
 import numpy as np
 
-import fighter_files as FF
+import model_files as MF
 import matanim as MA
 
 NAMES = ('rx', 'ry', 'rz', 'ti', 'tx', 'ty', 'tz', 'sx', 'sy', 'sz')
@@ -47,7 +47,7 @@ def uses_interp(d, ptrs, script, limit=4096):
         if o is None or o + 4 > len(d) or o in seen:
             return False
         seen.add(o)
-        w = FF.u32(d, o)
+        w = MF.u32(d, o)
         op, flags = w >> 25, (w >> 15) & 0x3FF
         if op == 13:
             return True
@@ -65,13 +65,13 @@ def uses_interp(d, ptrs, script, limit=4096):
 def play(d, ptrs, script, joint, max_frames=1800, max_loop=8192):
     """A joint's script -> dict(frames, loop, loop_start, samples={track: per frame 0..frames},
     tracks=[the tracks it sets]) like matanim.play: a cycle ends with its first frame again."""
-    out, loop = FF.simulate_anim(d, ptrs, script, max_loop + 1)
+    out, loop = MF.simulate_anim(d, ptrs, script, max_loop + 1)
     rest = rest_values(joint)
     looping, n = False, None
     if loop == 0:
         n = 0
     elif loop:
-        more, _ = FF.simulate_anim(d, ptrs, script, 2 * loop + 1)
+        more, _ = MF.simulate_anim(d, ptrs, script, 2 * loop + 1)
         if len(more) > 2 * loop and all(more[k] == more[loop + k] for k in range(loop + 1)):
             out, n, looping = more, loop, True
         else:
@@ -135,7 +135,7 @@ def decompose(L, prev=None):
         return a + 2 * math.pi * round((ref - a) / (2 * math.pi))
     # the solutions that give the matrix back (near gimbal the regular one is numerically lost),
     # the closest to the previous frame's
-    errs = [float(np.abs(FF.rot_zyx(*c) - R).max()) for c in cands]
+    errs = [float(np.abs(MF.rot_zyx(*c) - R).max()) for c in cands]
     good = [c for c, e in zip(cands, errs) if e <= min(errs) + 1e-6]
     if prev is not None:
         best = None
@@ -154,7 +154,7 @@ def decompose(L, prev=None):
 def matrix(v):
     """{track: value} -> the joint's local 4x4 matrix (T * Rz Ry Rx * S)."""
     M = np.eye(4)
-    M[:3, :3] = FF.rot_zyx(v['rx'], v['ry'], v['rz']) * [v['sx'], v['sy'], v['sz']]
+    M[:3, :3] = MF.rot_zyx(v['rx'], v['ry'], v['rz']) * [v['sx'], v['sy'], v['sz']]
     M[:3, 3] = [v['tx'], v['ty'], v['tz']]
     return M
 
@@ -186,7 +186,7 @@ def _check(script, ptrs, samples, tracks, frames, loop, loop_start):
     d = script + b'\0' * 8
     period = frames - loop_start
     total = frames + 1 + (period if loop else 0)
-    out, _ = FF.simulate_anim(d, dict(ptrs), 0, total)
+    out, _ = MF.simulate_anim(d, dict(ptrs), 0, total)
     bad = []
     for k in tracks:
         i, seq = NAMES.index(k), samples[k]

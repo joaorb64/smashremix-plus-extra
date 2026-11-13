@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preview sheets of an export_fighter.py folder (EXPORT_DIR/previews/):
+"""Preview sheets of an export_model.py folder (EXPORT_DIR/previews/):
   body.png         every costume from the front, left, back, right, top, bottom
   expressions.png  every image of materials that have several (facial expressions,
                    alternate textures), shown on the model

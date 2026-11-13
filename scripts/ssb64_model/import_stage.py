@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Rebuild a stage's stage.bin geometry layers from an edited .blend (export_fighter.py --stage).
+"""Rebuild a stage's stage.bin geometry layers from an edited .blend (export_model.py --stage).
 
+    # (ssb64_model.py import OUT_DIR does both steps)
     # 1. inside Blender: one glTF per geometry layer (layer0.gltf, layer1.gltf...)
-    blender -b fighter.blend --python blend_to_gltf.py -- WORK_DIR
+    blender -b model.blend --python blend_to_gltf.py -- WORK_DIR
     # 2. write stage.bin (and re-point header.bin)
     python3 import_stage.py STAGE_DIR WORK_DIR [--out OUT_DIR]
 
@@ -21,10 +22,10 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))     # appender root
-import fighter_files as FF  # noqa: E402
+import model_files as MF  # noqa: E402
 import gbi_writer as GW  # noqa: E402
 import import_fighter as IF  # noqa: E402
-import export_fighter as EX  # noqa: E402
+import export_model as EX  # noqa: E402
 import import_object as IO  # noqa: E402
 from smashremix_extra import ge_bin as ge  # noqa: E402
 
@@ -40,20 +41,20 @@ def set_stage_head(cfg_path, head):
     open(cfg_path, 'w', encoding='utf-8').write(pat.sub(lambda m: m.group(1) + f'{head:04X}' + m.group(3), text, 1))
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('stage_dir')
     ap.add_argument('work_dir', help='blend_to_gltf.py output (layer<N>.gltf)')
     ap.add_argument('--out', help='write the files here (default: the stage folder, updating config.yaml)')
     ap.add_argument('--manifest', help="the export's manifest.json (default: the one the .blend was built from)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     cfg_path = os.path.join(a.stage_dir, 'config.yaml')
     kw = EX.stage_files(EX.read_config(a.stage_dir), a.stage_dir)
-    f = FF.load_stage(**kw)
+    f = MF.load_stage(**kw)
     header = bytearray(f.main)
     ext_head = kw['header_ext_head']
-    ext = FF.chain(bytes(header), ext_head)
+    ext = MF.chain(bytes(header), ext_head)
     ext_fields = list(ext)
 
     reqlist_path = os.path.join(a.stage_dir, 'header_reqlist.txt')
@@ -110,7 +111,7 @@ def main():
     if base_head is None:
         new, head = IO.standalone(blob)
     else:
-        new = bytes(GW.append_blob(base, blob, base_head, lambda d, h: FF.chain(d, h)))
+        new = bytes(GW.append_blob(base, blob, base_head, lambda d, h: MF.chain(d, h)))
         head = base_head
     if len(new) > 0x3FFFC:
         raise SystemExit(f'stage.bin is {len(new)} bytes: over the 0x3FFFC limit')
@@ -132,12 +133,12 @@ def main():
     for fld, tgt in sorted(targets.items()):
         if fld in ext:
             continue
-        if FF.u32(header, fld) != 0:
+        if MF.u32(header, fld) != 0:
             raise SystemExit(f'header 0x{fld:X} holds data, not an (empty) pointer field')
-        tail = list(FF.chain(bytes(header), ext_head))[-1]
+        tail = list(MF.chain(bytes(header), ext_head))[-1]
         struct.pack_into('>H', header, tail, fld // 4)
         struct.pack_into('>HH', header, fld, GW.NULL, tgt // 4)
-        req.insert(len(FF.chain(bytes(header), ext_head)) - 1, token)
+        req.insert(len(MF.chain(bytes(header), ext_head)) - 1, token)
         added += 1
 
     out = a.out or a.stage_dir
@@ -149,6 +150,12 @@ def main():
             newline.join(req) + (newline if req_raw.endswith(b'\n') else ''))
     if a.out is None:
         set_stage_head(cfg_path, head)
+    # collision lines, map objects, spawn locations, bounds (the .blend's Collision / Stage objects)
+    import gamedata as GD
+    for msg in GD.apply_stage(a.work_dir, getattr(textures, 'manifest', None) or {}, os.path.join(out, 'stage.bin'),
+                              head, os.path.join(out, 'header.bin'), f.object['ground'], cfg_path,
+                              write_cfg=a.out is None):
+        print('  ' + msg)
     print(f'stage.bin: {len(f.char)} -> {len(new)} bytes, chain head 0x{head:X}; kept {len(keep)} other '
           f'header targets (collision, animations...)' + (f'; {added} new header pointers' if added else ''))
     for name, (n, js) in tris.items():

@@ -1,7 +1,7 @@
-"""Export a fighter.blend (made by build_blend.py, then edited) for import_fighter.py.
-Run inside Blender:
+"""Export a model.blend (made by build_blend.py, then edited) for import_fighter.py /
+import_object.py / import_stage.py (ssb64_model.py import runs both steps). Run inside Blender:
 
-  blender -b fighter.blend --python blend_to_gltf.py -- OUT_DIR
+  blender -b model.blend --python blend_to_gltf.py -- OUT_DIR
 
 Writes OUT_DIR/body.gltf ('Costume 0' collection = hi detail), lo.gltf
 ('Low detail'), parts.gltf ('Model parts') and costumes.json: for every
@@ -25,7 +25,8 @@ BLEND_DIR = os.path.dirname(bpy.data.filepath)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import matanim as MA  # noqa: E402
-import n64_fighter_panel as PANEL  # noqa: E402
+import n64_panel as PANEL  # noqa: E402
+import blend_gamedata as GDB  # noqa: E402
 
 
 def image_path(img):
@@ -134,6 +135,8 @@ for coll in bpy.data.collections:
         if ob.type != 'MESH':
             continue
         for slot in ob.material_slots:
+            if slot.material is not None and slot.material.get('n64_helper'):
+                continue
             info = mat_info(slot.material)
             if info and slot.material:
                 costumes.setdefault(base_name(slot.material.name), {})[k] = info
@@ -141,7 +144,7 @@ for coll in bpy.data.collections:
 # costume k's image is the costume-0 image's sibling <mat>_c<k>.png
 for m in bpy.data.materials:
     name = base_name(m.name)
-    if name in costumes or m.users == 0:
+    if name in costumes or m.users == 0 or m.get('n64_helper'):
         continue
     info = mat_info(m)
     costumes[name] = {0: info}
@@ -156,7 +159,7 @@ for m in bpy.data.materials:
 props, anims = {}, {}
 for m in bpy.data.materials:
     name = base_name(m.name)
-    if name in props and m.name != name:
+    if (name in props and m.name != name) or m.get('n64_helper'):
         continue
     p = {k: (m[k] if isinstance(m[k], str) else str(m[k])) for k in ('n64_format', 'n64_wrap_s', 'n64_wrap_t',
                                                                       'n64_cull', 'n64_lighting', 'n64_light_color',
@@ -180,7 +183,7 @@ for m in bpy.data.materials:
 for img in bpy.data.images:
     if img.is_dirty and img.filepath:
         img.save()
-export_dir = os.path.normpath(bpy.path.abspath(bpy.context.scene.get('fighter_export_dir', '//')))
+export_dir = os.path.normpath(bpy.path.abspath(bpy.context.scene.get('n64_export_dir', bpy.context.scene.get('fighter_export_dir', '//'))))
 sc = bpy.context.scene
 lights = {k: str(sc[f'n64_{k}_color']) for k in ('light', 'shadow') if f'n64_{k}_color' in sc.keys()}
 
@@ -262,6 +265,8 @@ def joint_anims():
     return out
 
 
+# hurtboxes / stage collision (gamedata.py applies them)
+json.dump(GDB.collect(), open(os.path.join(OUT, 'gamedata.json'), 'w'), indent=1)
 json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims,
                joint_anims=joint_anims()),
           open(os.path.join(OUT, 'costumes.json'), 'w'), indent=1)

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Rebuild an item / projectile model file from an edited .blend (export_fighter.py --object).
+"""Rebuild an item / projectile model file from an edited .blend (export_model.py --object).
 
+    # (ssb64_model.py import OUT_DIR does both steps)
     # 1. inside Blender: export the .blend's geometry + material table
-    blender -b fighter.blend --python blend_to_gltf.py -- WORK_DIR
+    blender -b model.blend --python blend_to_gltf.py -- WORK_DIR
     # 2. write the model file (and re-point its attributes file)
     python3 import_object.py FOLDER NAME WORK_DIR [--out OUT_DIR]
 
@@ -25,13 +26,13 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))     # appender root
-import fighter_files as FF  # noqa: E402
+import model_files as MF  # noqa: E402
 import materials as MAT  # noqa: E402
 import matanim as MA  # noqa: E402
 import jointanim as JA  # noqa: E402
 import gbi_writer as GW  # noqa: E402
 import import_fighter as IF  # noqa: E402
-import export_fighter as EX  # noqa: E402
+import export_model as EX  # noqa: E402
 from smashremix_extra import ge_bin as ge  # noqa: E402
 
 DATA, MOBJSUBS, ANIM, MATANIM = 0x0, 0x4, 0x8, 0xC          # attributes fields
@@ -89,7 +90,7 @@ def epilogue_of(f, dl):
 
 def prologue_for(f, d, lights):
     """The model's DL setup (sync, lights, geometry mode...) from its first display list."""
-    first = next((FF.linked_display_lists(f.char, f.char_int, j.dl)[0] for j in d['joints'] if j.dl is not None), None)
+    first = next((MF.linked_display_lists(f.char, f.char_int, j.dl)[0] for j in d['joints'] if j.dl is not None), None)
     return IF.set_lights(IF.prologue_of(f, first) if first is not None else b'', lights)
 
 
@@ -120,7 +121,7 @@ class ModelWriter:
         self.f, self.textures, self.blob = f, textures, blob
         self.kept_scripts = kept_scripts or {}
         self.template_ms = next((ms for d in f.details.values() for lst in d['mobjs'].values() for ms in lst
-                                 if FF.u16(f.char, ms + 0x30) & 0x0005 == 0x0005), None)
+                                 if MF.u16(f.char, ms + 0x30) & 0x0005 == 0x0005), None)
         self.mobj_of, self.script_of, self.data_at, self.mobj_at = {}, {}, {}, {}
 
     def store(self, data, align=8):
@@ -271,7 +272,7 @@ class ModelWriter:
         d = f.details[detail]
         joints = d['joints']
         W = [j.world for j in joints]
-        links = {j.index for j in joints if j.dl is not None and FF.dl_links(f.char, f.char_int, j.dl)}
+        links = {j.index for j in joints if j.dl is not None and MF.dl_links(f.char, f.char_int, j.dl)}
         prologue = prologue_for(f, d, textures.lights)
         order = {int(j): v for j, v in (textures.manifest.get('mobj_order') or {}).get(detail, {}).items()}
         # one display list per DObjDLLink list (materials drawn from list 1 = translucent... keep it)
@@ -282,7 +283,7 @@ class ModelWriter:
         for j in joints:
             if j.dl is None:
                 continue
-            for lid, dl in FF.dl_links(f.char, f.char_int, j.dl) or [(0, j.dl)]:
+            for lid, dl in MF.dl_links(f.char, f.char_int, j.dl) or [(0, j.dl)]:
                 e = epilogue_of(f, dl)
                 if e and lid not in epi:
                     epi[lid] = e
@@ -345,12 +346,12 @@ class ModelWriter:
             targets[DATA] = joint_dl(0)
         else:
             n = len(joints)
-            arr = bytearray(f.char[d['dobjdesc']:d['dobjdesc'] + FF.DOBJDESC_SIZE * n + 4])
+            arr = bytearray(f.char[d['dobjdesc']:d['dobjdesc'] + MF.DOBJDESC_SIZE * n + 4])
             for j in range(n):
-                struct.pack_into('>I', arr, FF.DOBJDESC_SIZE * j + 4, 0)
+                struct.pack_into('>I', arr, MF.DOBJDESC_SIZE * j + 4, 0)
             do = blob.add(bytes(arr), 8)
             for j in dls:
-                blob.ptr(do + FF.DOBJDESC_SIZE * j + 4, joint_dl(j))
+                blob.ptr(do + MF.DOBJDESC_SIZE * j + 4, joint_dl(j))
             targets[DATA] = do
         return targets, dls
 
@@ -418,25 +419,25 @@ def write_joint_anims(f, work_dir, blob, remap):
     return out
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('folder', help='character or stage folder (its config.yaml lists the files)')
     ap.add_argument('name', help='the object: NAME_hitbox + NAME_gfx / NAME')
     ap.add_argument('work_dir', help='blend_to_gltf.py output')
     ap.add_argument('--out', help='write the files here (default: the folder, updating config.yaml)')
     ap.add_argument('--manifest', help="the export's manifest.json (default: the one the .blend was built from)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     cfg_path = os.path.join(a.folder, 'config.yaml')
     cfg = EX.read_config(a.folder)
     kw = EX.object_files(cfg, a.folder, a.name)
     if 'model_path' not in kw:
         raise SystemExit(f'{a.name}: no model file in config.yaml (single-file objects are not supported yet)')
-    f = FF.load_object(**kw)
+    f = MF.load_object(**kw)
     attr_off, ext_head = kw.get('attr_offset', 0), kw['attr_ext_head']
     model_name = os.path.splitext(os.path.basename(kw['model_path']))[0]
     hb = bytearray(f.main)
-    ext = FF.chain(bytes(hb), ext_head)                     # {field: target}, in chain order
+    ext = MF.chain(bytes(hb), ext_head)                     # {field: target}, in chain order
     ext_fields = list(ext)
 
     reqlist_path = os.path.splitext(kw['attr_path'])[0] + '_reqlist.txt'
@@ -476,7 +477,7 @@ def main():
     if base_head is None:
         new, head = standalone(blob)
     else:
-        new = bytes(GW.append_blob(base, blob, base_head, lambda d, h: FF.chain(d, h)))
+        new = bytes(GW.append_blob(base, blob, base_head, lambda d, h: MF.chain(d, h)))
         head = base_head
     if len(new) > 0x3FFFC:
         raise SystemExit(f'{model_name}.bin is {len(new)} bytes: over the 0x3FFFC limit')
@@ -496,12 +497,12 @@ def main():
         fld = attr_off + rel
         if fld in ext:
             continue
-        if FF.u32(hb, fld) != 0:
+        if MF.u32(hb, fld) != 0:
             raise SystemExit(f'attributes +0x{rel:X} holds data, not an (empty) pointer field')
-        tail = list(FF.chain(bytes(hb), ext_head))[-1]
+        tail = list(MF.chain(bytes(hb), ext_head))[-1]
         struct.pack_into('>H', hb, tail, fld // 4)
         struct.pack_into('>HH', hb, fld, GW.NULL, tgt // 4)
-        req.insert(len(FF.chain(bytes(hb), ext_head)) - 1, token)
+        req.insert(len(MF.chain(bytes(hb), ext_head)) - 1, token)
         added += 1
 
     out = a.out or a.folder
