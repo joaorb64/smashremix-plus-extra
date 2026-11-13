@@ -93,8 +93,10 @@ Layer types (decomp grdisplay.c), drawn in this order:
 
 Within a layer the rooms (joints) and each display list's materials draw in order; the
 export records it (manifest objects' `draw_order`) and the import keeps it. The preview
-draws exactly that; Blender can't (layers 2 / 3 are shown In Front, layer 0 is depth
-tested there).
+draws exactly that, and so do Blender renders (F12): each layer is its own view layer
+(`Stage Layer <n>`), composited in that order (the compositor's `N64 Stage Layers`). The
+viewport can't composite view layers: it shows every layer depth-tested together (the
+`ViewLayer` view layer, for editing; it isn't rendered).
 
 Animations (the layers' anim_joints scripts, decomp objanim.c) are played and sampled
 every frame into the glTF animation `Stage`: the `Stage` armature's action, 60 fps, the
@@ -212,7 +214,8 @@ per texture and no combiner. What the preview does like the game:
   them to 16 / 256).
 - **Game Camera** (the scene camera; Numpad 0): the battle camera's 38 degree vertical field
   of view (gmcamera.c), 320 x 240, tilted down by the stage's `light_angle` z, framing a
-  stage's camera bounds (else the model; a flat sprite facing x from its side).
+  stage's camera bounds (else the model; a flat sprite facing x from its side). Stage
+  renders composite the layers in the game's order (see Stages).
 
 Identical materials (e.g. the hi and lo models' copies) are exported once, so an
 edit applies everywhere they're used. Vertex normals are the model's own (custom

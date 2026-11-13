@@ -365,9 +365,13 @@ def update_view(m, context=None):
                 nt.links.new(src, fin.inputs[1])
                 src = fin.outputs[0]
             clamp = m.get('n64_clamp_' + 'st'[i])
+            # clamps stop at the edge texel's center (the N64's clamped coordinate): exactly at
+            # the edge, the image node's repeat / mirror extension would read the other side
+            size = tex.image.size[i] if tex.image is not None and tex.image.size[i] else 32
+            half = 0.5 / size
             if clamp and mode != 'clamp':      # the tile clamps first, past the texture's size
                 cl = _node(nt, f'N64 Clamp {axis}', 'ShaderNodeClamp', x - 580, y + 120 - 240 * i)
-                cl.inputs['Min'].default_value, cl.inputs['Max'].default_value = 0.0, float(clamp)
+                cl.inputs['Min'].default_value, cl.inputs['Max'].default_value = 0.0, float(clamp) - half
                 nt.links.new(src, cl.inputs['Value'])
                 src = cl.outputs[0]
             else:
@@ -375,22 +379,26 @@ def update_view(m, context=None):
                 if cl is not None:
                     nt.nodes.remove(cl)
             mth.use_clamp = False
+            edge = None
             if mode == 'repeat':
                 mth.operation = 'WRAP'
                 mth.inputs[1].default_value, mth.inputs[2].default_value = 1.0, 0.0
             elif mode == 'mirror':
                 mth.operation = 'PINGPONG'
                 mth.inputs[1].default_value = 1.0
-            elif clamp and clamp < 1:          # clamp at the tile's extent, inside the texture
-                mth.operation = 'MINIMUM'
-                mth.inputs[1].default_value = float(clamp)
-                mth.use_clamp = True
-            else:                              # clamp: the edge pixels repeat
-                mth.operation = 'ADD'
-                mth.inputs[1].default_value = 0.0
-                mth.use_clamp = True
+            else:                              # clamp (at the tile's extent when inside the texture)
+                mth.operation = 'MAXIMUM'
+                mth.inputs[1].default_value = half
+                edge = _node(nt, f'N64 Edge {axis}', 'ShaderNodeMath', x - 380, y + 160 - 240 * i)
+                edge.operation = 'MINIMUM'
+                edge.inputs[1].default_value = (float(clamp) if clamp and clamp < 1 else 1.0) - half
+            if edge is None and nt.nodes.get(f'N64 Edge {axis}') is not None:
+                nt.nodes.remove(nt.nodes[f'N64 Edge {axis}'])
             nt.links.new(src, mth.inputs[0])
             res = mth.outputs[0]
+            if edge is not None:
+                nt.links.new(res, edge.inputs[0])
+                res = edge.outputs[0]
             if axis == 'Y':
                 fout = _node(nt, 'N64 Flip Out Y', 'ShaderNodeMath', x - 320, y - 120)
                 fout.operation, fout.inputs[0].default_value = 'SUBTRACT', 1.0
@@ -658,6 +666,8 @@ def _edge_alpha(m, cmds, node, nt, alpha):
         nt.links.new(alpha, clip.inputs[0])
         clip.inputs[1].default_value = 0.124
         return False, clip.outputs[0]
+    if rm is not None:      # a mode that neither blends nor takes coverage from the texture alpha
+        return False, 1.0   # (e.g. 00552078, AA opaque surface): opaque, whatever the alpha
     return False, alpha
 
 
@@ -775,6 +785,8 @@ def build_combiner(m, nt, tex, out, bsdf):
     # translucent: the render mode's (cycle 2) blender weighs memory by 1 - alpha (XLU modes:
     # 0x0050...., 0x4410....); opaque / cut-out modes use memory coverage (0x0055...., 0xC411....)
     blending, comb_a = _edge_alpha(m, cmds, node, nt, comb_a)
+    if isinstance(comb_a, float):
+        comb_a = val(comb_a)
     for attr, value in (('surface_render_method', 'BLENDED' if blending else 'DITHERED'),
                         ('blend_method', 'BLEND' if blending else 'HASHED')):
         try:

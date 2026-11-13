@@ -200,6 +200,11 @@ for m in bpy.data.materials:
     for n in [n for n in nt.nodes if n.name.startswith('N64 ')]:
         nt.nodes.remove(n)
 
+# (.blend files built with the old layer-order modifier: it only moved layers for viewing)
+for ob in bpy.data.objects:
+    for md in [md for md in ob.modifiers if md.name == 'N64 Layer Order']:
+        ob.modifiers.remove(md)
+
 # vertex colors (unlit materials): the glTF exporter's color handling loses some (alpha 0,
 # corner colors), so they travel as two extra UV maps (R,G) and (B,A): exact, per corner.
 # Values are the game's (sRGB) bytes / 255. In memory only.

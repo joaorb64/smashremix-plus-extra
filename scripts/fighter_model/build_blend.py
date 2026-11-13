@@ -290,9 +290,10 @@ if IS_STAGE:
         o['stage_room'] = joint
         o['stage_layer'] = layer
         move(o, layer_coll)
-        # Layers 2 and 3 draw over everything in the game (no depth test, after
-        # the fighters); layer 0 is painted first, behind all.
-        o.show_in_front = layer in (2, 3)
+        # Layer 0 is painted first in the game, with no depth test: whatever comes after it
+        # covers it, even where it's closer (Gym Leader's horn feet under the floor); layers 2 / 3
+        # cover everything: renders composite the layers in that order (render passes below).
+        o.show_in_front = False                  # (see n64_fighter_panel LAYER_DEPTH)
 meshes = [o for o in scene.objects if o.type == 'MESH']
 hi = [o for o in meshes if o.name.startswith('hi_')]
 lo = [o for o in meshes if o.name.startswith('lo_')]
@@ -392,6 +393,7 @@ if anims or anim_frames:                      # stages: their joint animations (
     scene.frame_set(0)
 if IS_OBJECT:
     scene['n64_kind'] = (man.get('object') or {}).get('kind') or 'item'
+
 # the scene light's direction (stages: their light_angle; fighters / items: the usual one)
 view = man.get('stage_view') or {}
 scene['n64_light_angle'] = [float(x) for x in (view.get('light_angle') or PANEL.DEFAULT_LIGHT_ANGLE)[:2]]
@@ -445,6 +447,56 @@ cam.rotation_euler = (math.radians(90.0) - tilt, 0.0, 0.0)
 if side:
     cam.location = (dist * math.cos(tilt), cx, cy + dist * math.sin(tilt))
     cam.rotation_euler = (math.radians(90.0) - tilt, 0.0, math.radians(90.0))
+
+# ---- stage renders (F12): one view layer per stage layer, composited in the game's order
+# (grdisplay.c: layer 0 painted first without depth, then the z-buffered layer 1, then 2 and 3
+# over everything). Each layer depth-tests only itself; the later one is laid over the earlier.
+# The viewport can't composite view layers: it shows every layer depth-tested together.
+layer_colls = sorted(((c['stage_layer'], c) for c in bpy.data.collections if 'stage_layer' in c.keys()),
+                     key=lambda x: x[0])
+if IS_STAGE and len(layer_colls) > 1:
+    base = scene.view_layers[0]
+    base.use = False                          # (the editing view: every layer, not rendered)
+    scene.render.film_transparent = True
+    vls = []
+    for L, c in layer_colls:
+        vl = scene.view_layers.get(f'Stage Layer {L}') or scene.view_layers.new(f'Stage Layer {L}')
+        for other_L, other in layer_colls:
+            lc = vl.layer_collection.children.get(other.name)
+            if lc is not None:
+                lc.exclude = other_L != L
+        for name in ('Armature', 'Low detail', 'Model parts', 'Electric skeleton'):
+            lc = vl.layer_collection.children.get(name)
+            if lc is not None:
+                lc.exclude = True
+        vls.append(vl)
+    if hasattr(scene, 'compositing_node_group'):          # Blender 5: a compositor node group
+        tree = bpy.data.node_groups.new('N64 Stage Layers', 'CompositorNodeTree')
+        tree.interface.new_socket('Image', in_out='OUTPUT', socket_type='NodeSocketColor')
+        scene.compositing_node_group = tree
+        out = tree.nodes.new('NodeGroupOutput')
+        out_socket = out.inputs[0]
+    else:
+        scene.use_nodes = True
+        tree = scene.node_tree
+        tree.nodes.clear()
+        out = tree.nodes.new('CompositorNodeComposite')
+        out_socket = out.inputs['Image']
+    prev = None
+    for k, vl in enumerate(vls):
+        rl = tree.nodes.new('CompositorNodeRLayers')
+        rl.layer = vl.name
+        rl.location = (0, -300 * k)
+        if prev is None:
+            prev = rl.outputs['Image']
+            continue
+        over = tree.nodes.new('CompositorNodeAlphaOver')          # the later layer over the earlier
+        over.location = (300, -300 * k)
+        tree.links.new(prev, over.inputs['Background' if 'Background' in over.inputs else 1])
+        tree.links.new(rl.outputs['Image'], over.inputs['Foreground' if 'Foreground' in over.inputs else 2])
+        prev = over.outputs['Image']
+    out.location = (600, 0)
+    tree.links.new(prev, out_socket)
 
 # colors as stored (no filmic / AgX look)
 scene.view_settings.view_transform = 'Standard'
