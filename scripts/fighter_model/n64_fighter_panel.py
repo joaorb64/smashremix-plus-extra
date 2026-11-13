@@ -236,7 +236,10 @@ def build_combiner(m, nt, tex, out, bsdf):
         prim_c, prim_a = list(bc[:3]), hex_color(0xFA, 0xFFFFFFFF)[1]
     else:
         prim_c, prim_a = hex_color(0xFA, 0xFFFFFFFF)
-    env_c, env_a = hex_color(0xFB, 0xFFFFFFFF)
+    # env default: white for fighters; items / projectiles (scene n64_default_env) fade
+    # toward env by its alpha, which the game keeps at 0 unless the item flashes
+    scn = bpy.context.scene
+    env_c, env_a = hex_color(0xFB, int(str(scn.get('n64_default_env', 'FFFFFFFF')), 16) if scn else 0xFFFFFFFF)
     one_c, zero_c = rgb((1, 1, 1)), rgb((0, 0, 0))
     one, zero = val(1.0), val(0.0)
     tex_c = tex.outputs['Color'] if tex is not None else one_c
@@ -298,7 +301,9 @@ def build_combiner(m, nt, tex, out, bsdf):
         nt.links.new(amul.outputs[0], aadd.inputs[0])
         nt.links.new(asrc.get(ad, zero), aadd.inputs[1])
         comb_c, comb_a = clampc.outputs['Result'], aadd.outputs[0]
-    blending = any(a == 0xE200001C and b not in (0xC4112078, 0xC4113078, 0xC4113878) for a, b in cmds)
+    # translucent: the render mode's (cycle 2) blender weighs memory by 1 - alpha (XLU modes:
+    # 0x0050...., 0x4410....); opaque / cut-out modes use memory coverage (0x0055...., 0xC411....)
+    blending = any(a == 0xE200001C and (b >> 16) & 3 == 0 for a, b in cmds)
     for attr, value in (('surface_render_method', 'BLENDED' if blending else 'DITHERED'),
                         ('blend_method', 'BLEND' if blending else 'HASHED')):
         try:

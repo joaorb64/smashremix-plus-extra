@@ -540,11 +540,7 @@ class Material:
         out.append(g(0xE6000000))
         out.append(g(0xD7000002, 0xFFFFFFFF))
         out.append(g(0xF2000000, ((self.tile_w - 1) << 2) << 12 | ((self.tile_h - 1) << 2)))
-        if self.uses_mobj():
-            out.append(g(0xDE000000, 0x0E000000 + 8 * mobj_index))   # MObj: its palette / image list entry
-        # the MObj loads the TLUT itself only together with its image (flags 0x1); otherwise
-        # it just points at the palette and the DL loads it (like the game's eye materials)
-        if self.ci and (self.palette_source != 'list' or self.image_source != 'list'):
+        def tlut():
             if self.palette_source != 'list':
                 fix.append((len(out) * 8, 'palette'))
                 out.append(g(0xFD100000, 0))                         # palette (RGBA16)
@@ -553,6 +549,19 @@ class Material:
             out.append(g(0xE6000000))
             out.append(g(0xF0000000, 0x05000000 | ((self.n_pal - 1) << 14)))
             out.append(g(0xE7000000))
+        # the MObj's DL (objdisplay.c) sets the palette image (flag 0x4; it loads the TLUT
+        # only together with its image, flag 0x1) and leaves the IMAGE's SETTIMG last for
+        # our LOADBLOCK. So an inline palette with a list image (GoldEditor models) is
+        # loaded before the MObj call - after it, its SETTIMG would be what LOADBLOCK
+        # reads; a list palette with an inline image (the game's eye materials) after it.
+        need_tlut = self.ci and (self.palette_source != 'list' or self.image_source != 'list')
+        mobj_image_first = self.uses_mobj() and self.image_source == 'list'
+        if need_tlut and mobj_image_first:
+            tlut()
+        if self.uses_mobj():
+            out.append(g(0xDE000000, 0x0E000000 + 8 * mobj_index))   # MObj: its palette / image list entry
+        if need_tlut and not mobj_image_first:
+            tlut()
         if self.image_source != 'list':
             fix.append((len(out) * 8, 'image'))
             out.append(g(0xFD000000 | (fmt << 21) | (load_siz << 19), 0))

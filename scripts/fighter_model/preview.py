@@ -20,6 +20,7 @@ images (facial expressions) get a row with every image. Writes EXPORT_DIR/previe
 import argparse
 import json
 import os
+import re
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -60,7 +61,10 @@ class Model:
         lights = {a: int(b, 16) for a, b in e.get('state') or [] if a.startswith('DB0A')}
         light = color(lights['DB0A0000'])[:3] if 'DB0A0000' in lights else LIGHT_COLOR
         amb = color(lights['DB0A0018'])[:3] if 'DB0A0018' in lights else AMBIENT
-        prim, env = color(state.get(0xFA, 0xFFFFFFFF)), color(state.get(0xFB, 0xFFFFFFFF))
+        # env: fighters' default is white (their combiner multiplies by it); items /
+        # projectiles fade toward env by its alpha (flashing), drawn with alpha 0
+        env0 = 0x00000000 if self.man.get('object') else 0xFFFFFFFF
+        prim, env = color(state.get(0xFA, 0xFFFFFFFF)), color(state.get(0xFB, env0))
         cc = e.get('costume_colors') or []
         if cc:                                    # the MObj's colors for this costume
             cur = cc[min(costume, len(cc) - 1)]
@@ -69,7 +73,9 @@ class Model:
             light = color(int(cur['light1'], 16))[:3] if 'light1' in cur else light
             amb = color(int(cur['light2'], 16))[:3] if 'light2' in cur else amb
         shading = (fc, prim, env, bool(geom & 0x20000), light, amb)
-        blend = 0xE2 in state and state[0xE2] not in OPAQUE_MODES
+        # translucent: the render mode's (cycle 2) blender weighs memory by 1 - alpha (XLU)
+        rmode = next((int(b, 16) for a, b in e.get('state') or [] if a == 'E200001C'), None)
+        blend = rmode is not None and (rmode >> 16) & 3 == 0
         pngs = e.get('costumes') or []
         if not pngs or not pngs[min(costume, len(pngs) - 1)]:
             if e.get('untextured'):               # its combiner takes the color (prim) itself
@@ -93,12 +99,19 @@ class Model:
                 UV = self.acc(pr['attributes']['TEXCOORD_0']).astype(float)
                 e = self.man['materials'].get(self.mats[pr['material']], {})
                 cull = next((int(b, 16) & 0x600 for a, b in e.get('state') or [] if a.startswith('D9')), 0x400)
+                # render mode depth bits: Z compare 0x10, Z update 0x20 (no render mode: the game's, both)
+                rmode = next((int(b, 16) for a, b in e.get('state') or [] if a == 'E200001C'), 0x30)
+                zmode = rmode & 0x30
+                lm = re.match(r'L(\d+)_', m['name'])
+                if lm and int(lm.group(1)) != 1:      # stage layers 0, 2, 3: the game clears G_ZBUFFER
+                    zmode = 0
                 I = self.acc(pr['indices']).reshape(-1, 3)
                 tex, col, wrap, blend, shading = self.texture(self.mats[pr['material']], costume)
                 if override and self.mats[pr['material']] in override:
                     tex = override[self.mats[pr['material']]]
                 for t in I:
-                    out.append((P[t], UV[t], tex, col, wrap, blend, (NR[t], VC[t]), cull, shading))
+                    out.append((P[t], UV[t], tex, col, wrap, blend, (NR[t], VC[t]), cull, shading, zmode,
+                                int(lm.group(1)) if lm else None))
         return out
 
 
@@ -146,6 +159,9 @@ def wrap_coord(x, n, mode, clamp=None):
     return np.mod(x, n)
 
 
+STAGE_LAYER_PRIORITY = {0: 4, 1: 6, 2: 13, 3: 17}
+
+
 def render(tris, yaw, H, bounds=None, pitch=0.0):
     """Orthographic render looking along -z after rotating by yaw around y
     (and pitch around x: pi/2 = looking straight down)."""
@@ -163,10 +179,18 @@ def render(tris, yaw, H, bounds=None, pitch=0.0):
     W = int((hi[0] - lo[0]) * scale) + 16
     img = np.full((H, W, 3), 58.0)
     zb = np.full((H, W), -1e9)
-    # opaque first, then blended surfaces back to front (alpha blended, no depth write)
-    opaque = [t for t in tris if not t[5]]
-    blended = sorted((t for t in tris if t[5]), key=lambda t: (t[0] @ rot.T)[:, 2].mean())
-    for P, UV, tex, col, wrap, blend, NR, cull, shading in opaque + blended:
+    if all(t[9] == 0x30 for t in tris):
+        # opaque first, then blended surfaces back to front (alpha blended, no depth write)
+        opaque = [t for t in tris if not t[5]]
+        blended = sorted((t for t in tris if t[5]), key=lambda t: (t[0] @ rot.T)[:, 2].mean())
+        order = opaque + blended
+    else:
+        # some surfaces aren't depth tested (stage backgrounds: painted in display-list
+        # order): draw everything in the game's order, depth test / write as each says.
+        # Stage layers draw by priority (grdisplay.c): 0 (4, background), 1 (6, depth-
+        # tested, with the fighters), 2 (13) and 3 (17) over everything
+        order = sorted(tris, key=lambda t: STAGE_LAYER_PRIORITY.get(t[10], 0)) if len(tris[0]) > 10 else tris
+    for P, UV, tex, col, wrap, blend, NR, cull, shading, zmode, _layer in order:
         q = P @ rot.T
         n = np.cross(q[1] - q[0], q[2] - q[0])
         ln = np.linalg.norm(n)
@@ -201,7 +225,7 @@ def render(tris, yaw, H, bounds=None, pitch=0.0):
         z = a * q[0, 2] + b * q[1, 2] + cc * q[2, 2]
         shade = np.minimum(a[..., None] * vshade[0] + b[..., None] * vshade[1] + cc[..., None] * vshade[2], 1.0)
         sub = zb[y0:y1 + 1, x0:x1 + 1]
-        m = inside & (z > sub)
+        m = inside & (z > sub) if zmode & 0x10 else inside
         if tex is not None:
             th, tw = tex.shape[:2]
             u = (a * UV[0, 0] + b * UV[1, 0] + cc * UV[2, 0]) * tw
@@ -223,7 +247,8 @@ def render(tris, yaw, H, bounds=None, pitch=0.0):
             region[m] = px[m] * a + region[m] * (1 - a)
         else:
             region[m] = px[m]
-            sub[m] = z[m]
+            if zmode & 0x20:                      # Z update
+                sub[m] = z[m]
     return Image.fromarray(img.clip(0, 255).astype(np.uint8))
 
 
@@ -294,6 +319,23 @@ def costume_varies(md, prefix):
     return False
 
 
+def stage_sheet(md, size):
+    """Stages: the whole stage (every layer, in the game's drawing order) from the front,
+    left, back, right, top and bottom."""
+    return vstack([header('stage (all layers)', 6 * (size + 6)), view_row(md.tris('L', 0), size, 'stage')])
+
+
+def layers_sheet(md, size):
+    """Stages: each geometry layer alone (the six views)."""
+    layers = sorted({m['name'].split('_')[0] for m in md.gl['meshes'] if m['name'].startswith('L')})
+    rows = []
+    for name in layers:
+        tris = md.tris(f'{name}_', 0)
+        if tris:
+            rows += [header(f'layer {name[1:]}', 6 * (size + 6)), view_row(tris, size, name)]
+    return vstack(rows) if rows else None
+
+
 def body_sheet(md, size):
     n = md.man['costumes']
     body0 = md.tris('hi_', 0)
@@ -334,7 +376,7 @@ def expressions_sheet(md, size):
         imgs = e.get('images') or []
         if len(imgs) < 2:
             continue
-        users = [m['name'] for m in md.gl['meshes'] if m['name'].startswith('hi_')
+        users = [m['name'] for m in md.gl['meshes'] if m['name'].startswith(('hi_', 'L'))
                  and any(md.mats[pr['material']] == name for pr in m['primitives'])]
         if not users:
             continue
@@ -354,6 +396,13 @@ def expressions_sheet(md, size):
 def sheets(folder, size=200):
     """{name: image} for every sheet that has something to show."""
     md = Model(folder)
+    if (md.man.get('object') or {}).get('kind') == 'stage':
+        out = {'stage': stage_sheet(md, size * 2), 'layers': layers_sheet(md, size),
+               'variants': expressions_sheet(md, size)}
+        return {k: v for k, v in out.items() if v is not None}
+    if md.man.get('object'):      # items / projectiles: alternate images (e.g. damage stages), full size
+        out = {'body': body_sheet(md, size), 'variants': expressions_sheet(md, size)}
+        return {k: v for k, v in out.items() if v is not None}
     out = {'body': body_sheet(md, size), 'expressions': expressions_sheet(md, size // 2 + 30),
            'parts': parts_sheet(md, size // 2 + 30), 'skeleton': skeleton_sheet(md, size)}
     return {k: v for k, v in out.items() if v is not None}

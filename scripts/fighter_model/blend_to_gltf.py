@@ -127,20 +127,40 @@ for me in {o.data for o in bpy.data.objects if o.type == 'MESH'}:      # (costum
         uv_ba.data[li].uv = (c[2], c[3])
 
 arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE'), None)
+LAYERS = []
+for c in bpy.data.collections:             # stages: one glTF per type/layer, containing its rooms
+    m = re.match(r'Layer (\d+)(?: - .*)?$', c.name)
+    if m:
+        LAYERS.append((c.name, f'layer{m.group(1)}.gltf'))
 for coll_name, out in (('Costume 0', 'body.gltf'), ('Low detail', 'lo.gltf'), ('Model parts', 'parts.gltf'),
-                      ('Electric skeleton', 'skeleton.gltf')):
+                       ('Electric skeleton', 'skeleton.gltf'), *LAYERS):
     lc = bpy.context.view_layer.layer_collection.children.get(coll_name)
     if lc is None:
         continue
     lc.exclude = False
     lc.hide_viewport = False
     bpy.context.view_layer.active_layer_collection = lc
+    stage_layer = re.match(r'Layer \d+(?: - .*)?$', coll_name) is not None
+    collection_objects = list(lc.collection.all_objects if stage_layer else lc.collection.objects)
+    # the armature the collection's meshes deform with (stages: a room may be nested
+    # under its type collection)
+    arm = next((md.object for o in collection_objects if o.type == 'MESH' for md in o.modifiers
+                if md.type == 'ARMATURE' and md.object), arm)
     linked = arm is not None and arm.name not in lc.collection.objects
     if linked:                       # the skin (bone per vertex) is only exported with its armature
         lc.collection.objects.link(arm)
+        if stage_layer:
+            collection_objects.append(arm)
+    if stage_layer:
+        for ob in bpy.context.selected_objects:
+            ob.select_set(False)
+        for ob in collection_objects:
+            ob.select_set(True)
     opts = dict(filepath=os.path.join(OUT, out), export_format='GLTF_SEPARATE',
-                use_active_collection=True, export_image_format='NONE',
+                use_active_collection=not stage_layer, export_image_format='NONE',
                 export_animations=False, export_yup=True, export_materials='EXPORT')
+    if stage_layer:
+        opts['use_selection'] = True
     try:      # vertex colors go as UV maps (above)
         bpy.ops.export_scene.gltf(**opts, export_vertex_color='NONE')
     except TypeError:

@@ -14,12 +14,14 @@ Layout of the .blend:
                      ('part<variant>_<hi|lo>_j<joint>'), hidden
   Electric skeleton  the shocked-skeleton model ('skel<id>_j<joint>'), hidden
   Armature           one skeleton (bones joint_00..), shared by everything
+  Stages             a type/layer collection with a Room collection per DObj joint
 Every image / palette list entry (facial expressions, extra palettes) is loaded
 as an image (<mat>_img<i>, <mat>_pal<p>) to paint in the Image Editor.
 Materials carry n64_format / n64_wrap_s / n64_wrap_t / n64_state properties.
 Writes EXPORT_DIR/fighter.blend.
 """
 import json
+import re
 import os
 import sys
 
@@ -47,6 +49,13 @@ def coll(name, hide=False):
         scene.collection.children.link(c)
     if hide:
         bpy.context.view_layer.layer_collection.children[c.name].hide_viewport = True
+    return c
+
+
+def child_coll(parent, name):
+    c = bpy.data.collections.get(name) or bpy.data.collections.new(name)
+    if c.name not in parent.children:
+        parent.children.link(c)
     return c
 
 
@@ -181,10 +190,19 @@ for ob in [o for o in scene.objects if o.type == 'MESH']:
             for k in range(3):
                 loop[lay[k]] = corner[li][k]
     deform = bm.verts.layers.deform.verify()
+    # faces lying exactly on another face (a decal / translucent layer drawn over it, e.g. a
+    # window over its frame): merging their vertices would make them duplicates Blender
+    # deletes, so each keeps its own vertices (every vertex is one face's corner here)
+    sig_count, face_sig = {}, {}
+    for face in bm.faces:
+        sig = tuple(sorted(tuple(round(c, 1) for c in v.co) for v in face.verts))
+        face_sig[face.index] = sig
+        sig_count[sig] = sig_count.get(sig, 0) + 1
+    own = {v.index: face.index for face in bm.faces if sig_count[face_sig[face.index]] > 1 for v in face.verts}
     groups = {}
     for v in bm.verts:
         g = max(v[deform].items(), key=lambda kv: kv[1])[0] if v[deform] else -1
-        groups.setdefault((g, vcol[v.index] if vcol else None), []).append(v)
+        groups.setdefault((g, vcol[v.index] if vcol else None, own.get(v.index)), []).append(v)
     for vs in groups.values():
         bmesh.ops.remove_doubles(bm, verts=vs, dist=0.01)
     normals = [tuple(loop[lay[k]] for k in range(3)) for face in bm.faces for loop in face.loops]
@@ -225,6 +243,7 @@ def tidy_bones(arm):
     bpy.ops.object.mode_set(mode='OBJECT')
     arm.show_in_front = True            # Viewport Display > Show: In Front, Names
     arm.data.show_names = True
+    arm.data.display_type = 'STICK'     # Viewport Display > Display As
     try:
         groups = {}
         for name, theme in (('Center', 'THEME09'), ('Left', 'THEME01'), ('Right', 'THEME04')):
@@ -239,30 +258,59 @@ def tidy_bones(arm):
         pass
 
 
+IS_STAGE = (man.get('object') or {}).get('kind') == 'stage'
 arm = next((o for o in scene.objects if o.type == 'ARMATURE'), None)
 c_arm = coll('Armature')
-if arm:
-    move(arm, c_arm)
-    tidy_bones(arm)
+for a in [o for o in scene.objects if o.type == 'ARMATURE']:     # (stages: the glTF import merges
+    move(a, c_arm)                                                 # the layers' skins into one)
+    tidy_bones(a)
+if IS_STAGE:
+    for a in [o for o in scene.objects if o.type == 'ARMATURE']:
+        a.name = 'Stage'                   # every layer's bones (L<n>_joint_NN), and the animation
+    # One type collection per MPGroundData slot (layer), holding its rooms' meshes.
+    stage_types = {
+        0: 'Background',
+        1: 'Stage (Z-buffered)',
+        2: 'Foreground',
+        3: 'Foreground',
+    }
+    for o in sorted([o for o in scene.objects if o.type == 'MESH'], key=lambda o: o.name):
+        m = re.match(r'L(\d+)_j(\d+)', o.name)
+        if not m:
+            continue
+        layer, joint = map(int, m.groups())
+        layer_coll = coll(f'Layer {layer} - {stage_types.get(layer, "Other")}')
+        layer_coll['stage_layer'] = layer
+        layer_coll['stage_type'] = stage_types.get(layer, 'Other')
+        # one mesh per room (DObj joint): straight in its layer; the room is in its name
+        # (L<layer>_j<joint>) and custom properties
+        o['stage_room'] = joint
+        o['stage_layer'] = layer
+        move(o, layer_coll)
+        # Layers 2 and 3 draw over everything in the game (no depth test, after
+        # the fighters); layer 0 is painted first, behind all.
+        o.show_in_front = layer in (2, 3)
 meshes = [o for o in scene.objects if o.type == 'MESH']
 hi = [o for o in meshes if o.name.startswith('hi_')]
 lo = [o for o in meshes if o.name.startswith('lo_')]
 parts = [o for o in meshes if o.name.startswith('part')]
 skel = [o for o in meshes if o.name.startswith('skel')]
 
-c_lo = coll('Low detail', hide=True)
-for o in lo:
-    move(o, c_lo)
-c_parts = coll('Model parts', hide=True)
-for o in parts:
-    move(o, c_parts)
+if lo or not IS_STAGE:
+    c_lo = coll('Low detail', hide=True)
+    for o in lo:
+        move(o, c_lo)
+if parts or not IS_STAGE:
+    c_parts = coll('Model parts', hide=True)
+    for o in parts:
+        move(o, c_parts)
 if skel:
     c_skel = coll('Electric skeleton', hide=True)
     for o in skel:
         move(o, c_skel)
 
 # costume 0 = the imported hi objects; costume k = linked duplicates beside it
-c0 = coll('Costume 0')
+c0 = coll('Costume 0') if not IS_STAGE else None
 for o in hi:
     move(o, c0)
 for k in range(1, N):
@@ -287,7 +335,15 @@ for name, entry in man['materials'].items():
             n_entries += 1
 lights = man.get('lights') or {}
 scene['n64_light_color'] = lights.get('light', 'FFFFFF')    # directional light color (hex RGB)
-scene['n64_shadow_color'] = lights.get('shadow', '808080')  # ambient = shadow color (hex RGB)
+scene['n64_shadow_color'] = lights.get('shadow', '808080')
+anims = man.get('animations') or {}
+if anims:                                     # stages: their joint animations (glTF 'Stage'), 60 fps
+    scene.render.fps = 60
+    scene.frame_start = 0
+    scene.frame_end = max(a['frames'] for a in anims.values()) - 1
+    scene.frame_set(0)
+if man.get('object'):                         # items / projectiles: see n64_fighter_panel build_combiner
+    scene['n64_default_env'] = '00000000'  # ambient = shadow color (hex RGB)
 scene['fighter_export_dir'] = '//'
 scene['n64_collapse_outliner'] = True        # the panel script collapses the outliner on the first open          # where manifest.json + textures/ are (relative to the .blend)
 
@@ -307,7 +363,12 @@ for m in bpy.data.materials:
                 node.inputs['Roughness'].default_value = 1.0
     m.specular_intensity = 0.0
     m.roughness = 1.0
-height = max((max((ob.matrix_world @ v.co).z for v in ob.data.vertices) for ob in hi if ob.data.vertices), default=500)
+view_objs = hi or [o for o in scene.objects if o.type == 'MESH']          # stages: every layer
+height = max((max((ob.matrix_world @ v.co).z for v in ob.data.vertices) for ob in view_objs if ob.data.vertices),
+             default=500)
+if IS_STAGE:                                  # a whole stage: frame its width too
+    xs = [(ob.matrix_world @ v.co).x for ob in view_objs for v in ob.data.vertices]
+    height = max(height, (max(xs) - min(xs)) / 2 if xs else 0)
 for screen in bpy.data.screens:
     for area in screen.areas:
         if area.type != 'VIEW_3D':

@@ -222,6 +222,262 @@ def load(main_path, char_path, main_int_head=0x2CC, main_ext_head=0x0, char_int_
 
 
 # ---------------------------------------------------------------- textures
+def load_object(attr_path, model_path=None, attr_int_head=None, attr_ext_head=None,
+                model_int_head=None, attr_offset=0, model_ext=None):
+    """An item / projectile model, described by its attributes (ITAttributes /
+    WPAttributes: +0 data = DObjDesc array or a bare display list, +4 p_mobjsubs,
+    +8 anim_joints, +0xC p_matanim_joints). The attributes are in attr_path at
+    attr_offset; the model is in model_path (Remix *_hitbox.bin -> *_gfx.bin, through
+    the attributes file's external chain), or in the same file (vanilla items,
+    model_path None). Returns a Fighter with one model ('hi') and no fighter extras:
+    the exporter / importer treat it like a one-costume fighter."""
+    attr = open(attr_path, 'rb').read()
+    a_int = chain(attr, attr_int_head) if attr_int_head is not None and attr_int_head < 0x3FFFC else {}
+    a_ext = chain(attr, attr_ext_head) if attr_ext_head is not None and attr_ext_head < 0x3FFFC else {}
+    if model_path is None:
+        char, char_int = attr, dict(a_int)
+        ptrs = a_int
+    else:
+        char = open(model_path, 'rb').read()
+        char_int = chain(char, model_int_head) if model_int_head is not None and model_int_head < 0x3FFFC else {}
+        ptrs = a_ext
+    char_int.update(model_ext or {})
+    f = Fighter(attr, char, a_int, a_ext if model_path else {}, char_int, attr_offset)
+    data = ptrs.get(attr_offset)
+    if data is None:
+        raise ValueError(f'no model: the attributes at 0x{attr_offset:X} have no data pointer')
+    ms_arr, ma_arr = ptrs.get(attr_offset + 4), ptrs.get(attr_offset + 0xC)
+    if char[data] in DL_START_OPS:          # a bare display list: one joint at the origin
+        joints = [Joint(0, 0, None, data, np.zeros(3), np.zeros(3), np.ones(3), np.eye(4))]
+        dobjdesc = None
+    else:
+        joints = read_skeleton(char, char_int, data)
+        dobjdesc = data
+    mobjs = {}
+    if ms_arr is not None:
+        for j in range(len(joints)):
+            lst = char_int.get(ms_arr + 4 * j)
+            items = []
+            while lst is not None and lst + 4 * len(items) in char_int:
+                items.append(char_int[lst + 4 * len(items)])
+            mobjs[j] = items
+    f.details['hi'] = dict(dobjdesc=dobjdesc, joints=joints, mobjs=mobjs, matanim=ma_arr)
+    f.object = dict(attr=attr_offset, single_file=model_path is None, dl_only=dobjdesc is None)
+    return f
+
+
+GROUND_DATA = 0x14          # MPGroundData in a Remix stage header.bin (after its 0x14-byte preamble)
+GROUND_LAYERS = 4           # gr_desc[4]: {DObjDesc*, anim_joints, p_mobjsubs, p_matanim_joints}
+
+
+def load_stage(header_path, stage_path, header_int_head, header_ext_head, stage_int_head,
+               ground=GROUND_DATA, stage_ext=None, only_file=None):
+    """A stage's geometry layers (MPGroundData.gr_desc[0..3] in header.bin, pointing into
+    stage.bin through the header's external chain) -> a Fighter whose details are
+    'L0'..'L3' (only the layers that have a model), each like an item's single model."""
+    header = open(header_path, 'rb').read()
+    char = open(stage_path, 'rb').read()
+    h_int = chain(header, header_int_head) if header_int_head < 0x3FFFC else {}
+    h_ext = chain(header, header_ext_head) if header_ext_head < 0x3FFFC else {}
+    char_int = chain(char, stage_int_head) if stage_int_head < 0x3FFFC else {}
+    char_int.update(stage_ext or {})
+    if only_file:              # ROM: (ID list, external fields in chain order, stage file): its pointers only
+        ids, links, fid = only_file
+        h_ext = {k: v for k, v in h_ext.items() if k in links and ids[links.index(k)] == fid}
+    f = Fighter(header, char, h_int, h_ext, char_int, ground)
+    layers = []
+    for L in range(GROUND_LAYERS):
+        base = ground + 0x10 * L
+        data = h_ext.get(base)
+        if data is None:
+            continue
+        joints = read_skeleton(char, char_int, data)
+        ms_arr, ma_arr = h_ext.get(base + 8), h_ext.get(base + 0xC)
+        mobjs = {}
+        if ms_arr is not None:
+            for j in range(len(joints)):
+                lst = char_int.get(ms_arr + 4 * j)
+                items = []
+                while lst is not None and lst + 4 * len(items) in char_int:
+                    items.append(char_int[lst + 4 * len(items)])
+                mobjs[j] = items
+        f.details[f'L{L}'] = dict(dobjdesc=data, joints=joints, mobjs=mobjs, matanim=ma_arr,
+                                  anim=h_ext.get(base + 4), field=base)
+        layers.append(L)
+    f.object = dict(kind='stage', ground=ground, layers=layers, single_file=False, dl_only=False)
+    return f
+
+
+# ---------------------------------------------------------------- DObj animation (AObjEvent32)
+ANIM_TRACKS = 10            # flag bits -> tracks: rot x/y/z, interp (TraI), tra x/y/z, sca x/y/z
+
+
+def _anim_value(a):
+    """gcPlayDObjAnimJoint's value of one track (AObj) at its current length."""
+    if a['kind'] == 'linear':
+        return a['vb'] + a['len'] * a['rb']
+    if a['kind'] == 'cubic':
+        li, ln = a['li'], a['len']
+        f16, f12 = li * li, ln * ln
+        f18 = li * f12
+        f14 = ln * f12 * f16
+        f20 = 2.0 * f14 * li
+        f22 = 3.0 * f12 * f16
+        f24 = f14 - f18
+        return (a['vb'] * ((f20 - f22) + 1.0) + a['vt'] * (f22 - f20) +
+                a['rb'] * ((f24 - f18) + ln) + a['rt'] * f24)
+    if a['kind'] == 'step':
+        return a['vt'] if a['li'] <= a['len'] else a['vb']
+    return None
+
+
+def simulate_anim(d, ptrs, script, frames):
+    """A DObj animation script (anim_joints[joint]: AObjEvent32 commands, objanim.c
+    gcParseDObjAnimJoint + gcPlayDObjAnimJoint) played for `frames` frames ->
+    [{track: value}] per frame (only the animated tracks: 0..2 rotation x/y/z, 4..6
+    translation, 7..9 scale), and the frame its script first loops back (or ends), if any."""
+    END = 'end'
+    tracks, out = {}, []
+    wait, frame, ptr, seen, loop_at = 'changed', 0.0, script, {script}, None
+
+    def track(i):
+        return tracks.setdefault(i, dict(kind=None, vb=0.0, vt=0.0, rb=0.0, rt=0.0, len=0.0, li=1.0))
+
+    def f32_at(o):
+        return f32(d, o)
+    for n in range(frames):
+        # ---- parse
+        if wait != END:
+            if wait == 'changed':
+                wait = -frame
+            else:
+                wait -= 1.0
+                frame += 1.0
+            while wait != END and wait <= 0.0:
+                if ptr is None or ptr + 4 > len(d):
+                    for a in tracks.values():
+                        if a['kind']:
+                            a['len'] += 1.0 + wait
+                    wait = END
+                    loop_at = loop_at if loop_at is not None else n
+                    break
+                w = u32(d, ptr)
+                op, payload = w >> 25, w & 0x7FFF
+                if op in (3, 4, 5, 6, 8, 9, 10, 11):     # set value (+ rate): block / not
+                    flags = (u32(d, ptr) >> 15) & 0x3FF
+                    ptr += 4
+                    for i in range(ANIM_TRACKS):
+                        if not flags >> i:
+                            break
+                        if not (flags >> i) & 1:
+                            continue
+                        a = track(i)
+                        a['vb'], a['vt'] = a['vt'], f32_at(ptr)
+                        ptr += 4
+                        if op in (5, 6):                          # value + rate (cubic)
+                            a['rb'], a['rt'] = a['rt'], f32_at(ptr)
+                            ptr += 4
+                            a['kind'] = 'cubic'
+                            if payload:
+                                a['li'] = 1.0 / payload
+                        elif op in (8, 9):                        # value, rate 0 (cubic)
+                            a['rb'], a['rt'] = a['rt'], 0.0
+                            a['kind'] = 'cubic'
+                            if payload:
+                                a['li'] = 1.0 / payload
+                        elif op in (3, 4):                        # linear
+                            a['kind'] = 'linear'
+                            if payload:
+                                a['rb'] = (a['vt'] - a['vb']) / payload
+                            a['rt'] = 0.0
+                        else:                                     # 10, 11: value after (step)
+                            a['kind'] = 'step'
+                            a['li'] = float(payload)
+                            a['rt'] = 0.0
+                        a['len'] = -wait - 1.0
+                    if op in (3, 5, 8, 10):                       # the *Block variants wait
+                        wait += payload
+                elif op == 7:                                     # target rate
+                    flags = (u32(d, ptr) >> 15) & 0x3FF
+                    ptr += 4
+                    for i in range(ANIM_TRACKS):
+                        if not flags >> i:
+                            break
+                        if (flags >> i) & 1:
+                            track(i)['rt'] = f32_at(ptr)
+                            ptr += 4
+                elif op == 2:                                     # wait
+                    wait += payload
+                    ptr += 4
+                elif op in (1, 14):                               # jump / set anim
+                    target = ptrs.get(ptr + 4)
+                    if target in seen and loop_at is None:
+                        loop_at = n
+                    seen.add(target)
+                    ptr = target
+                    if op == 14:
+                        frame = -wait
+                elif op == 12:
+                    flags = (u32(d, ptr) >> 15) & 0x3FF
+                    ptr += 4
+                    for i in range(ANIM_TRACKS):
+                        if not flags >> i:
+                            break
+                        if (flags >> i) & 1:
+                            track(i)['len'] += payload
+                elif op == 13:                                    # interp path (TraI): not shown
+                    ptr += 8
+                elif op == 0:                                     # end
+                    for a in tracks.values():
+                        if a['kind']:
+                            a['len'] += 1.0 + wait
+                    wait = END
+                    loop_at = loop_at if loop_at is not None else n
+                elif op in (15, 16):
+                    wait += payload
+                    ptr += 4
+                elif op == 17:
+                    flags = (u32(d, ptr) >> 15) & 0x3FF
+                    wait += payload
+                    ptr += 4
+                    for i in range(ANIM_TRACKS):
+                        if not flags >> i:
+                            break
+                        if (flags >> i) & 1:
+                            ptr += 4
+                else:                                             # not a joint command: stop
+                    wait = END
+                    loop_at = loop_at if loop_at is not None else n
+        # ---- play
+        vals = {}
+        for i, a in tracks.items():
+            if a['kind']:
+                if wait != END:
+                    a['len'] += 1.0
+                if i != 3:
+                    vals[i] = _anim_value(a)
+        out.append(vals)
+    return out, loop_at
+
+
+def layer_animation(f, d, frames=None, max_frames=1800):
+    """A stage layer's (or model's) joint animations -> ({joint: [{track: value}] per frame},
+    frame count): played until every looping / ending script has come round once."""
+    if d.get('anim') is None:
+        return {}, 0
+    scripts = {j.index: f.char_int.get(d['anim'] + 4 * j.index) for j in d['joints']}
+    scripts = {j: s for j, s in scripts.items() if s is not None}
+    if not scripts:
+        return {}, 0
+    if frames is None:
+        frames = 1
+        for s in scripts.values():
+            _, loop = simulate_anim(f.char, f.char_int, s, max_frames)
+            frames = max(frames, (loop or max_frames) + 1)
+        frames = min(frames, max_frames)
+    return {j: simulate_anim(f.char, f.char_int, s, frames)[0] for j, s in scripts.items()}, frames
+
+
 def rgba16(v):
     return (((v >> 11) & 31) * 255 // 31, ((v >> 6) & 31) * 255 // 31,
             ((v >> 1) & 31) * 255 // 31, 255 * (v & 1))
@@ -307,6 +563,7 @@ class Tri:
     corners: list            # [(source joint, local xyz, normal xyz, st texels, rgba bytes)] x3
     material: tuple          # key into Geometry.materials
     tile_ul: tuple = (0.0, 0.0)   # render tile's upper-left (texels) when drawn: the RDP subtracts it from st
+    link: int = 0                 # DObjDLLink list id of the DL drawing it (0: opaque / plain DL)
 
 
 @dataclass
@@ -315,21 +572,33 @@ class Geometry:
     materials: dict = field(default_factory=dict)   # key -> description
 
 
-def decode_model(f, joints, mobjs, dls, cache=None):
+def decode_model(f, joints, mobjs, dls, cache=None, carry_state=False):
     """Triangles of the given display lists, drawn in order with one shared RSP
     vertex cache (joints reuse their parent's cached vertices: knees, elbows...).
     dls: [(joint index, dl offset)]."""
     char, ptrs = f.char, f.char_int
+    link_of = {}
+    for joint, dl in dls:
+        for lid, target in (dl_links(char, ptrs, dl) or []) if dl is not None else []:
+            link_of[target] = lid
     dls = [(joint, target) for joint, dl in dls if dl is not None
            for target in linked_display_lists(char, ptrs, dl)]
     geo = Geometry()
     cache = cache if cache is not None else [None] * 32
+    st = None
     for j, dl in dls:
         # geometry mode: the game draws fighters lit, with back-face culling on
-        st = dict(img=None, tile=(2, 0), size=(32, 32), ul=(0.0, 0.0), scale=(1.0, 1.0),
-                  prim=(255, 255, 255, 255), tex_on=False,
-                  mobj=None, pal=None, wrap=(0, 0, 0, 0), geom=GEOM_DEFAULT,
-                  state={(0xD9, 0): (GEOM_CMD, GEOM_DEFAULT)})
+        if st is None or not carry_state:
+            st = dict(img=None, tile=(2, 0), size=(32, 32), ul=(0.0, 0.0), scale=(1.0, 1.0),
+                      prim=(255, 255, 255, 255), tex_on=False,
+                      mobj=None, pal=None, wrap=(0, 0, 0, 0), geom=GEOM_DEFAULT,
+                      state={(0xD9, 0): (GEOM_CMD, GEOM_DEFAULT)})
+        else:
+            # carry_state (stages, items): the game draws a model's joints one after the
+            # other, so a joint's DL starts with what the previous one left set (vanilla
+            # stages set texturing / the combiner once, in their first joint). Its MObjs
+            # are its own.
+            st['mobj'], st['drawn'] = None, False
 
         def key():
             if not st['tex_on']:
@@ -428,7 +697,7 @@ def decode_model(f, joints, mobjs, dls, cache=None):
                     for t in tl:
                         cs = [cache[i] for i in t]
                         if all(c is not None for c in cs):
-                            geo.tris.append(Tri(j, cs, k, st['ul']))
+                            geo.tris.append(Tri(j, cs, k, st['ul'], link_of.get(dl, 0)))
                 elif op == 0xDE:
                     if (w1 >> 24) == 0x0E:                       # MObj material (segment 0x0E)
                         i = (w1 & 0xFFFFFF) // 8
@@ -457,10 +726,31 @@ class BadDL(ValueError):
 DL_START_OPS = {0xE7, 0xD9, 0xDB, 0xD7, 0xFC, 0xE2, 0xE3, 0xDE, 0x01, 0xF5, 0xFD, 0xFA, 0xFB, 0xE8, 0xE6, 0xDF}
 
 
+def dl_links(char, ptrs, offset):
+    """A DObjDLLink array (GoldEditor models: {u32 list id, Gfx* dl} entries ending with
+    list id 4; 0 = opaque, 1 = translucent...) -> [(list id, dl)], or None if offset
+    isn't one."""
+    if offset in ptrs or offset + 4 not in ptrs or u32(char, offset) > 3:
+        return None
+    out, o = [], offset
+    while o + 8 <= len(char) and len(out) < 8:
+        lid = u32(char, o)
+        if lid == 4:
+            return out
+        if lid > 3 or o + 4 not in ptrs:
+            return None
+        out.append((lid, ptrs[o + 4]))
+        o += 8
+    return None
+
+
 def linked_display_lists(char, ptrs, offset):
-    """Resolve a direct display list or the two-list DObjDLLink form."""
+    """Resolve a direct display list, a DObjDLLink array (every list) or the two-list form."""
     if offset < len(char) and char[offset] in DL_START_OPS:
         return [offset]
+    links = dl_links(char, ptrs, offset)
+    if links:
+        return [dl for _, dl in links]
 
     linked = []
     for field in (offset, offset + 4):
@@ -570,7 +860,8 @@ def model_lights(f):
     """The model's light colors, set at the start of its display lists (DB0A0000 = light 1:
     the directional light, DB0A0018 = light 2: ambient, i.e. the shadow color)."""
     out = {}
-    for j in f.details['hi']['joints']:
+    first = f.details.get('hi') or next(iter(f.details.values()))     # stages: their first layer
+    for j in first['joints']:
         if j.dl is None:
             continue
         try:

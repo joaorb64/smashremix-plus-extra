@@ -57,6 +57,36 @@ VANILLA_FIGHTER_COSTUMES = {
     'BOSS': 1,
     'METAL': 1,
 }
+# vanilla common items: ITAttributes offsets in ITCommonData (file 0xFB), from the decomp's
+# tools/relocFileDescriptions.us.txt
+ITCOMMON_FILE = 0xFB
+VANILLA_ITEMS = {
+    'CAPSULE': 0x50, 'TOMATO': 0xB8, 'HEART': 0x100, 'STAR': 0x148, 'SWORD': 0x190, 'BAT': 0x1D8,
+    'HARISEN': 0x220, 'LGUN': 0x268, 'FFLOWER': 0x2E4, 'HAMMER': 0x374, 'MSBOMB': 0x3BC,
+    'BOMBHEI': 0x424, 'STARROD': 0x48C, 'GSHELL': 0x53C, 'RSHELL': 0x584, 'BOX': 0x5CC, 'TARU': 0x634,
+    'NBUMPER': 0x69C, 'MBALL': 0x6E4, 'EGG': 0xACC,
+}
+# vanilla stages: their Map file (MPGroundData at 0x14), decomp tools/relocFileDescriptions.us.txt
+VANILLA_MAPS = {
+    'DREAMLAND': 255, 'BETA_DREAMLAND': 256, 'ZEBES': 257, 'TEST': 258, 'CASTLE': 259,
+    'MUSHROOM_KINGDOM': 260, 'JUNGLE': 261, 'SECTOR_Z': 262, 'YOSHIS_ISLAND': 263, 'SAFFRON': 264,
+    'HYRULE': 265, 'FINAL_DESTINATION': 266, 'HOW_TO_PLAY': 267, 'DUEL_ZONE': 268, 'META_CRYSTAL': 269,
+    'SMALL_YOSHIS_ISLAND': 270,
+}
+
+
+def remix_maps():
+    """Remix stages' header (Map) files: File.asm STG_<NAME>_HEADER constants."""
+    file_asm = os.path.join(APPENDER_DIR, 'smashremix', 'src', 'File.asm')
+    out = {}
+    if os.path.isfile(file_asm):
+        for line in open(file_asm, encoding='utf-8'):
+            m = re.match(r'^\s*constant\s+STG_([A-Z0-9_]+)_HEADER\((0x[0-9A-Fa-f]+|\d+)\)', line)
+            if m:
+                out[m.group(1)] = int(m.group(2), 0)
+    return out
+
+
 NEAREST, REPEAT, MIRRORED_REPEAT, CLAMP_TO_EDGE = 9728, 10497, 33648, 33071
 
 def remix_fighter_files():
@@ -99,6 +129,44 @@ def quat_from_matrix(R):
         return [(R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s, (R[0, 2] - R[2, 0]) / s]
     s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
     return [(R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s, (R[1, 0] - R[0, 1]) / s]
+
+
+def object_files(cfg, char_dir, name):
+    """An extra character's item / projectile by name (e.g. 'knuckle'): its attributes file
+    (config.yaml files: <name>_hitbox or <name>) and model file (append_files: <name>_gfx),
+    with their chain heads -> dict for FF.load_object."""
+    def entries(lst):
+        for e in lst or []:
+            if e and isinstance(e[0], list):
+                yield from entries(e)
+            elif e:
+                yield e
+    files = {e[0]: e for e in entries(cfg.get('files'))}
+    extra = {e[0]: e for e in entries(cfg.get('append_files'))}
+    attr = files.get(f'{name}_hitbox') or files.get(name)
+    if attr is None:
+        raise SystemExit(f"config.yaml files: has no {name}_hitbox / {name} entry")
+    model = (extra.get(f'{name}_gfx') or files.get(f'{name}_gfx')
+             or (files.get(name) if attr[0] != name else None))       # stage items: NAME + NAME_hitbox
+    out = dict(attr_path=os.path.join(char_dir, attr[0] + '.bin'),
+               attr_int_head=int(attr[1], 16), attr_ext_head=int(attr[2], 16))
+    # the attributes start with their data pointer, the first link of the external chain
+    # (Remix projectiles: 0; stage items: a footer at 0x40)
+    if out['attr_ext_head'] < 0x3FFFC:
+        out['attr_offset'] = out['attr_ext_head']
+    if model is not None:
+        out.update(model_path=os.path.join(char_dir, model[0] + '.bin'), model_int_head=int(model[1], 16))
+    return out
+
+
+def stage_files(cfg, stage_dir):
+    """A stage folder's header.bin / stage.bin and chain heads (config.yaml offsets)."""
+    off = cfg.get('offsets') or {}
+    if 'header' not in off or 'stage' not in off:
+        raise SystemExit(f'{stage_dir}/config.yaml: offsets: header / stage missing')
+    return dict(header_path=os.path.join(stage_dir, 'header.bin'), stage_path=os.path.join(stage_dir, 'stage.bin'),
+                header_int_head=int(off['header'][0], 16), header_ext_head=int(off['header'][1], 16),
+                stage_int_head=int(off['stage'][0], 16))
 
 
 def read_config(char_dir):
@@ -173,15 +241,17 @@ class Exporter:
         return len(self.gl['accessors']) - 1
 
     # ---- skeleton
-    def skeleton(self, joints):
+    def skeleton(self, joints, prefix='', name='fighter'):
+        """One skin (armature) of joints named <prefix>joint_NN; meshes made next use it."""
         self.joint_node = {}
         for j in joints:
             self.joint_node[j.index] = len(self.gl['nodes'])
             R = FF.rot_zyx(*j.r)
-            self.gl['nodes'].append({'name': f'joint_{j.index:02d}', 'translation': [float(x) for x in j.t],
+            self.gl['nodes'].append({'name': f'{prefix}joint_{j.index:02d}', 'translation': [float(x) for x in j.t],
                                      'rotation': [float(x) for x in quat_from_matrix(R)],
                                      'scale': [float(x) for x in j.s]})
-            self.manifest['joints'].append(dict(index=j.index, parent=j.parent, depth=j.depth))
+            self.manifest['joints'].append(dict(index=j.index, parent=j.parent, depth=j.depth,
+                                                **({'prefix': prefix} if prefix else {})))
         for j in joints:
             kids = [self.joint_node[c.index] for c in joints if c.parent == j.index]
             if kids:
@@ -189,10 +259,80 @@ class Exporter:
         roots = [self.joint_node[j.index] for j in joints if j.parent is None]
         self.gl['scenes'][0]['nodes'] += roots
         ibm = np.array([np.linalg.inv(j.world).T.reshape(-1) for j in joints], '<f4')
-        self.gl['skins'].append({'name': 'fighter', 'skeleton': roots[0],
+        self.skin = len(self.gl['skins'])
+        self.gl['skins'].append({'name': name, 'skeleton': roots[0],
                                  'joints': [self.joint_node[j.index] for j in joints],
                                  'inverseBindMatrices': self.add(ibm, FLOAT, 'MAT4')})
         self.joints = joints
+
+    def animation(self, name, anims, frames):
+        """A glTF animation sampling joint animations every frame (60 per second): the
+        joint's rest transform with its animated tracks (rotation x/y/z, translation,
+        scale) replaced, as the game plays them (the scripts themselves are kept by the
+        import, unchanged)."""
+        n = max(len(seq) for _, _, seq in anims)
+        times = self.add(np.arange(n, dtype='<f4')[:, None] / 60.0, FLOAT, 'SCALAR', None, True)
+        samplers, channels = [], []
+        for node, j, seq in anims:
+            seq = list(seq) + [seq[-1]] * (n - len(seq))
+            T, R, S = [], [], []
+            r, t, sc = list(j.r), list(j.t), list(j.s)
+            for v in seq:
+                for k in range(3):
+                    r[k] = v.get(k, r[k])
+                    t[k] = v.get(4 + k, t[k])
+                    sc[k] = v.get(7 + k, sc[k])
+                T.append(list(t))
+                R.append(quat_from_matrix(FF.rot_zyx(*r)))
+                S.append(list(sc))
+            for path, vals, typ in (('translation', T, 'VEC3'), ('rotation', R, 'VEC4'), ('scale', S, 'VEC3')):
+                arr = np.array(vals, '<f4')
+                if np.allclose(arr, arr[0]):
+                    continue                              # not animated
+                samplers.append({'input': times, 'output': self.add(arr, FLOAT, typ), 'interpolation': 'LINEAR'})
+                channels.append({'sampler': len(samplers) - 1, 'target': {'node': node, 'path': path}})
+        if channels:
+            self.gl.setdefault('animations', []).append({'name': name, 'samplers': samplers, 'channels': channels})
+
+    def run_stage(self):
+        """Stage geometry: one armature + meshes per layer (L<n>_joint_NN, L<n>_j<joint>)."""
+        f = self.f
+        self.script_of = {}
+        for d in f.details.values():
+            if d.get('matanim') is None:
+                continue
+            for j, lst in d['mobjs'].items():
+                an = f.char_int.get(d['matanim'] + 4 * j)
+                for i, ms in enumerate(lst):
+                    sc = f.char_int.get(an + 4 * i) if an is not None else None
+                    if sc is not None:
+                        self.script_of.setdefault(ms, sc)
+        self.manifest['lights'] = FF.model_lights(f)
+        self.manifest['expressions'] = []
+        anims = []                                    # (joint node, rest joint, [{track: value}])
+        n_frames = 0
+        for name, d in f.details.items():
+            L = int(name[1:])
+            self.skeleton(d['joints'], prefix=f'{name}_', name=f'Layer {L}')
+            per, frames = FF.layer_animation(f, d)
+            n_frames = max(n_frames, frames)
+            for j, seq in per.items():
+                if any(seq):
+                    anims.append((self.joint_node[j], d['joints'][j], seq))
+            if per:
+                self.manifest.setdefault('animations', {})[name] = dict(
+                    joints=sorted(per), frames=frames, field=d['field'] + 4)
+            geo, _ = FF.decode_model(f, d['joints'], d['mobjs'], [(j.index, j.dl) for j in d['joints']],
+                                     carry_state=True)
+            self.mesh(name, geo, extra=dict(detail=name, layer=L), preserve_order=True)
+            self.manifest.setdefault('mobj_order', {})[name] = {
+                str(j): self.mobj_order(lst) for j, lst in d['mobjs'].items() if lst}
+        if anims:
+            self.animation('Stage', anims, n_frames)
+        self.gl['buffers'].append({'uri': 'model.bin', 'byteLength': len(self.blob)})
+        open(os.path.join(self.out, 'model.bin'), 'wb').write(self.blob)
+        json.dump(self.gl, open(os.path.join(self.out, 'model.gltf'), 'w'), indent=1)
+        json.dump(self.manifest, open(os.path.join(self.out, 'manifest.json'), 'w'), indent=1, default=int)
 
     # ---- materials
     FMT = {(0, 2): 'RGBA16', (0, 3): 'RGBA32', (2, 0): 'CI4', (2, 1): 'CI8', (3, 0): 'IA4', (3, 1): 'IA8',
@@ -404,16 +544,19 @@ class Exporter:
         return rel
 
     # ---- meshes
-    def mesh(self, name, geo, owner_of=None, extra=None):
+    def mesh(self, name, geo, owner_of=None, extra=None, preserve_order=False):
         """One glTF mesh per (joint drawing it): vertices rigid on their source joint."""
         by_joint = {}
         for t in geo.tris:
             by_joint.setdefault(t.joint, []).append(t)
         for j, tris in sorted(by_joint.items()):
-            pos, nrm, uv, jnt, col, prims = [], [], [], [], [], {}
+            pos, nrm, uv, jnt, col = [], [], [], [], []
+            prims = []
             for t in tris:
                 desc = geo.materials[t.material]
                 mi = self.material(t.material, desc, None)
+                if t.link:                # drawn from a DObjDLLink list other than 0 (translucent...)
+                    self.manifest['materials'][self.gl['materials'][mi]['name']]['dl_link'] = t.link
                 wrap = desc['wrap']
                 w, h = FF.texture_dimensions(desc['size'], wrap)
                 lit = desc['state'].get((0xD9, 0), (0, FF.GEOM_DEFAULT))[1] & FF.G_LIGHTING
@@ -436,7 +579,16 @@ class Exporter:
                     uv.append(((st[0] - t.tile_ul[0]) / w, (st[1] - t.tile_ul[1]) / h))
                     jnt.append(src)
                     idx.append(len(pos) - 1)
-                prims.setdefault(mi, []).extend(idx)
+                if preserve_order:
+                    if not prims or prims[-1][0] != mi:
+                        prims.append([mi, []])
+                    prims[-1][1].extend(idx)
+                else:
+                    primitive = next((p for p in prims if p[0] == mi), None)
+                    if primitive is None:
+                        primitive = [mi, []]
+                        prims.append(primitive)
+                    primitive[1].extend(idx)
             P = np.array(pos, '<f4')
             J = np.zeros((len(jnt), 4), '<u2')
             J[:, 0] = jnt
@@ -451,13 +603,22 @@ class Exporter:
             mesh_name = f'{name}_j{j:02d}'
             self.gl['meshes'].append({'name': mesh_name, 'primitives': [
                 {'attributes': attrs, 'material': mi,
-                 'indices': self.add(np.array(ix, '<u4'), UINT, 'SCALAR', 34963)} for mi, ix in prims.items()]})
-            self.gl['nodes'].append({'name': mesh_name, 'mesh': len(self.gl['meshes']) - 1, 'skin': 0})
+                 'indices': self.add(np.array(ix, '<u4'), UINT, 'SCALAR', 34963)} for mi, ix in prims]})
+            self.gl['nodes'].append({'name': mesh_name, 'mesh': len(self.gl['meshes']) - 1, 'skin': self.skin})
             self.gl['scenes'][0]['nodes'].append(len(self.gl['nodes']) - 1)
-            self.manifest['objects'][mesh_name] = dict(joint=j, triangles=len(tris), **(extra or {}))
+            obj_info = dict(
+                joint=j, triangles=len(tris),
+                draw_order=[self.gl['materials'][mi]['name'] for mi, _ in prims], **(extra or {}))
+            if preserve_order:
+                obj_info['draw_runs'] = [
+                    dict(material=self.gl['materials'][mi]['name'], triangles=len(ix) // 3)
+                    for mi, ix in prims]
+            self.manifest['objects'][mesh_name] = obj_info
 
     def run(self):
         f = self.f
+        if (getattr(f, 'object', None) or {}).get('kind') == 'stage':
+            return self.run_stage()
         hi = f.details['hi']
         self.script_of = {}
         for d in f.details.values():
@@ -487,7 +648,8 @@ class Exporter:
             if not d:
                 continue
             dls = [(j.index, j.dl) for j in d['joints']]
-            geo, _ = FF.decode_model(f, d['joints'], d['mobjs'], dls)
+            geo, _ = FF.decode_model(f, d['joints'], d['mobjs'], dls,
+                                     carry_state=bool(getattr(f, 'object', None)))
             self.mesh(detail, geo, extra=dict(detail=detail))
             self.manifest.setdefault('mobj_order', {})[detail] = {
                 str(j): self.mobj_order(lst) for j, lst in d['mobjs'].items() if lst}
@@ -589,6 +751,21 @@ def main():
                     help='hex ROM file ID for character.bin (use with --main-file-id)')
     ap.add_argument('--costumes', type=int)
     ap.add_argument('--no-preview', action='store_true', help="don't render previews/*.png")
+    # items / projectiles (one model described by ITAttributes / WPAttributes)
+    ap.add_argument('--object', metavar='NAME',
+                    help="CHAR_DIR's (a character or stage folder) item / projectile NAME: config.yaml "
+                         "files: NAME_hitbox + NAME_gfx (append_files) or NAME (stage items)")
+    ap.add_argument('--attr', help='attributes .bin (with --model, or alone when the model is in it)')
+    ap.add_argument('--model', help='model .bin the attributes point into')
+    ap.add_argument('--attr-offset', type=lambda v: int(v, 16), help='hex offset of the attributes '
+                    '(default: the attributes file\'s external chain head, else 0)')
+    ap.add_argument('--attr-heads', default='3FFFC,0', help='hex internal,external chain heads of --attr')
+    ap.add_argument('--model-head', type=lambda v: int(v, 16), default=0x3FFFC, help='hex internal chain head of --model')
+    ap.add_argument('--item', type=str.upper, choices=VANILLA_ITEMS, help='vanilla common item from --rom')
+    ap.add_argument('--stage', action='store_true',
+                    help="CHAR_DIR is a stage folder: export its geometry layers (header.bin -> stage.bin)")
+    ap.add_argument('--map', metavar='STAGE', help='a stage from --rom: vanilla name (' + ', '.join(VANILLA_MAPS) +
+                    '), a Remix File.asm STG_<NAME>_HEADER name (e.g. BATTLEFIELD), or the Map file\'s hex ID')
     a = ap.parse_args()
     if len(a.paths) == 1:
         char_dir, out_dir = None, a.paths[0]
@@ -599,10 +776,50 @@ def main():
 
     if a.rom and (a.main or a.char):
         ap.error('--rom cannot be combined with --main or --char')
+    if a.stage and a.map:
+        ap.error('--stage (a stage folder) and --map (a stage from --rom) are mutually exclusive')
     if not a.rom and (a.fighter or a.main_file_id is not None or a.char_file_id is not None):
         ap.error('--fighter and ROM file IDs require --rom')
 
     cfg = read_config(char_dir) if char_dir else {}
+    if a.stage or a.map:
+        if a.map:
+            if not a.rom:
+                ap.error('--map requires --rom')
+            f = load_rom_stage(a.rom, a.map, ap)
+        elif not char_dir:
+            ap.error('--stage needs the stage folder (STAGE_DIR OUT_DIR)')
+        else:
+            f = FF.load_stage(**stage_files(cfg, char_dir))
+        ex = Exporter(f, out_dir, 1)
+        ex.manifest['object'] = f.object
+        ex.run()
+        m = ex.manifest
+        tris = sum(o['triangles'] for o in m['objects'].values())
+        print(f"exported layers {f.object['layers']}: {len(m['objects'])} meshes ({tris} triangles), "
+              f"{len(m['materials'])} materials, {sum(len(v['images']) for v in m['materials'].values())} image + "
+              f"{sum(len(v['palettes']) for v in m['materials'].values())} palette entries -> {out_dir}")
+        if not a.no_preview:
+            import preview
+            for p in preview.save_sheets(out_dir):
+                print(f'preview: {p}')
+        return
+    if a.object or a.attr or a.item:
+        f = load_object_args(a, ap, cfg, char_dir, out_dir)
+        ex = Exporter(f, out_dir, a.costumes or costumes_in_scripts(f) or 1)
+        ex.manifest['object'] = f.object
+        ex.run()
+        m = ex.manifest
+        tris = sum(o['triangles'] for o in m['objects'].values())
+        print(f"exported {'display list' if f.object['dl_only'] else str(len(m['joints'])) + ' joints'}, "
+              f"{len(m['objects'])} meshes ({tris} triangles), {len(m['materials'])} materials, "
+              f"{sum(len(v['images']) for v in m['materials'].values())} image + "
+              f"{sum(len(v['palettes']) for v in m['materials'].values())} palette entries -> {out_dir}")
+        if not a.no_preview:
+            import preview
+            for p in preview.save_sheets(out_dir):
+                print(f'preview: {p}')
+        return
     off = cfg.get('offsets', {})
     mi, me = (int(x, 16) for x in off.get('main', ['02CC', '0000']))
     ci = int(off.get('character', ['0004'])[0], 16)
@@ -661,6 +878,97 @@ def main():
         import preview
         for p in preview.save_sheets(out_dir):
             print(f'preview: {p}')
+
+
+def load_rom_stage(rom, name, ap):
+    """A stage's Map file (MPGroundData at 0x14) from the ROM, and the file its geometry
+    layers point into (its external chain: which file each pointer goes to is the
+    entry's ID list, in chain order)."""
+    key = name.upper()
+    remix = remix_maps()
+    if key in VANILLA_MAPS:
+        map_id = VANILLA_MAPS[key]
+    else:
+        remix_name = key
+        if remix_name.startswith('STG_'):
+            remix_name = remix_name[4:]
+        if remix_name.endswith('_HEADER'):
+            remix_name = remix_name[:-7]
+        if key in remix:
+            map_id = remix[key]
+        elif remix_name in remix:
+            map_id = remix[remix_name]
+        else:
+            try:
+                map_id = int(name, 16)
+            except ValueError:
+                ap.error(f'unknown stage {name!r} (vanilla: {", ".join(VANILLA_MAPS)}; Remix: File.asm STG_*_HEADER)')
+    entries = SSBtbl.fromROM(N64(open(rom, 'rb').read()))
+    if not 0 <= map_id < len(entries):
+        ap.error(f'stage Map file ID 0x{map_id:X} is outside the ROM file table (0..0x{len(entries) - 1:X})')
+    entry = entries[map_id]
+    header = entry.extract('data')
+    ids = [int.from_bytes(entry.idx[i:i + 2], 'big') for i in range(0, len(entry.idx or b''), 2)]
+    links = list(FF.chain(header, entry.res).keys()) if entry.res is not None else []
+    layer_files = {ids[links.index(FF.GROUND_DATA + 0x10 * L)] for L in range(FF.GROUND_LAYERS)
+                   if FF.GROUND_DATA + 0x10 * L in links}
+    if not layer_files:
+        raise SystemExit(f'Map file 0x{map_id:X}: no geometry layers')
+    stage_id = min(layer_files)
+    if len(layer_files) > 1:
+        print(f'  note: layers point into files {sorted(hex(x) for x in layer_files)}; '
+              f'exporting those in 0x{stage_id:X}')
+    stage_data, stage_ext = rom_external_data(entries, entries[stage_id])
+    with tempfile.TemporaryDirectory() as temp_dir:
+        hp, sp = os.path.join(temp_dir, 'header.bin'), os.path.join(temp_dir, 'stage.bin')
+        open(hp, 'wb').write(header)
+        open(sp, 'wb').write(stage_data)
+        f = FF.load_stage(hp, sp, entry.tbl if entry.tbl is not None else 0x3FFFC,
+                          entry.res if entry.res is not None else 0x3FFFC,
+                          entries[stage_id].tbl if entries[stage_id].tbl is not None else 0x3FFFC,
+                          stage_ext=stage_ext, only_file=(ids, links, stage_id))
+    f.object.update(rom_map=map_id, rom_stage=stage_id, name=name)
+    return f
+
+
+def load_object_args(a, ap, cfg, char_dir, out_dir):
+    """FF.load_object from --object / --attr [--model] / --rom --item."""
+    if a.item:
+        if not a.rom:
+            ap.error('--item requires --rom')
+        entries = SSBtbl.fromROM(N64(open(a.rom, 'rb').read()))
+        entry = entries[ITCOMMON_FILE]
+        off = VANILLA_ITEMS[a.item]
+        # the attributes point (external chain) into the item model file; which file each
+        # external pointer goes to: the entry's ID list, in chain order
+        attr = entry.extract('data')
+        ids = [int.from_bytes(entry.idx[i:i + 2], 'big') for i in range(0, len(entry.idx or b''), 2)]
+        links = list(FF.chain(attr, entry.res).keys()) if entry.res is not None else []
+        if off not in links:
+            raise SystemExit(f'{a.item}: no model pointer at 0x{off:X}')
+        model_id = ids[links.index(off)]
+        model_data, model_ext = rom_external_data(entries, entries[model_id])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ap_, mp_ = os.path.join(temp_dir, 'attr.bin'), os.path.join(temp_dir, 'model.bin')
+            open(ap_, 'wb').write(attr)
+            open(mp_, 'wb').write(model_data)
+            f = FF.load_object(ap_, mp_, entry.tbl, entry.res, entries[model_id].tbl, off, model_ext)
+        f.object.update(kind='item', rom_file=ITCOMMON_FILE, model_file=model_id, name=a.item)
+        return f
+    if a.object:
+        if not char_dir:
+            ap.error('--object needs CHAR_DIR (CHAR_DIR OUT_DIR)')
+        kw = object_files(cfg, char_dir, a.object)
+        if a.attr_offset is not None:
+            kw['attr_offset'] = a.attr_offset
+        f = FF.load_object(**kw)
+        f.object.update(name=a.object, char_dir=char_dir, **{k: v for k, v in kw.items() if k.endswith('path')})
+        return f
+    ih, eh = (int(x, 16) for x in a.attr_heads.split(','))
+    f = FF.load_object(a.attr, a.model, ih, eh, a.model_head,
+                       a.attr_offset if a.attr_offset is not None else (eh if a.model and eh < 0x3FFFC else 0))
+    f.object.update(attr_path=a.attr, model_path=a.model)
+    return f
 
 
 if __name__ == '__main__':

@@ -71,7 +71,7 @@ def load_gltf(path):
         jn = gl['skins'][nd['skin']]['joints']
         bone = []
         for j in jn:
-            m = re.match(r'joint_(\d+)', gl['nodes'][j].get('name', ''))
+            m = re.search(r'joint_(\d+)$', gl['nodes'][j].get('name', ''))     # (stages: L<n>_joint_NN)
             bone.append(int(m.group(1)) if m else None)
         pos, nrm, uv, jnt, col, tris = [], [], [], [], [], []
         for prim in gl['meshes'][nd['mesh']]['primitives']:
@@ -189,15 +189,49 @@ class Materials:
 
 
 # ---------------------------------------------------------------- model
-def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=None, mobj_order=None, slots=None):
+def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=None, mobj_order=None, slots=None,
+                 epilogue=b'', keep_order=False, draw_order=None, preserve_order=False, draw_runs=None):
     """Display lists per joint; triangles joining two joints are drawn in the
     later joint with the earlier joint's cached vertices (reserved cache slots).
     mobj_order: {joint: [material names]}: the original MObj list order (kept: texture
     parts and code address MObjs by index); None = a slot with no material."""
     Winv = [np.linalg.inv(W) for W in joints_W]
-    per_joint, wedge = {}, {}
+    per_joint, wedge, ordered = {}, {}, {}
+    # keep_order (items / stages): materials drawn in the order they come in the meshes (the
+    # original display-list order: stage backgrounds drawn without depth test are painted
+    # in that order); otherwise blending materials last, by name
+    appear = {}                                   # joint -> {material: draw position}
+
+    def note(j, o, name):
+        d = appear.setdefault(j, {})
+        if not d:                                 # the export's order first (Blender re-sorts)
+            for mat in (draw_order or {}).get(o['name'], []):
+                d.setdefault(base_mat(mat), len(d))
+        d.setdefault(name, len(d))
+
+    def ordered_triangles(o):
+        triangles = o['tris']
+        runs = (draw_runs or {}).get(o['name'])
+        if not preserve_order or not runs:
+            return triangles
+        by_material = {}
+        for mat, tri in triangles:
+            by_material.setdefault(base_mat(mat), []).append((mat, tri))
+        out = []
+        for run in runs:
+            name, count = base_mat(run['material']), int(run['triangles'])
+            entries = by_material.get(name, [])
+            if len(entries) < count:
+                raise SystemExit(f"{o['name']}: draw-order manifest requests {count} triangles for {name}, "
+                                 f"but the Blender mesh has {len(entries)}")
+            out.extend(entries[:count])
+            del entries[:count]
+        if any(entries for entries in by_material.values()):
+            raise SystemExit(f"{o['name']}: Blender mesh triangles do not match the stage draw-order manifest")
+        return out
+
     for o in objs:
-        for mat, tri in o['tris']:
+        for mat, tri in ordered_triangles(o):
             js = sorted({int(o['joint'][v]) for v in tri})
             if only_joint is not None:
                 js = [only_joint]
@@ -217,8 +251,14 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
                 keys.append(k)
             if len(js) == 1:
                 per_joint.setdefault(js[0], {'own': {}, 'cross': {}})['own'].setdefault(name, []).append(keys)
+                if preserve_order:
+                    ordered.setdefault(js[0], []).append((name, keys, False))
             elif len(js) == 2:
                 per_joint.setdefault(js[1], {'own': {}, 'cross': {}})['cross'].setdefault(name, []).append(keys)
+                if preserve_order:
+                    ordered.setdefault(js[1], []).append((name, keys, True))
+            if len(js) in (1, 2):
+                note(js[-1], o, name)
             else:
                 raise SystemExit(f"{o['name']}: a triangle spans joints {js} (max two)")
     dls, mats = {}, {}
@@ -266,7 +306,12 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
         return min([min(exports[c].values()) for c in waiting] + [32])
     for j in sorted(per_joint):
         pj = per_joint[j]
-        used = textures.order({m for k in ('own', 'cross') for m in pj[k]})
+        if keep_order:
+            def order(names, _a=appear.get(j, {})):
+                return sorted(names, key=lambda n: _a.get(n, len(_a)))
+        else:
+            order = textures.order
+        used = order({m for k in ('own', 'cross') for m in pj[k]})
         hint = [m if m is not None and textures.has(m) and textures.get(m).uses_mobj() else None
                 for m in (mobj_order or {}).get(j, [])]
         mi = {}
@@ -297,9 +342,25 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
                    if not isinstance(w, tuple) or w[0] != 'slot']
         if any(wedge[w][0] != j for w in missing):
             raise SystemExit(f'joint {j}: a triangle reaches a joint drawn after it')
-        GW.emit_tris(dw, {m: cross[m] for m in textures.order(cross)}, setup_fn(mi), free_below())
-        waiting.discard(j)
-        GW.emit_tris(dw, {m: pj['own'][m] for m in textures.order(pj['own'])}, setup_fn(mi), free_below())
+        if preserve_order:
+            runs = []
+            for name, tri, is_cross in ordered[j]:
+                if is_cross:
+                    missing = [w for w in tri if w not in imp and wedge[w][0] != j]
+                    if missing:
+                        raise SystemExit(f'joint {j}: a triangle reaches a joint drawn after it')
+                    tri = [('slot', imp[w]) if w in imp else w for w in tri]
+                if runs and runs[-1][0] == name:
+                    runs[-1][1].append(tri)
+                else:
+                    runs.append([name, [tri]])
+            for name, tris in runs:
+                GW.emit_tris(dw, {name: tris}, setup_fn(mi), free_below())
+            waiting.discard(j)
+        else:
+            GW.emit_tris(dw, {m: cross[m] for m in order(cross)}, setup_fn(mi), free_below())
+            waiting.discard(j)
+            GW.emit_tris(dw, {m: pj['own'][m] for m in order(pj['own'])}, setup_fn(mi), free_below())
         # keep the verts later joints' cross triangles need
         for later in sorted(per_joint):
             if later <= j:
@@ -315,6 +376,8 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
                 waiting.add(later)
         if dw.alpha_compare:                     # not reset by the game's render mode
             dw.raw(GW.g(0xE7000000) + b''.join(GW.g(*c) for c in MAT.ALPHA_COMPARE_OFF))
+        if epilogue:                             # items / stages: the state the original DL left
+            dw.raw(epilogue)
         dls[j] = dw.finish()
     return dls, mats
 

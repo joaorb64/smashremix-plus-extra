@@ -1,15 +1,21 @@
-# fighter_model: edit a fighter's 3D model in Blender
+# fighter_model: edit fighter, item, projectile and stage models in Blender
 
 Export a fighter's model (body, low detail, alternate parts, every costume,
 facial expressions, palettes, materials) to an editable .blend, then build the
-edited .blend back into its `main.bin` / `character.bin`.
+edited .blend back into its `main.bin` / `character.bin`. Items and projectiles
+(one model described by ITAttributes / WPAttributes) and stages (their geometry
+layers) work the same way, see [Items and projectiles](#items-and-projectiles) and
+[Stages](#stages).
 
 Status: export and import work. Unedited round trips of Meta Knight, Mega Man and
 Snake render identically (same textures in every costume, same expressions/palettes,
-same MObj order). ROM export discovers Remix fighters from `File.asm` and handles
-two-display-list joints used by fighters such as Bowser. Not yet: importing
-DObjDLLink joints, adding model-part variants, build-process wiring (planned:
-.blend files in the repo, compiled at build).
+same MObj order); so do items and projectiles (rebuilt model files have no leftover
+data). ROM export reads Remix fighters (from `File.asm`) and vanilla fighters and
+items, including vanilla display-list features (shifted / scaled texture tiles,
+mirrored clamped tiles, vertex edits across joints, shared files). Not yet: writing
+items back into the vanilla shared item file, editing stage animations in Blender
+(they're kept), adding model-part variants,
+build-process wiring (planned: .blend files in the repo, compiled at build).
 
 Blender commands are given twice: as `blender`, and for Blender installed from
 Flatpak (`flatpak run org.blender.Blender`, with absolute paths: Flatpak Blender
@@ -38,7 +44,73 @@ python3 appender/scripts/fighter_model/export_fighter.py --rom ROM.z64 --main-fi
 ```
 ROM file IDs can be found in `appender/scripts/gen_editable_rom.py`. ROM exports
 read relocation-chain offsets from the ROM file table; ordinary `main.bin` /
-`character.bin` exports continue using their config offsets.
+`character.bin` exports continue using their config offsets. Data a ROM file takes
+from other files (its external relocation chain, e.g. the bone texture every
+vanilla electric skeleton shares) is read too.
+
+### Items and projectiles
+
+```
+python3 appender/scripts/fighter_model/export_fighter.py FOLDER OUT_DIR --object NAME
+```
+FOLDER is a character or stage folder; NAME is found in its config.yaml: the
+attributes file `NAME_hitbox` (`files:`) and the model file `NAME_gfx`
+(`append_files:`, projectiles) or `NAME` (`files:`, stage items). Chain heads come
+from those entries; the attributes are at the attributes file's external chain head
+(`--attr-offset` to override). Other files: `--attr X_hitbox.bin --model X.bin
+--attr-heads INT,EXT --model-head HEAD [--attr-offset OFF]`. Vanilla common items:
+`--rom ROM.z64 --item HAMMER` (see `VANILLA_ITEMS` in export_fighter.py).
+
+The model is a DObj tree or a bare display list (sprite projectiles: one quad);
+the .blend has one costume. Materials with several images (e.g. damage stages a
+hazard swaps in) are drawn in `previews/variants.png`. Items fade toward the env
+color by its alpha (flashing), which the game keeps at 0: the preview and Blender
+draw them with env 00000000.
+
+### Stages
+
+```
+python3 appender/scripts/fighter_model/export_fighter.py STAGE_DIR OUT_DIR --stage
+```
+Reads the geometry layers of `header.bin`'s ground data (MPGroundData at 0x14:
+`gr_desc[0..3]`, each a DObj tree in `stage.bin` with its materials and material
+scripts) using config.yaml `offsets:`. Meshes are `L<n>_j<joint>`, bones
+`L<n>_joint_NN` (one armature for every layer). Each `gr_desc` is a stage type/layer;
+its DObj joints (rooms) are the meshes `L<n>_j<joint>` in its `Layer <n> - <type>` collection. Layer 0 is the
+background, layer 1 is the z-buffered stage/collision-group layer, and layers 2 and 3
+are foreground. Layer 1's joints are the groups the hazard code toggles, by index.
+`previews/stage.png`: the whole stage from the six sides; `previews/layers.png`: each
+layer alone.
+
+Layer types (decomp grdisplay.c), drawn in this order:
+
+| Layer | Draw priority | Depth buffer | Use |
+|---|---|---|---|
+| 0 | 4 (first) | off: painted in display-list order | background |
+| 1 | 6 (with the fighters) | on | the z-buffered stage, collision groups |
+| 2 | 13 | off | drawn over everything |
+| 3 | 17 (last) | off | drawn over everything |
+
+Within a layer the rooms (joints) and each display list's materials draw in order; the
+export records it (manifest objects' `draw_order`) and the import keeps it. The preview
+draws exactly that; Blender can't (layers 2 / 3 are shown In Front, layer 0 is depth
+tested there).
+
+Animations (the layers' anim_joints scripts, decomp objanim.c) are played and sampled
+every frame into the glTF animation `Stage`: the `Stage` armature's action, 60 fps, the
+timeline covering one loop (capped at 30 s for scripts the stage code drives, e.g.
+moving platforms). They're for viewing: the import keeps the original scripts as they
+are. Vanilla stages are available by name too (`DREAMLAND`, `CASTLE`, `SECTOR_Z`...:
+`VANILLA_MAPS` in export_fighter.py).
+
+To export a stage directly from a Smash Remix ROM, give its `File.asm` header name:
+```
+python3 appender/scripts/fighter_model/export_fighter.py --rom ROM.z64 --map=BATTLEFIELD OUT_DIR
+```
+Use a stage name such as `BATTLEFIELD`, `DEKU`, or `MUTE` (the `STG_` prefix and
+`_HEADER` suffix are optional), or the Map file's hexadecimal ID. The ROM supplies
+the stage header and its referenced geometry files. `--map BATTLEFIELD` works too;
+the equals form is useful when keeping option/value pairs together in scripts.
 
 ```
 blender -b --factory-startup --python appender/scripts/fighter_model/build_blend.py -- OUT_DIR
@@ -58,6 +130,7 @@ shadow colors and per-material culling:
 | `expressions.png` | every image of each material that has several (facial expressions), on the model |
 | `parts.png` | every model part from the six sides; one row per costume when its colors change per costume |
 | `skeleton.png` | the electric-shock skeleton model(s) |
+| `variants.png` | items / projectiles: every image of each material that has several (instead of expressions.png) |
 
 `OUT_DIR/fighter.blend` contains:
 
@@ -67,7 +140,13 @@ shadow colors and per-material culling:
 | Low detail | lo-detail body (hidden) |
 | Model parts | alternate pieces per joint and variant: hands (open/fist...), held props, effects. Objects `part<variant>_<hi\|lo>_j<joint>` (hidden) |
 | Electric skeleton | the model drawn while electrocuted, `skel<id>_j<joint>` (hidden). It's drawn with the joint's body materials (MObjs) or its own inline textures (usually the shared skeleton texture) |
-| Armature | the skeleton, bones `joint_00`.. (shared) |
+| Armature | the skeleton, bones `joint_00`.. (shared). Shown as sticks, in front, with names; bones reach toward their child joints, joints stacked on one spot (separate rotation axes) are short stubs, and bone collections Left (red, the fighter's left: +X) / Right (blue) / Center (yellow) group them. Display only: the import takes the joints from the game file |
+| Stage types / rooms | `Layer 0 - Background`, `Layer 1 - Stage (Z-buffered)`, and `Layer 2/3 - Foreground`; each contains `Room <joint>` collections for its DObj joints. Moving a room to another layer changes its stage type. |
+
+Textures are external files (`textures/`, relative paths): keep the export folder
+together. Judge colors in Material Preview: it runs the N64 setup (combiner, wrap
+/ mirror / clamp per axis, per-material light colors); Solid view has one wrap mode
+per texture and no combiner.
 
 Identical materials (e.g. the hi and lo models' copies) are exported once, so an
 edit applies everywhere they're used. Vertex normals are the model's own (custom
@@ -199,6 +278,43 @@ python3 appender/scripts/fighter_model/import_fighter.py extra_characters/<Name>
 Sizes (unedited round trip): Meta Knight 75,296 -> 55,088 bytes (its hi and lo
 models were duplicate data), Mega Man 107,632 -> 115,360, Snake 180,748 -> 107,800.
 
+### Items and projectiles
+
+```
+python3 appender/scripts/fighter_model/import_object.py FOLDER NAME WORK_DIR [--out OUT_DIR]
+```
+- The model file (`NAME_gfx.bin` / `NAME.bin`) is written from scratch: the new
+  model, plus whatever the attributes reach that isn't the model (anim_joints) -
+  nothing else from the old file (GoldEditor exports carry unused objects and
+  textures; a re-import drops them, so they need no trimming at build).
+- Kept as the original had it: DObj tree or bare display list, DObjDLLink entries
+  (GoldEditor models), MObj image lists (in order: code may swap their entries).
+- `NAME_hitbox.bin`: its pointers into the model file are re-pointed (a new one is
+  added to its external chain, with a line in `NAME_hitbox_reqlist.txt`).
+- config.yaml: the model file's chain head is updated (it changes with the new
+  layout) and a `trim:` option on that entry is removed. With `--out`, nothing in
+  FOLDER is touched and the new head is printed instead.
+- Stage builds derive the `FILES.<NAME>.*` offsets (mobjsub, sprites, sprite0..)
+  from the files, so they follow the new layout.
+- Material scripts (texture animations) are kept as they are, and so is each display
+  list's original end state (render mode restored...: items drawn with no render mode
+  of their own, like stage hazards, inherit what a model leaves set).
+
+### Stages
+
+```
+python3 appender/scripts/fighter_model/import_stage.py STAGE_DIR WORK_DIR [--out OUT_DIR]
+```
+`blend_to_gltf.py` writes `layer<N>.gltf` per layer collection. `stage.bin` is written
+from scratch: the rebuilt layers plus everything else `header.bin` points at in it
+(collision geometry, layer animations), and the layers' material scripts (texture
+animations), unchanged. Each layer keeps its DObjDesc array (transforms and order:
+collision groups and hazard code address joints by index); a layer with no meshes in
+the .blend keeps its joints without display lists. `header.bin`'s pointers are
+updated (extra `header_reqlist.txt` lines after the pointer lines, e.g. imported item
+files, stay last) and config.yaml `offsets: stage` gets the new chain head. The
+collision tools (`stage_collision.py`) read the rebuilt file the same way.
+
 ## What is read (through main.bin's fighter attributes, decomp fttypes.h FTAttributes)
 
 - common parts (hi/lo): DObjDesc skeleton, display lists, MObjSub materials and
@@ -214,8 +330,17 @@ models were duplicate data), Mega Man 107,632 -> 115,360, Snake 180,748 -> 107,8
   the list. With 0x04 alone the MObj only points at the palette; the DL loads it.
 
 - electric skeleton: attr->skeleton[id][joint] {dl, flags}, ids 1..3.
+- items / projectiles: ITAttributes / WPAttributes +0x0 data (DObjDesc array or a
+  display list), +0x4 p_mobjsubs, +0x8 anim_joints (kept), +0xC p_matanim_joints.
+- vanilla display-list features: tile upper-left (G_SETTILESIZE, subtracted from
+  the UVs) and G_TEXTURE scale; tiles wider than their texture with mirror + clamp
+  (clamped at the extent first, then mirrored by the mask: manifest wrap
+  `clamp_s` / `clamp_t`); G_MODIFYVTX texture coordinates / colors of vertices
+  shared with the parent joint; a prim color set after an MObj's material (the
+  MObj no longer applies); texels past a clamped extent (never drawn) are shown as
+  the edge texel in the costume PNGs.
 - joints: DObjDesc entry i is the game's joint i + 4 (player joints[0..3] are
   TopN/TransN/XRotN/YRotN; joints[] starts at 0x8E8 in the player struct).
 
-Not handled yet (passed through untouched): DObjDLLink arrays (and two-DL skeleton
-entries), accessory parts, hidden parts.
+Not handled yet (passed through untouched): fighter DObjDLLink arrays (and two-DL
+skeleton entries), accessory parts, hidden parts.
