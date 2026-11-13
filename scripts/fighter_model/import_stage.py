@@ -104,6 +104,9 @@ def main():
             targets[d['field'] + LAYER_FIELDS[role]] = tgt
         tris[name] = (sum(len(o['tris']) for o in objs), sorted(dls))
 
+    # ---- joint animations (anim_joints): Blender's, per joint (blend_to_gltf.py joint_anims)
+    anim_targets = IO.write_joint_anims(f, a.work_dir, blob, remap)
+
     if base_head is None:
         new, head = IO.standalone(blob)
     else:
@@ -114,7 +117,9 @@ def main():
 
     # ---- re-point header.bin (kept: remapped; layer models: the new data)
     for fld in into_stage:
-        if fld in model_fields:
+        if fld in anim_targets:
+            tgt = anim_targets[fld]
+        elif fld in model_fields:
             if fld not in targets:
                 name, role = model_fields[fld]
                 raise SystemExit(f'{name}: header 0x{fld:X} pointed into stage.bin but the new layer has no such data')
@@ -123,6 +128,7 @@ def main():
             tgt = remap[ext[fld]]
         struct.pack_into('>H', header, fld + 2, tgt // 4)
     added = 0
+    targets.update(anim_targets)
     for fld, tgt in sorted(targets.items()):
         if fld in ext:
             continue

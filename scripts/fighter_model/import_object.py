@@ -14,10 +14,13 @@ original export is gone. The attributes file's pointers into it are updated, and
 model file's chain head in config.yaml (it moves with the new layout).
 """
 import argparse
+import json
 import os
 import re
 import struct
 import sys
+
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -25,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))     # appender root
 import fighter_files as FF  # noqa: E402
 import materials as MAT  # noqa: E402
 import matanim as MA  # noqa: E402
+import jointanim as JA  # noqa: E402
 import gbi_writer as GW  # noqa: E402
 import import_fighter as IF  # noqa: E402
 import export_fighter as EX  # noqa: E402
@@ -351,6 +355,69 @@ class ModelWriter:
         return targets, dls
 
 
+def write_joint_anims(f, work_dir, blob, remap):
+    """Each model's (stage layer's, item's) joint animation scripts from Blender's joint transforms: a joint's
+    original script where it's unchanged (same values every frame, same length / loop), a new
+    one where it was edited or newly animated, none where its animation was removed. ->
+    {anim_joints field (the model's field + 4): new array} for the models that changed
+    (others keep theirs)."""
+    tab = json.load(open(os.path.join(work_dir, 'costumes.json')))
+    blend = tab.get('joint_anims')
+    if blend is None:                                     # (an older blend_to_gltf.py: kept)
+        return {}
+    out = {}
+    for name, d in f.details.items():
+        joints, arr = d['joints'], d.get('anim')
+        orig = {j.index: f.char_int.get(arr + 4 * j.index) for j in joints} if arr is not None else {}
+        orig = {k: v for k, v in orig.items() if v is not None}
+        mine = blend.get(name) or {}
+        ptrs, changed = {}, False
+        for j in joints:
+            b, sc = mine.get(str(j.index)), orig.get(j.index)
+            if b is None:
+                if sc is not None:
+                    print(f'  {name} joint {j.index}: animation removed')
+                    changed = True
+                continue
+            prev, samples = None, {k: [] for k in JA.EDITABLE}
+            for m in b['matrices']:
+                prev = JA.decompose(np.array(m, float).reshape(4, 4), prev)
+                for k in JA.EDITABLE:
+                    samples[k].append(prev[k])
+            new = dict(frames=int(b['frames']), loop=bool(b['loop']), loop_start=int(b.get('loop_start', 0)),
+                       samples=samples)
+            if new['frames'] < 1 and sc is None:
+                continue
+            old = JA.play(f.char, f.char_int, sc, j) if sc is not None else None
+            if sc is not None and (JA.unchanged(old, new) or JA.uses_interp(f.char, f.char_int, sc)):
+                if not JA.unchanged(old, new):
+                    print(f'  warning: {name} joint {j.index}: moves along a path (TraI), which can\'t be '
+                          'edited: kept as it was')
+                ptrs[j.index] = remap[sc]
+                continue
+            try:
+                script, fixups, bad = JA.build(new, JA.rest_values(j), keep_tracks=old['tracks'] if old else ())
+            except ValueError as err:
+                raise SystemExit(f'{name} joint {j.index}: {err}')
+            changed = True
+            if script is None:
+                print(f'  {name} joint {j.index}: stays at its rest pose: no animation')
+                continue
+            o = blob.add(script, 4)
+            for fld, tgt in fixups:
+                blob.ptr(o + fld, o + tgt)
+            ptrs[j.index] = o
+            print(f'  {name} joint {j.index}: animation written ({new["frames"]} frames'
+                  + (', loops' if new['loop'] else '') + ')'
+                  + (f'; frame by frame: {", ".join(bad)}' if bad else ''))
+        if changed:
+            lst = blob.add(b'\0' * (4 * len(joints)), 4)
+            for ji, tgt in ptrs.items():
+                blob.ptr(lst + 4 * ji, tgt)
+            out[d['field'] + 4] = lst
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('folder', help='character or stage folder (its config.yaml lists the files)')
@@ -402,6 +469,9 @@ def main():
     objs = IF.load_gltf(path)
     writer = ModelWriter(f, textures, blob, {ms: remap[sc] for ms, sc in scripts.items()})
     targets, dls = writer.build('hi', objs, [r for r in (MOBJSUBS, MATANIM) if attr_off + r in ext])
+    # joint animations (anim_joints, attributes +8): Blender's (blend_to_gltf.py joint_anims)
+    for fld, tgt in write_joint_anims(f, a.work_dir, blob, remap).items():
+        targets[fld - attr_off] = tgt
 
     if base_head is None:
         new, head = standalone(blob)
@@ -414,7 +484,7 @@ def main():
     # ---- re-point the attributes (kept fields: remapped; model fields: the new data)
     for fld in into_model:
         rel = fld - attr_off
-        if rel in MODEL_FIELDS:
+        if rel in MODEL_FIELDS or rel in targets:
             if rel not in targets:
                 raise SystemExit(f'attributes +0x{rel:X} pointed into the model but the new model has no such data')
             tgt = targets[rel]

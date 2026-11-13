@@ -47,6 +47,29 @@ class StageProcessor:
             dirs_exist_ok=True
         )
 
+        # background.png in the stage folder: the stage's background image (background.bin's
+        # wallpaper sprite) is made from it, scaled to the wallpaper's size (300 x 220 for the
+        # vanilla-based ones). background.bin keeps its layout: only its pixels change.
+        from smashremix_extra.stage import wallpaper as _wallpaper
+        _ground_off = int(config['offsets']['header'][1], 16)
+        if os.path.isfile(f"{original_path}/background.png"):
+            from PIL import Image as _Image
+            _bg, _size, _resized = _wallpaper.write(
+                open(f"{output_path}/header.bin", "rb").read(),
+                open(f"{output_path}/background.bin", "rb").read(), _ground_off,
+                _Image.open(f"{original_path}/background.png"))
+            open(f"{output_path}/background.bin", "wb").write(_bg)
+            logger.info(f"{stage_folder}: background.bin's image from background.png"
+                        + (f" (scaled to {_size[0]} x {_size[1]})" if _resized else ""))
+        # ... and the image background.bin ends up with, to look at: build/.../background.bin.png
+        try:
+            _img = _wallpaper.read(open(f"{output_path}/header.bin", "rb").read(),
+                                   open(f"{output_path}/background.bin", "rb").read(), _ground_off)
+            if _img is not None:
+                _img.save(f"{output_path}/background.bin.png")
+        except Exception as _e:                       # never fail a build over a preview
+            logger.warning(f"{stage_folder}: background.bin.png skipped ({_e})")
+
         # config['collision']: rewrite stage.bin's map-collision geometry from a
         # declarative spec (see smashremix_extra/stage/collision.py). Runs on the
         # build copy before it is registered; header.bin is not affected.
@@ -157,9 +180,6 @@ class StageProcessor:
             f"constant STAGE_{stage_folder.upper().replace("/", "_")}(0x{header_file.id:X})"
         )
 
-        stage_name = config.get(
-            'name', stage_folder.upper().replace("/", " "))
-
         config["id"] = stage_folder.upper().replace("/", "_")
 
         if "/" in stage_folder:
@@ -170,13 +190,17 @@ class StageProcessor:
 
         self.stage_configs.append(config)
 
-        # Stage icon
-        # If stage icon image doesn't exist, generate one
+        # Stage icon: icon.bmp, else made from the stage's background image (its wallpaper
+        # sprite, scaled to 40 x 30, like the vanilla stages' icons)
         if not os.path.isfile(f"{output_path}/icon.bmp"):
-            create_stage_icon(
-                stage_name,
-                f"{output_path}/icon.bmp"
-            )
+            if not create_stage_icon(
+                    f"{output_path}/header.bin",
+                    f"{output_path}/background.bin",
+                    int(config['offsets']['header'][1], 16),
+                    f"{output_path}/icon.bmp"):
+                raise ValueError(
+                    f"{stage_folder}: no icon.bmp, and its background.bin has no RGBA16 wallpaper "
+                    "to make one from: add a 40 x 30 icon.bmp")
 
         # Append icon
         pixels, w, h = get_image_data(

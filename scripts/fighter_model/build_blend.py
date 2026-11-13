@@ -34,6 +34,8 @@ N = man['costumes']
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
+scene.render.fps = 60          # the game's frame rate; before the glTF import, which turns the
+                               # animations' seconds into frames at the scene's rate
 try:     # bone tails toward the child joints (the default keeps each joint's own axes: bones
          # sticking out sideways, with sphere shapes). Display only: import_fighter.py takes
          # the joints from the game file and the vertices as they are, not the bones' rest.
@@ -270,6 +272,34 @@ for a in [o for o in scene.objects if o.type == 'ARMATURE']:     # (stages: the 
 if IS_STAGE:
     for a in [o for o in scene.objects if o.type == 'ARMATURE']:
         a.name = 'Stage'                   # every layer's bones (L<n>_joint_NN), and the animation
+if man.get('animations'):                  # joint animations (stage layers: L<n>_joint_NN; items,
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))          # projectiles: joint_NN)
+    import n64_fighter_panel as _P  # noqa: E402
+
+    def _bone(L, j):
+        return f'{L}_joint_{int(j):02d}' if L != 'hi' else f'joint_{int(j):02d}'
+    for a in [o for o in scene.objects if o.type == 'ARMATURE']:
+        # each animated joint's own length and loop (Bone > N64 Joint Animation; the import
+        # writes its script from them)
+        for L, an in man['animations'].items():
+            for j, ji in (an.get('joint_info') or {}).items():
+                pb = a.pose.bones.get(_bone(L, j))
+                if pb is None:
+                    continue
+                pb['n64_anim_frames'] = int(ji['frames'])
+                pb['n64_anim_loop'] = bool(ji['loop'])
+                pb['n64_anim_loop_start'] = int(ji.get('loop_start', 0))
+                if ji.get('locked'):
+                    pb['n64_anim_locked'] = True        # (a translation path: kept as it is)
+        for fc in (_P.anim_fcurves(a) or []):             # keys on whole frames (the glTF's times
+            for kp in fc.keyframe_points:                  # come back as 499.99997...)
+                d_ = round(kp.co.x) - kp.co.x
+                kp.co.x += d_
+                kp.handle_left.x += d_
+                kp.handle_right.x += d_
+            fc.update()
+        _P.sync_loops()                                    # looping joints repeat (Cycles), each at its own length
+if IS_STAGE:
     # One type collection per MPGroundData slot (layer), holding its rooms' meshes.
     stage_types = {
         0: 'Background',

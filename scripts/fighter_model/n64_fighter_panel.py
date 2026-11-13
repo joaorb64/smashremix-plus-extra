@@ -1462,7 +1462,7 @@ def draw_anim(lay, m, context):
         if 'n64_anim_frames' in m.keys():
             col.prop(m, '["n64_anim_frames"]', text='Length (frames)')
         if 'n64_anim_loop' in m.keys():
-            col.prop(m, '["n64_anim_loop"]', text='Loop')
+            col.prop(m, 'n64ui_anim_loop', text='Loop')
         if m.get('n64_anim_loop') and 'n64_anim_loop_start' in m.keys():
             col.prop(m, '["n64_anim_loop_start"]', text='Loop Start')
         if 'n64_anim_frames' not in m.keys():
@@ -1570,8 +1570,8 @@ class N64_OT_anim_settings(bpy.types.Operator):
         last = max((kp.co.x for fcs in anim_animated(m).values() for fc in fcs for kp in fc.keyframe_points),
                    default=60)
         m['n64_anim_frames'] = max(1, int(round(last)))
-        m['n64_anim_loop'] = True
         m['n64_anim_loop_start'] = 0
+        _mat_loop_set(m, True)
         return {'FINISHED'}
 
 
@@ -1659,6 +1659,160 @@ class N64_OT_frame_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+# ---------------------------------------------------------------- joint animation (stages)
+# A stage layer's joints (bones L<n>_joint_NN) each play their own script: its length
+# (n64_anim_frames), loop (n64_anim_loop: the curves repeat, Cycles) and loop start, as pose
+# bone properties. blend_to_gltf.py samples the bone over that length; the import writes the
+# script (the original one where nothing changed).
+def _bone_fcurves(arm, name):
+    fcs = anim_fcurves(arm)
+    return [fc for fc in (fcs or []) if fc.data_path.startswith(f'pose.bones["{name}"]')]
+
+
+def _sync_cycles(fcurves, on):
+    for fc in fcurves:
+        has = [md for md in fc.modifiers if md.type == 'CYCLES']
+        if on and not has:
+            fc.modifiers.new('CYCLES')
+        elif not on:
+            for md in has:
+                fc.modifiers.remove(md)
+        fc.update()
+
+
+def _mat_loop_get(self):
+    return bool(self.get('n64_anim_loop', False))
+
+
+def _mat_loop_set(self, on):
+    self['n64_anim_loop'] = bool(on)
+    _sync_cycles([fc for fc in (anim_fcurves(self) or []) if fc.data_path[2:-2] in ANIM_INFO], on)
+
+
+def _bone_loop_get(self):
+    return bool(self.get('n64_anim_loop', False))
+
+
+def _bone_loop_set(self, on):
+    self['n64_anim_loop'] = bool(on)
+    _sync_cycles(_bone_fcurves(self.id_data, self.name), on)
+
+
+def sync_loops(*_):
+    """Every curve of a looping joint / material repeats (Cycles), a non-looping one's doesn't:
+    also curves keyed later (Insert Keyframe adds location / scale curves), so Blender always
+    plays what the game will. Runs after every change (depsgraph update) that touches an
+    action; cheap otherwise."""
+    for ob in bpy.data.objects:
+        if ob.type != 'ARMATURE' or ob.animation_data is None:
+            continue
+        fcs = anim_fcurves(ob)
+        if not fcs:
+            continue
+        for fc in fcs:
+            if not fc.data_path.startswith('pose.bones["'):
+                continue
+            pb = ob.pose.bones.get(fc.data_path[len('pose.bones["'):].split('"')[0])
+            if pb is None or 'n64_anim_loop' not in pb.keys():
+                continue
+            has = any(md.type == 'CYCLES' for md in fc.modifiers)
+            if bool(pb['n64_anim_loop']) != has:
+                _sync_cycles([fc], bool(pb['n64_anim_loop']))
+    for m in bpy.data.materials:
+        if 'n64_anim_loop' not in m.keys() or m.animation_data is None:
+            continue
+        for fc in (anim_fcurves(m) or []):
+            if fc.data_path[2:-2] in ANIM_INFO and any(md.type == 'CYCLES' for md in fc.modifiers) != bool(m['n64_anim_loop']):
+                _sync_cycles([fc], bool(m['n64_anim_loop']))
+
+
+def _sync_loops_on_update(scene, depsgraph):
+    if depsgraph.id_type_updated('ACTION') or depsgraph.id_type_updated('OBJECT'):
+        sync_loops()
+
+
+def _last_key(fcurves):
+    return max((kp.co.x for fc in fcurves for kp in fc.keyframe_points), default=0.0)
+
+
+class N64_OT_joint_anim_set(bpy.types.Operator):
+    bl_idname = 'n64.joint_anim_set'
+    bl_label = 'Game Animation From Keys'
+    bl_description = ('Make this joint\'s keyframes its game animation: its length = the last key, looping '
+                      '(change them below)')
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        pb = context.active_pose_bone
+        fcs = _bone_fcurves(pb.id_data, pb.name)
+        pb['n64_anim_frames'] = max(1, int(round(_last_key(fcs))))
+        pb['n64_anim_loop_start'] = 0
+        _bone_loop_set(pb, True)
+        return {'FINISHED'}
+
+
+class N64_OT_joint_anim_remove(bpy.types.Operator):
+    bl_idname = 'n64.joint_anim_remove'
+    bl_label = 'Remove Joint Animation'
+    bl_description = 'This joint stops animating in the game: its keyframes and settings are removed'
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        pb = context.active_pose_bone
+        fcs = anim_fcurves(pb.id_data)
+        for fc in _bone_fcurves(pb.id_data, pb.name):
+            fcs.remove(fc)
+        for k in ('n64_anim_frames', 'n64_anim_loop', 'n64_anim_loop_start', 'n64_anim_locked'):
+            if k in pb.keys():
+                del pb[k]
+        pb.matrix_basis.identity()
+        return {'FINISHED'}
+
+
+class N64_PT_joint(bpy.types.Panel):
+    bl_label = 'N64 Joint Animation'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'bone'
+
+    @classmethod
+    def poll(cls, context):
+        # stage layers' joints (L<n>_joint_NN), items' / projectiles' (joint_NN: their exports
+        # have the scene's n64_kind; a fighter's bones aren't animated this way)
+        import re
+        pb = context.active_pose_bone
+        if pb is None:
+            return False
+        if re.match(r'L\d+_joint_\d+$', pb.name):
+            return True
+        return bool(re.match(r'joint_\d+$', pb.name)) and bool(context.scene.get('n64_kind'))
+
+    def draw(self, context):
+        lay = self.layout
+        pb = context.active_pose_bone
+        fcs = _bone_fcurves(pb.id_data, pb.name)
+        lay.use_property_split = True
+        if 'n64_anim_frames' not in pb.keys():
+            if fcs:
+                lay.label(text='Keyframed, but not a game animation yet', icon='INFO')
+                lay.operator('n64.joint_anim_set', icon='ANIM')
+            else:
+                lay.label(text='Not animated: keyframe the bone (I), then set it here')
+            return
+        if pb.get('n64_anim_locked'):
+            lay.label(text='Moves along a path (TraI): kept as the original', icon='LOCKED')
+        col = lay.column()
+        col.prop(pb, '["n64_anim_frames"]', text='Length (frames)')
+        col.prop(pb, 'n64ui_anim_loop', text='Loop')
+        if pb.get('n64_anim_loop'):
+            col.prop(pb, '["n64_anim_loop_start"]', text='Loop Start')
+        if fcs and pb.get('n64_anim_loop') and int(round(_last_key(fcs))) != int(pb['n64_anim_frames']):
+            lay.label(text=f'Keys end at {_last_key(fcs):g}: Blender repeats them there, the game at '
+                           f'the length', icon='ERROR')
+        lay.label(text='60 frames per second; each joint loops on its own', icon='INFO')
+        lay.operator('n64.joint_anim_remove', icon='X')
+
+
 class N64_PT_scene(bpy.types.Panel):
     bl_label = 'N64 Fighter'
     bl_space_type = 'PROPERTIES'
@@ -1674,7 +1828,7 @@ class N64_PT_scene(bpy.types.Panel):
             lay.prop(context.scene, '["n64_light_angle"]', text='Light Angle')
 
 
-CLASSES = (N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
+CLASSES = (N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
            N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene)
 
 
@@ -1698,9 +1852,20 @@ def _collapse_outliner():
     return None
 
 
+LOOP_DESC = 'The animation starts over after its length (its curves repeat: Cycles); off: it stops there'
+
+
 def register():
     for name, prop in {**PROPS, **ADV_PROPS}.items():
         setattr(bpy.types.Material, name, prop)
+    bpy.types.Material.n64ui_anim_loop = bpy.props.BoolProperty(get=_mat_loop_get, set=_mat_loop_set,
+                                                                name='Loop', description=LOOP_DESC)
+    bpy.types.PoseBone.n64ui_anim_loop = bpy.props.BoolProperty(get=_bone_loop_get, set=_bone_loop_set,
+                                                                name='Loop', description=LOOP_DESC)
+    handlers = bpy.app.handlers.depsgraph_update_post
+    for h in [h for h in handlers if getattr(h, '__name__', '') == '_sync_loops_on_update']:
+        handlers.remove(h)                         # (registered again: the add-on + embedded copy)
+    handlers.append(_sync_loops_on_update)
     for name, prop in SCENE_PROPS.items():
         setattr(bpy.types.Scene, name, prop)
     for c in CLASSES:
@@ -1728,6 +1893,12 @@ def unregister():
     for name in SCENE_PROPS:
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
+    for t in (bpy.types.Material, bpy.types.PoseBone):
+        if hasattr(t, 'n64ui_anim_loop'):
+            delattr(t, 'n64ui_anim_loop')
+    handlers = bpy.app.handlers.depsgraph_update_post
+    for h in [h for h in handlers if getattr(h, '__name__', '') == '_sync_loops_on_update']:
+        handlers.remove(h)
 
 
 if __name__ == '__main__':

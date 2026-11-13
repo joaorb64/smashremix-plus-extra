@@ -33,6 +33,7 @@ sys.path.insert(0, APPENDER_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fighter_files as FF  # noqa: E402
 import matanim as MA  # noqa: E402
+import jointanim as JA  # noqa: E402
 from SSB import N64, SSBtbl  # noqa: E402
 
 FLOAT, USHORT, UINT = 5126, 5123, 5125
@@ -267,16 +268,18 @@ class Exporter:
                                  'inverseBindMatrices': self.add(ibm, FLOAT, 'MAT4')})
         self.joints = joints
 
-    def animation(self, name, anims, frames):
+    def animation(self, name, anims):
         """A glTF animation sampling joint animations every frame (60 per second): the
         joint's rest transform with its animated tracks (rotation x/y/z, translation,
         scale) replaced, as the game plays them (the scripts themselves are kept by the
-        import, unchanged)."""
-        n = max(len(seq) for _, _, seq in anims)
-        times = self.add(np.arange(n, dtype='<f4')[:, None] / 60.0, FLOAT, 'SCALAR', None, True)
+        import, unchanged). Each joint has its own length (a looping one: one cycle)."""
+        times_of = {}
         samplers, channels = [], []
         for node, j, seq in anims:
-            seq = list(seq) + [seq[-1]] * (n - len(seq))
+            n = len(seq)
+            if n not in times_of:
+                times_of[n] = self.add(np.arange(n, dtype='<f4')[:, None] / 60.0, FLOAT, 'SCALAR', None, True)
+            times = times_of[n]
             T, R, S = [], [], []
             r, t, sc = list(j.r), list(j.t), list(j.s)
             for v in seq:
@@ -287,14 +290,41 @@ class Exporter:
                 T.append(list(t))
                 R.append(quat_from_matrix(FF.rot_zyx(*r)))
                 S.append(list(sc))
+            rest = {'translation': list(j.t), 'rotation': quat_from_matrix(FF.rot_zyx(*j.r)), 'scale': list(j.s)}
             for path, vals, typ in (('translation', T, 'VEC3'), ('rotation', R, 'VEC4'), ('scale', S, 'VEC3')):
                 arr = np.array(vals, '<f4')
-                if np.allclose(arr, arr[0]):
-                    continue                              # not animated
+                if np.allclose(arr, arr[0]) and np.allclose(arr[0], np.array(rest[path], '<f4')):
+                    continue                              # not animated (it stays at the rest pose)
                 samplers.append({'input': times, 'output': self.add(arr, FLOAT, typ), 'interpolation': 'LINEAR'})
                 channels.append({'sampler': len(samplers) - 1, 'target': {'node': node, 'path': path}})
         if channels:
             self.gl.setdefault('animations', []).append({'name': name, 'samplers': samplers, 'channels': channels})
+
+    def joint_animations(self, name, d, anims):
+        """Joint animations (anim_joints scripts; stage layers, items, projectiles): each joint's
+        values per frame (-> anims, for the glTF), its length and loop (-> manifest). Blender
+        edits them; blend_to_gltf.py samples the bones back, the import writes the scripts (the
+        original ones where nothing changed). -> the longest one's frame count."""
+        f = self.f
+        info = {}
+        for j in d['joints']:
+            sc = f.char_int.get(d['anim'] + 4 * j.index) if d.get('anim') is not None else None
+            if sc is None:
+                continue
+            a = JA.play(f.char, f.char_int, sc, j)
+            info[j.index] = dict(frames=a['frames'], loop=a['loop'], loop_start=a['loop_start'],
+                                 tracks=a['tracks'], locked=JA.uses_interp(f.char, f.char_int, sc))
+            idx = {k: JA.NAMES.index(k) for k in JA.EDITABLE}
+            seq = [{idx[k]: a['samples'][k][n] for k in JA.EDITABLE} for n in range(a['frames'] + 1)]
+            anims.append((self.joint_node[j.index], j, seq))
+        if not info:
+            return 0
+        frames = max(v['frames'] for v in info.values()) + 1
+        self.manifest.setdefault('animations', {})[name] = dict(
+            joints=sorted(info), frames=frames, field=d['field'] + 4,
+            cycles={str(j): v['frames'] for j, v in info.items() if v['loop']},
+            joint_info={str(j): v for j, v in info.items()})
+        return frames
 
     def run_stage(self):
         """Stage geometry: one armature + meshes per layer (L<n>_joint_NN, L<n>_j<joint>)."""
@@ -323,21 +353,14 @@ class Exporter:
         for name, d in f.details.items():
             L = int(name[1:])
             self.skeleton(d['joints'], prefix=f'{name}_', name=f'Layer {L}')
-            per, frames = FF.layer_animation(f, d)
-            n_frames = max(n_frames, frames)
-            for j, seq in per.items():
-                if any(seq):
-                    anims.append((self.joint_node[j], d['joints'][j], seq))
-            if per:
-                self.manifest.setdefault('animations', {})[name] = dict(
-                    joints=sorted(per), frames=frames, field=d['field'] + 4)
+            n_frames = max(n_frames, self.joint_animations(name, d, anims))
             geo, _ = FF.decode_model(f, d['joints'], d['mobjs'], [(j.index, j.dl) for j in d['joints']],
                                      carry_state=True)
             self.mesh(name, geo, extra=dict(detail=name, layer=L), preserve_order=True)
             self.manifest.setdefault('mobj_order', {})[name] = {
                 str(j): self.mobj_order(lst) for j, lst in d['mobjs'].items() if lst}
         if anims:
-            self.animation('Stage', anims, n_frames)
+            self.animation('Stage', anims)
         self.gl['buffers'].append({'uri': 'model.bin', 'byteLength': len(self.blob)})
         open(os.path.join(self.out, 'model.bin'), 'wb').write(self.blob)
         json.dump(self.gl, open(os.path.join(self.out, 'model.gltf'), 'w'), indent=1)
@@ -697,6 +720,10 @@ class Exporter:
             self.mesh(detail, geo, extra=dict(detail=detail))
             self.manifest.setdefault('mobj_order', {})[detail] = {
                 str(j): self.mobj_order(lst) for j, lst in d['mobjs'].items() if lst}
+            if self.material_scripts() and d.get('anim') is not None:      # items / projectiles
+                anims = []
+                if self.joint_animations(detail, d, anims):
+                    self.animation('Animation', anims)
         for joint, variants in sorted(f.modelparts.items()):
             for v, pair in enumerate(variants):
                 for k, detail in enumerate(('hi', 'lo')):

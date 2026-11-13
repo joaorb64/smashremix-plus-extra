@@ -183,7 +183,87 @@ for img in bpy.data.images:
 export_dir = os.path.normpath(bpy.path.abspath(bpy.context.scene.get('fighter_export_dir', '//')))
 sc = bpy.context.scene
 lights = {k: str(sc[f'n64_{k}_color']) for k in ('light', 'shadow') if f'n64_{k}_color' in sc.keys()}
-json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims),
+
+
+def joint_anims():
+    """Stages: each animated joint's local transform per frame (bones L<n>_joint_NN that have
+    a game animation: n64_anim_frames, or keyframes), over its own length -> {layer: {joint:
+    dict(frames, loop, loop_start, locked, matrices: [4x4 row-major per frame 0..frames])}}, in
+    the game's space (glTF's, Y up). import_stage.py makes the scripts from them."""
+    from mathutils import Matrix, Quaternion
+    gl_path = os.path.join(export_dir, 'model.gltf')
+    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and
+                any(re.match(r'(L\d+_)?joint_\d+$', b.name) for b in o.data.bones)), None)
+    if arm is None or not os.path.exists(gl_path) or not bpy.context.scene.get('n64_kind'):
+        return None
+    gl = json.load(open(gl_path))
+    nodes = gl['nodes']
+    parent = {c: i for i, n in enumerate(nodes) for c in n.get('children', [])}
+    by_name = {n.get('name'): i for i, n in enumerate(nodes)}
+
+    def local(n):
+        t = n.get('translation', [0, 0, 0])
+        q = n.get('rotation', [0, 0, 0, 1])
+        sc = n.get('scale', [1, 1, 1])
+        return Matrix.Translation(t) @ Quaternion((q[3], q[0], q[1], q[2])).to_matrix().to_4x4() @ \
+            Matrix.Diagonal((*sc, 1.0))
+    world = {}
+
+    def node_world(i):
+        if i not in world:
+            world[i] = (node_world(parent[i]) @ local(nodes[i])) if i in parent else local(nodes[i])
+        return world[i]
+    A = Matrix(((1, 0, 0, 0), (0, 0, -1, 0), (0, 1, 0, 0), (0, 0, 0, 1)))     # glTF (Y up) -> Blender
+    Ai = A.inverted()
+    corr = {}                      # per bone: its rest axes vs the joint's (the importer's bone axes): a
+    for b in arm.data.bones:       # rotation only (bones have no rest scale: a joint's is in its pose)
+        if b.name in by_name:
+            j_rest = (A @ node_world(by_name[b.name]) @ Ai).to_3x3().normalized()
+            corr[b.name] = (j_rest.inverted() @ b.matrix_local.to_3x3().normalized()).to_4x4()
+    fcs = PANEL.anim_fcurves(arm) or []
+    keyed = {m.group(1) for fc in fcs for m in [re.match(r'pose\.bones\["([^"]+)"\]', fc.data_path)] if m}
+    todo = {}
+    for pb in arm.pose.bones:
+        m = re.match(r'(?:(L\d+)_)?joint_(\d+)$', pb.name)          # (items, projectiles: joint_NN)
+        if not m or pb.name not in corr or ('n64_anim_frames' not in pb.keys() and pb.name not in keyed):
+            continue
+        last = max((kp.co.x for fc in fcs if fc.data_path.startswith(f'pose.bones["{pb.name}"]')
+                    for kp in fc.keyframe_points), default=0)
+        frames = int(pb.get('n64_anim_frames', round(last)))
+        loop = bool(pb.get('n64_anim_loop', any(md.type == 'CYCLES' for fc in fcs
+                                                if fc.data_path.startswith(f'pose.bones["{pb.name}"]')
+                                                for md in fc.modifiers)))
+        todo[pb.name] = dict(layer=m.group(1) or 'hi', joint=int(m.group(2)), frames=frames, loop=loop,
+                             loop_start=int(pb.get('n64_anim_loop_start', 0)) if loop else 0,
+                             locked=bool(pb.get('n64_anim_locked', False)), matrices=[])
+    if not todo:
+        return {}
+    sc = bpy.context.scene
+    keep_frame = sc.frame_current
+    for f in range(max(t['frames'] for t in todo.values()) + 1):
+        sc.frame_set(f)
+        for name, t in todo.items():
+            if f > t['frames']:
+                continue
+            pb = arm.pose.bones[name]
+
+            def game(pbone):                 # the joint's world matrix in glTF space this frame
+                return Ai @ pbone.matrix @ corr[pbone.name].inverted() @ A
+            N = game(pb)
+            pi = parent.get(by_name[name])
+            pname = nodes[pi].get('name') if pi is not None else None
+            if pname in arm.pose.bones and pname in corr:
+                N = game(arm.pose.bones[pname]).inverted() @ N
+            t['matrices'].append([v for row in N for v in row])
+    sc.frame_set(keep_frame)
+    out = {}
+    for t in todo.values():
+        out.setdefault(t.pop('layer'), {})[str(t.pop('joint'))] = t
+    return out
+
+
+json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims,
+               joint_anims=joint_anims()),
           open(os.path.join(OUT, 'costumes.json'), 'w'), indent=1)
 
 # the N64 view setup (unlit = emission x vertex color node) only exists for looking at it

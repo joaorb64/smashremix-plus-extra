@@ -261,7 +261,9 @@ def load_object(attr_path, model_path=None, attr_int_head=None, attr_ext_head=No
             while lst is not None and lst + 4 * len(items) in char_int:
                 items.append(char_int[lst + 4 * len(items)])
             mobjs[j] = items
-    f.details['hi'] = dict(dobjdesc=dobjdesc, joints=joints, mobjs=mobjs, matanim=ma_arr)
+    f.details['hi'] = dict(dobjdesc=dobjdesc, joints=joints, mobjs=mobjs, matanim=ma_arr,
+                           anim=ptrs.get(attr_offset + 8) if dobjdesc is not None else None,
+                           field=attr_offset + 4)        # (field + 4: anim_joints, like a stage layer's)
     f.object = dict(attr=attr_offset, single_file=model_path is None, dl_only=dobjdesc is None)
     return f
 
@@ -458,24 +460,6 @@ def simulate_anim(d, ptrs, script, frames):
                     vals[i] = _anim_value(a)
         out.append(vals)
     return out, loop_at
-
-
-def layer_animation(f, d, frames=None, max_frames=1800):
-    """A stage layer's (or model's) joint animations -> ({joint: [{track: value}] per frame},
-    frame count): played until every looping / ending script has come round once."""
-    if d.get('anim') is None:
-        return {}, 0
-    scripts = {j.index: f.char_int.get(d['anim'] + 4 * j.index) for j in d['joints']}
-    scripts = {j: s for j, s in scripts.items() if s is not None}
-    if not scripts:
-        return {}, 0
-    if frames is None:
-        frames = 1
-        for s in scripts.values():
-            _, loop = simulate_anim(f.char, f.char_int, s, max_frames)
-            frames = max(frames, (loop or max_frames) + 1)
-        frames = min(frames, max_frames)
-    return {j: simulate_anim(f.char, f.char_int, s, frames)[0] for j, s in scripts.items()}, frames
 
 
 def rgba16(v):

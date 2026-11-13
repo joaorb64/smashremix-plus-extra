@@ -99,10 +99,13 @@ viewport can't composite view layers: it shows every layer depth-tested together
 `ViewLayer` view layer, for editing; it isn't rendered).
 
 Animations (the layers' anim_joints scripts, decomp objanim.c) are played and sampled
-every frame into the glTF animation `Stage`: the `Stage` armature's action, 60 fps, the
-timeline covering one loop (capped at 30 s for scripts the stage code drives, e.g.
-moving platforms). They're for viewing: the import keeps the original scripts as they
-are. Vanilla stages are available by name too (`DREAMLAND`, `CASTLE`, `SECTOR_Z`...:
+every frame into the glTF animation `Stage`: the `Stage` armature's action, 60 fps. A
+looping joint has one cycle of keys with a Cycles modifier, at its own length (joints of
+one stage loop independently, e.g. 300 and 500 frames); a script that never loops or ends
+(the stage code drives it, e.g. moving platforms) is sampled for 30 s. Material
+animations loop the same way (cycles up to 16384 frames are found). Both are editable:
+see [Joint animations](#joint-animations) and [Material animations](#material-animations).
+Vanilla stages are available by name too (`DREAMLAND`, `CASTLE`, `SECTOR_Z`...:
 `VANILLA_STAGES` in export_fighter.py).
 
 To export a stage directly from a Smash Remix ROM, give its name to `--stage`:
@@ -114,6 +117,34 @@ Use a stage name such as `BATTLEFIELD`, `DEKU`, or `MUTE` (`File.asm`'s
 `--help` lists them all), or the stage header file's hexadecimal ID (the decomp calls
 it the Map file). The ROM supplies the stage header and its referenced geometry files.
 Without `--rom`, `--stage` (with no name) means the folder given is a stage folder.
+
+### Joint animations
+
+Each joint of a stage layer (bone `L<n>_joint_NN`), item or projectile (`joint_NN`: the
+attributes' anim_joints, +0x8, same format) plays its own script, with its own length and
+loop. Edit them like any Blender animation: pose the bone and keyframe it (the
+`Stage` armature's action, 60 frames per second). **Bone > N64 Joint Animation** sets, per
+joint:
+
+- **Length** (`n64_anim_frames`): the frame it ends or starts over.
+- **Loop** (`n64_anim_loop`): it starts over after its length, or stops there and holds its
+  last pose. The bone's curves get / lose Cycles modifiers to match (kept in sync on every
+  change, also for curves keyed later, e.g. Insert Keyframe adding location / scale), so
+  Blender plays it like the game. Keys at frame 0 and at the length make Blender's cycle match (the panel
+  warns otherwise).
+- **Loop Start**: the frame it starts over from.
+- **Game Animation From Keys** (a bone keyframed that had no animation): its length = the
+  last key, looping. **Remove Joint Animation**: the joint no longer animates.
+
+The import (`blend_to_gltf.py` -> `import_stage.py` / `import_object.py`) samples each animated bone over its
+length, turns the pose back into the joint's local transform (rotation x / y / z as the
+game composes it, translation, scale; mirrored, flattened and hidden joints included) and
+writes its script: the original one, byte for byte, when every frame and the length / loop
+are unchanged; a new one otherwise, as keyframes (linear segments and holds that give every
+frame exactly; checked by playing the script) - so any Blender curve works. A joint that
+moves along a translation path (TraI) keeps its original script (warned if edited).
+Unchanged layers keep their anim_joints array; a layer that gains an animation gets one
+(its header pointer added).
 
 ### Material animations
 
@@ -401,7 +432,8 @@ collision tools (`stage_collision.py`) read the rebuilt file the same way.
 
 - electric skeleton: attr->skeleton[id][joint] {dl, flags}, ids 1..3.
 - items / projectiles: ITAttributes / WPAttributes +0x0 data (DObjDesc array or a
-  display list), +0x4 p_mobjsubs, +0x8 anim_joints (kept), +0xC p_matanim_joints.
+  display list), +0x4 p_mobjsubs, +0x8 anim_joints (joint animations: editable), +0xC
+  p_matanim_joints.
 - vanilla display-list features: tile upper-left (G_SETTILESIZE, subtracted from
   the UVs) and G_TEXTURE scale; tiles wider than their texture with mirror + clamp
   (clamped at the extent first, then mirrored by the mask: manifest wrap

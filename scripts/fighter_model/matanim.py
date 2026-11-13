@@ -240,11 +240,13 @@ def simulate(d, ptrs, script, frames, stop_at_loop=True):
     return out, loop
 
 
-def play(d, ptrs, script, static, max_frames=1800):
+def play(d, ptrs, script, static, max_frames=1800, max_loop=16384):
     """A script's animation -> dict(frames, loop, loop_start, samples={track: [value per
     frame 0..frames]}) where, when it loops, frame `frames` is the cycle's end (= its
-    start again: frame loop_start); otherwise the values hold after `frames`."""
-    out, loop = simulate(d, ptrs, script, 2 * max_frames + 2)       # (a cycle found: one more, to check)
+    start again: frame loop_start); otherwise the values hold after `frames` (at most
+    max_frames: a script that neither ends nor loops). Cycles up to max_loop frames are
+    found (e.g. a slow scroll: 4096 frames)."""
+    out, loop = simulate(d, ptrs, script, 2 * max_loop + 2)         # (a cycle found: one more, to check)
     tracks = sorted({k for fr in out for k in fr}, key=lambda k: (TRACKS + COLORS).index(k))
     full = {}                                  # every frame played: a track holds its value until set
     for k in tracks:
@@ -271,13 +273,15 @@ def play(d, ptrs, script, static, max_frames=1800):
 
 
 # ---------------------------------------------------------------- keyframes
-def _close(a, b, track, color_tol=1):
+def _close(a, b, track, color_tol=1, tol=None):
+    if tol is not None:                         # (a caller's own tolerance: tol(value) -> max difference)
+        return abs(a - b) <= tol(b)
     if track in COLORS:
         return all(abs(((a >> sh) & 255) - ((b >> sh) & 255)) <= color_tol for sh in (24, 16, 8, 0))
     return abs(a - b) <= 1e-4 * max(1.0, abs(a), abs(b))
 
 
-def _linear_fits(seq, k, m, track):
+def _linear_fits(seq, k, m, track, tol=None):
     if track in COLORS:
         D = m - k
         for x in range(1, D):
@@ -288,12 +292,12 @@ def _linear_fits(seq, k, m, track):
                 return False
         return True
     for x in range(k + 1, m):
-        if not _close(seq[x], seq[k] + (seq[m] - seq[k]) * (x - k) / (m - k), track):
+        if not _close(seq[x], seq[k] + (seq[m] - seq[k]) * (x - k) / (m - k), track, tol=tol):
             return False
     return True
 
 
-def to_keys(seq, track):
+def to_keys(seq, track, tol=None):
     """Per-frame values (frames 0..n) -> [[frame, value, 'CONSTANT' | 'LINEAR'], ...] that
     give the same value at every frame: a held value is one CONSTANT key (stepping at the
     next key), a steady change one LINEAR segment. Indices are always CONSTANT."""
@@ -301,13 +305,13 @@ def to_keys(seq, track):
     keys, k = [], 0
     while k < n:
         m = k + 1
-        while m <= n and (seq[m] == seq[k] if track in COLORS else _close(seq[m], seq[k], track)):
+        while m <= n and (seq[m] == seq[k] if track in COLORS else _close(seq[m], seq[k], track, tol=tol)):
             m += 1
         if m > k + 1 or track in DISCRETE or m > n:          # held (then it steps at m)
             keys.append([k, seq[k], 'CONSTANT'])
             k = min(m, n)
             continue
-        while m + 1 <= n and _linear_fits(seq, k, m + 1, track):
+        while m + 1 <= n and _linear_fits(seq, k, m + 1, track, tol=tol):
             m += 1
         keys.append([k, seq[k], 'LINEAR' if m > k + 1 else 'CONSTANT'])
         k = m
@@ -338,7 +342,7 @@ def _cmd(op, flags, payload):
     return struct.pack('>I', (op << 25) | (flags << 15) | int(payload))
 
 
-def encode(tracks, frames, loop, loop_start=0):
+def encode(tracks, frames, loop, loop_start=0, names=TRACKS):
     """Keyframes -> a material script: (bytes, [(pointer field offset, target offset)]).
     tracks: {track: [(frame, value, interp, slope_in, slope_out), ...]} sorted by frame
     (interp: 'CONSTANT' / 'LINEAR' / 'BEZIER', slopes per frame for BEZIER; color values are
@@ -407,9 +411,9 @@ def encode(tracks, frames, loop, loop_start=0):
         for order, op, payload, track, vals in events[frame]:
             groups.setdefault((order, op, payload), []).append((track, vals))
         for (order, op, payload), items in sorted(groups.items()):
-            names = COLORS if op in (18, 19, 20, 21) else TRACKS
-            items.sort(key=lambda x: names.index(x[0]))
-            flags = sum(1 << names.index(tr) for tr, _ in items)
+            names_ = COLORS if op in (18, 19, 20, 21) else names
+            items.sort(key=lambda x: names_.index(x[0]))
+            flags = sum(1 << names_.index(tr) for tr, _ in items)
             out += _cmd(op, flags, payload)
             for tr, vals in items:
                 for v in vals:
