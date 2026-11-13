@@ -534,6 +534,7 @@ for screen in bpy.data.screens:
             space.shading.type = 'MATERIAL'                    # Material Preview: shows the N64 setup
             space.shading.studiolight_intensity = 0.6          # (the preview light is much brighter than the game's)
             space.shading.studiolight_background_alpha = 0.0
+            space.overlay.show_stats = True                    # (Overlays > Statistics: triangle counts)
             r3d = space.region_3d
             if r3d:
                 r3d.view_location = (0, 0, height / 2)
