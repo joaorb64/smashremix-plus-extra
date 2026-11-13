@@ -24,6 +24,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))     # appender root
 import fighter_files as FF  # noqa: E402
 import materials as MAT  # noqa: E402
+import matanim as MA  # noqa: E402
 import gbi_writer as GW  # noqa: E402
 import import_fighter as IF  # noqa: E402
 import export_fighter as EX  # noqa: E402
@@ -136,18 +137,22 @@ class ModelWriter:
         f, t = self.f, self.textures.get(name)
         imgs = tuple(self.store(x) for x in t.images) if t.image_source == 'list' else ()
         pals = tuple(self.store(p) for p in t.palettes) if t.palette_source == 'list' else ()
-        src = t.mobj if t.mobj is not None else self.template_ms
-        if src is None:
-            raise SystemExit(f'{name}: needs an MObj, and the original model has none to copy')
-        ms = bytearray(f.char[src:src + IF.MOBJSUB_SIZE])
+        # a new material: a copy of one of the model's MObjs, or (animated, or none to copy) a
+        # clean one: no offset, scale 1, white colors
+        src = t.mobj if t.mobj is not None else (self.template_ms if not t.animated else None)
+        ms = bytearray(f.char[src:src + IF.MOBJSUB_SIZE]) if src is not None else self.clean_mobjsub(t)
         struct.pack_into('>I', ms, 0x04, 0)
         struct.pack_into('>I', ms, 0x2C, 0)
         struct.pack_into('>H', ms, 0x30, t.mobj_flags())
         for k, v in ((t.costume_colors or [{}])[0]).items():
             struct.pack_into('>I', ms, MAT.COLOR_FIELDS[k], int(v, 16))
-        if t.new and not t.untextured:
+        if (t.new or src is None) and not t.untextured:
+            # (the MObj's image SETTIMG feeds the DL's LOADBLOCK: 16b unless 32b; its TLUT load
+            # (flags 0x05) reads 16 colors then, 256 only for an 8b CI image loaded inline)
             struct.pack_into('>BB', ms, 0x02, t.fmt, 3 if t.siz == 3 else (1 if t.siz == 1 and not imgs else 2))
             struct.pack_into('>BB', ms, 0x32, t.fmt, t.siz)
+        anim = (self.textures.anims or {}).get(name) if self.textures.anims is not None else None
+        script = self.anim_script(name, t, ms, anim) if anim is not None else None
         key = (bytes(ms), imgs, pals)
         if key not in self.mobj_at:
             o = self.blob.add(bytes(ms), 8)
@@ -157,12 +162,101 @@ class ModelWriter:
                 self.blob.ptr(o + 0x2C, self.ptr_list(pals))
             self.mobj_at[key] = o
         self.mobj_of[name] = self.mobj_at[key]
-        if t.mobj in self.kept_scripts:                 # its original material animation
+        if anim is not None:                            # (Blender's material animation)
+            self.script_of[name] = script
+        elif t.mobj in self.kept_scripts:               # its original material animation
             self.script_of[name] = self.kept_scripts[t.mobj]
         else:
             sc = t.script(1)
             self.script_of[name] = self.store(sc, 4) if sc else None
         return self.mobj_of[name]
+
+    @staticmethod
+    def clean_mobjsub(t):
+        ms = bytearray(IF.MOBJSUB_SIZE)
+        tw, th = int(getattr(t, 'tile_w', 0) or t.w or 32), int(getattr(t, 'tile_h', 0) or t.h or 32)
+        struct.pack_into('>BB', ms, 0x02, t.fmt, t.siz)
+        struct.pack_into('>HHHH', ms, 0x08, 32, 0, tw, th)          # (unk08 32: texture scale 1)
+        struct.pack_into('>ffffff', ms, 0x14, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0)
+        struct.pack_into('>BBHHHH', ms, 0x32, t.fmt, t.siz, 0, 0, tw, th)
+        for off in (0x50, 0x58, 0x60):                                # prim, env, light: white
+            struct.pack_into('>I', ms, off, 0xFFFFFFFF)
+        struct.pack_into('>I', ms, 0x64, 0x808080FF)
+        return ms
+
+    def anim_script(self, name, t, ms, anim):
+        """Material animation from Blender (blend_to_gltf.py anim_info): the MObjSub gets the
+        starting values and the flags its tracks need (ms, edited in place); -> the script's
+        offset: the original's when its keyframes weren't changed, a new one otherwise, None
+        without animation."""
+        entry = (self.textures.manifest.get('materials') or {}).get(name) or {}
+        orig_static = entry.get('mobj_static') or {}
+        static, tracks = dict(anim.get('static') or {}), dict(anim.get('tracks') or {})
+        samples = dict(anim.get('samples') or {})
+        frames, loop, loop_start = int(anim.get('frames') or 0), bool(anim.get('loop')), int(anim.get('loop_start') or 0)
+        flags = struct.unpack_from('>H', ms, 0x30)[0]
+        old_flags = flags
+        for track, v in static.items():                 # starting values (the MObjSub's fields)
+            if track in MA.FIELD:
+                if t.mobj is None or abs(v - orig_static.get(track, v + 1)) > 1e-6:
+                    struct.pack_into('>f', ms, MA.FIELD[track], v)
+            elif track == 'lfrac':
+                ms[0x54] = max(0, min(255, round(v * 255)))
+            elif track in MA.COLOR_FIELD:
+                struct.pack_into('>I', ms, MA.COLOR_FIELD[track], int(v))
+            elif v:                                     # an index: the MObj starts at 0, a script sets it
+                tracks[track] = [[0, v, 'CONSTANT', 0.0, 0.0]]
+                samples[track] = [v] * (frames + 1)
+            flags |= MA.FLAG_OF[track] if track not in ('tex', 'pal') else 0
+        for track in tracks:
+            flags |= MA.FLAG_OF[track] if track not in ('tex', 'pal') else 0
+        for bit, size_at in ((0x20, 0x0C), (0x40, 0x38)):
+            if flags & bit and not old_flags & bit:     # the MObj now sets the tile: its size
+                if bit == 0x20:
+                    struct.pack_into('>H', ms, 0x0A, 0)
+                    struct.pack_into('>i', ms, 0x10, 0)
+                    for k, v in (('trau', 0.0), ('trav', 0.0), ('scau', 1.0), ('scav', 1.0)):
+                        if k not in static and k not in tracks:
+                            struct.pack_into('>f', ms, MA.FIELD[k], v)
+                struct.pack_into('>HH', ms, size_at, int(getattr(t, 'tile_w', 0) or t.w or 32),
+                                 int(getattr(t, 'tile_h', 0) or t.h or 32))
+        struct.pack_into('>H', ms, 0x30, flags)
+        if not tracks:
+            if entry.get('anim'):
+                print(f'  {name}: material animation removed')
+            return None
+        man = entry.get('anim')
+        if man and t.mobj in self.kept_scripts and self._unchanged(man, tracks, samples, frames, loop, loop_start):
+            return self.kept_scripts[t.mobj]
+        if frames < 1:
+            raise SystemExit(f'{name}: material animation of {frames} frames (set its Length)')
+        script, ptrs, bad = MA.build(tracks, samples, frames, loop, loop_start)
+        key = (script, tuple(ptrs))
+        if key not in self.data_at:
+            o = self.blob.add(script, 4)
+            for fld, tgt in ptrs:
+                self.blob.ptr(o + fld, o + tgt)
+            self.data_at[key] = o
+        print(f'  {name}: material animation written ({", ".join(MA.PROP[k] for k in tracks)}; {frames} frames'
+              + (', loops' if loop else '') + ')'
+              + (f'; written frame by frame: {", ".join(MA.PROP[k] for k in bad)}' if bad else ''))
+        return self.data_at[key]
+
+    @staticmethod
+    def _unchanged(man, tracks, samples, frames, loop, loop_start):
+        """Blender's animation = the exported one (same values every frame, same loop)?"""
+        if (int(man['frames']), bool(man['loop']), int(man.get('loop_start', 0))) != (frames, loop, loop_start):
+            return False
+        if set(man['keys']) != set(tracks):
+            return False
+        for k, keys in man['keys'].items():
+            seq = samples.get(k) or []
+            if len(seq) != frames + 1:
+                return False
+            for n in range(frames + 1):
+                if not MA._close(MA.eval_keys(keys, n, k), seq[n], k):
+                    return False
+        return True
 
     def build(self, detail, objs, need=()):
         """f.details[detail]'s model from objs -> ({DATA / MOBJSUBS / MATANIM: new target}, dls):
@@ -307,7 +401,7 @@ def main():
         raise SystemExit(f'{path}: not found (run blend_to_gltf.py on the .blend first)')
     objs = IF.load_gltf(path)
     writer = ModelWriter(f, textures, blob, {ms: remap[sc] for ms, sc in scripts.items()})
-    targets, dls = writer.build('hi', objs)
+    targets, dls = writer.build('hi', objs, [r for r in (MOBJSUBS, MATANIM) if attr_off + r in ext])
 
     if base_head is None:
         new, head = standalone(blob)

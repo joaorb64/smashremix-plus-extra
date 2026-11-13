@@ -703,6 +703,10 @@ def decode_model(f, joints, mobjs, dls, cache=None, carry_state=False):
                         i = (w1 & 0xFFFFFF) // 8
                         lst = mobjs.get(j, []) if isinstance(mobjs, dict) else mobjs
                         st['mobj'] = lst[i] if i < len(lst) else None
+                        if carry_state and st['mobj'] is not None and u16(char, st['mobj'] + 0x30) & 0x20:
+                            # (stages, items) the MObj sets the tile's position itself (its offset,
+                            # maybe animated: matanim.py): the UVs are the vertices' own
+                            st['ul'] = (0.0, 0.0)
                     elif o + 4 in ptrs and depth < 8:
                         run(ptrs[o + 4], depth + 1)
                         if (w0 >> 16) & 0xFF == 1:               # branch

@@ -25,6 +25,7 @@ import numpy as np
 from PIL import Image
 
 import fighter_files as FF
+import matanim as MA
 
 FORMATS = {'RGBA16': (0, 2), 'RGBA32': (0, 3), 'CI4': (2, 0), 'CI8': (2, 1), 'IA4': (3, 0), 'IA8': (3, 1),
            'IA16': (3, 2), 'I4': (4, 0), 'I8': (4, 1)}
@@ -152,6 +153,12 @@ def first_seen(rgba, n):
     return rank[inv.ravel()], pal, reduced
 
 
+def load_png(path):
+    if not path or not os.path.exists(path):
+        return None
+    return np.asarray(Image.open(path).convert('RGBA'))
+
+
 def resize(im, w, h):
     im = np.asarray(im, np.uint8)
     if im.shape[:2] == (h, w):
@@ -169,6 +176,14 @@ class Material:
         e = entry or {}
         self.warnings = []
         self.new = not entry
+        # material animation (stages, items; matanim.py): the tracks it animates, its image list
+        # ('N64 Frame <i>' nodes in Blender)
+        self.animated = set(props.get('n64_animated') or [])
+        self.frames = [im for im in (load_png(p) for p in props.get('n64_frames') or []) if im is not None]
+        # its palette list ('N64 Palette <i>' nodes: the texture drawn with palette i)
+        self.pal_frames = [im for im in (load_png(p) for p in props.get('n64_palettes') or []) if im is not None]
+        if not entry and self.frames and len(self.frames) > 1:
+            costume_imgs = [self.frames[0]] + list(costume_imgs[1:])
         self.untextured = bool(e.get('untextured')) or (not entry and all(
             im is None or (im.shape[:2] == (4, 4) and (im == im[0, 0]).all()) for im in costume_imgs))
         self.costume_colors = None
@@ -223,7 +238,17 @@ class Material:
             self.new = True
         self.orig_transparent = False
         if self.new:
-            self._build_new(costume_imgs, costumes, n_pal)
+            if len(self.frames) > 1:
+                self._build_frames(costumes, n_pal)
+            else:
+                self._build_new(costume_imgs, costumes, n_pal)
+            if self.ci and len(self.pal_frames) > 1 and self.images and self.palettes:
+                # more palettes: recolors of its image (palette 0's drawing)
+                ref = unpack(self.unpad(self.images[0]), BPP[self.siz], w * h)
+                pal0 = decode_pal(self.palettes[0])
+                for p in range(len(self.palettes), len(self.pal_frames)):
+                    self.palettes.append(encode_pal(self._palette_from(resize(self.pal_frames[p], w, h), ref, pal0,
+                                                                       f'palette {p}')))
             self._finish()
             return
 
@@ -283,6 +308,19 @@ class Material:
                         pals[pi][k] = col
             else:                                                      # repainted: image ti, palette pi's colors
                 imgs[ti] = self._image_from(im, imgs[ti], pals[pi], f'costume {c}')
+        # palettes added in Blender (N64 Palette nodes past the original's entries): recolors
+        # of the reference image
+        for p in range(len(pals), len(self.pal_frames) if self.ci else 0):
+            pals.append(self._palette_from(resize(self.pal_frames[p], w, h), imgs[ref_i], pals[ref_p],
+                                           f'palette {p}'))
+            pal_raw.append(b'')
+            self.warnings.append(f'palette {p} added to the list')
+        # images added to the list in Blender (N64 Frame nodes past the original's entries)
+        for i in range(len(imgs), len(self.frames)):
+            im = resize(self.frames[i], w, h)
+            imgs.append(nearest_index(im, pals[ref_p])[0] if self.ci else im)
+            img_raw.append(b'')
+            self.warnings.append(f'image {i} added to the list')
         # encode (unchanged entries keep their exact bytes)
         if self.ci:
             self.images = [self.pad(pack(ix, bpp)) for ix in imgs]
@@ -291,9 +329,29 @@ class Material:
             self.images = []
             for r, im in zip(img_raw, imgs):
                 enc = self.pad(encode_direct(im, self.fmt, self.siz))
-                self.images.append(r if enc == self.pad(encode_direct(self._decode(r), self.fmt, self.siz)) else enc)
+                self.images.append(r if r and enc == self.pad(encode_direct(self._decode(r), self.fmt, self.siz))
+                                   else enc)
             self.palettes = []
         self._finish()
+
+    def _build_frames(self, costumes, n_pal):
+        """A new material with an image list (N64 Frame nodes, for a material animation):
+        one image per frame, CI formats sharing one palette."""
+        frames = [resize(im, self.w, self.h) for im in self.frames]
+        if self.ci:
+            ix, pal, reduced = first_seen(np.concatenate(frames, 0), n_pal)
+            if reduced:
+                self.warnings.append(f'its images have more than {n_pal} colors together, reduced')
+            n = self.w * self.h
+            self.images = [self.pad(pack(ix[k * n:(k + 1) * n], BPP[self.siz])) for k in range(len(frames))]
+            self.palettes = [encode_pal(pal)]
+        else:
+            self.images = [self.pad(encode_direct(im, self.fmt, self.siz)) for im in frames]
+            self.palettes = []
+        self.costume_map = [[0, 0]] * costumes
+        self.image_source = 'list'
+        self.palette_source = 'inline' if self.ci else None
+        self.flags = 0x01
 
     def pad(self, packed):
         """Tightly packed rows -> rows of self.stride bytes (64-bit aligned, like the game's)."""
@@ -421,14 +479,14 @@ class Material:
         pal_ids = {m[1] for m in self.costume_map}
         self.tex_varies = len(tex_ids) > 1
         self.pal_varies = self.ci and len(pal_ids) > 1
-        if self.tex_varies:                                            # per-costume images need the MObj list
-            self.image_source = 'list'
-        if self.siz == 1 and self.ci and self.image_source == 'list':
+        if self.tex_varies or 'tex' in self.animated:                  # per-costume / animated images need
+            self.image_source = 'list'                                 # the MObj's list
+        if self.siz == 1 and self.ci and self.image_source == 'list' and 'tex' not in self.animated:
             # the MObj's own TLUT load is 16 colors when its image SETTIMG is 16b (needed by the load)
             if self.tex_varies:
                 raise SystemExit(f'{self.name}: CI8 images can\'t change per costume (only palettes); use CI4')
             self.image_source = 'inline'
-        if self.pal_varies:
+        if self.pal_varies or (self.ci and 'pal' in self.animated):
             self.palette_source = 'list'
         self.transparent = self._uses_transparency(self.images, self.palettes)
         binary_alpha = self.ci or (self.fmt, self.siz) in ((0, 2), (3, 0))
@@ -499,6 +557,8 @@ class Material:
 
     # ---------------------------------------------------------------- drawing
     def uses_mobj(self):
+        if self.animated:                       # a material animation plays on the MObj
+            return True
         if self.untextured:
             return self.needs_mobj
         return self.image_source == 'list' or self.palette_source == 'list' or \
@@ -512,13 +572,15 @@ class Material:
         f = self.flags
         f = (f | 0x01) if self.image_source == 'list' else (f & ~0x01)
         f = (f | 0x04) if self.palette_source == 'list' else (f & ~0x04)
+        for track in self.animated:              # what the animated tracks need to show
+            f |= MA.FLAG_OF[track] if track not in ('tex', 'pal') else 0
         return f
 
     def block(self, mobj_index):
         """DL commands that set this material up -> (bytes, [(offset, 'image'|'palette')]);
         inline image / palette loads need their pointer (at offset + 4) filled in."""
         if self.untextured:                      # texture off; its colors: the MObj's, or prim in the state
-            return g(0xD7000000, 0) + (g(0xDE000000, 0x0E000000 + 8 * mobj_index) if self.needs_mobj else b''), []
+            return g(0xD7000000, 0) + (g(0xDE000000, 0x0E000000 + 8 * mobj_index) if self.uses_mobj() else b''), []
         w, h, fmt, siz = self.w, self.h, self.fmt, self.siz
         cms, cmt = WRAP_BITS[self.wrap_s] | self.clamp_bits[0], WRAP_BITS[self.wrap_t] | self.clamp_bits[1]
         ms, mt = int(np.ceil(np.log2(w))), int(np.ceil(np.log2(h)))      # masks (rounded up: clamped edges)

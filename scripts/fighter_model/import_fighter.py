@@ -125,6 +125,7 @@ class Materials:
         if 'materials' in tab and 'export_dir' in tab:
             self.table, self.props, root = tab['materials'], tab.get('props', {}), tab['export_dir']
             self.lights = tab.get('lights') or {}
+            self.anims = tab.get('anims')        # material animations (None: older blend_to_gltf.py)
         else:                                                           # older costumes.json: table only
             self.table, self.props, root = tab, {}, None
         mp = manifest_path or (os.path.join(root, 'manifest.json') if root else None)
@@ -139,6 +140,7 @@ class Materials:
             print('  warning: no export manifest found: every material is rebuilt as a new CI4 material')
             self.manifest, self.root = {'materials': {}}, None
         self.costumes, self.base = costumes, base_char
+        self.anims = getattr(self, 'anims', None)
         self.cloak_safe = True
         self.lights = getattr(self, 'lights', {})
         self.mat = {}

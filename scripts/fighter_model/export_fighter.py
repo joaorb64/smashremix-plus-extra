@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import sys
 import tempfile
 
@@ -31,6 +32,7 @@ APPENDER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 sys.path.insert(0, APPENDER_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fighter_files as FF  # noqa: E402
+import matanim as MA  # noqa: E402
 from SSB import N64, SSBtbl  # noqa: E402
 
 FLOAT, USHORT, UINT = 5126, 5123, 5125
@@ -66,8 +68,8 @@ VANILLA_ITEMS = {
     'BOMBHEI': 0x424, 'STARROD': 0x48C, 'GSHELL': 0x53C, 'RSHELL': 0x584, 'BOX': 0x5CC, 'TARU': 0x634,
     'NBUMPER': 0x69C, 'MBALL': 0x6E4, 'EGG': 0xACC,
 }
-# vanilla stages: their Map file (MPGroundData at 0x14), decomp tools/relocFileDescriptions.us.txt
-VANILLA_MAPS = {
+# vanilla stages: their header file (decomp: Map file; MPGroundData at 0x14), decomp tools/relocFileDescriptions.us.txt
+VANILLA_STAGES = {
     'DREAMLAND': 255, 'BETA_DREAMLAND': 256, 'ZEBES': 257, 'TEST': 258, 'CASTLE': 259,
     'MUSHROOM_KINGDOM': 260, 'JUNGLE': 261, 'SECTOR_Z': 262, 'YOSHIS_ISLAND': 263, 'SAFFRON': 264,
     'HYRULE': 265, 'FINAL_DESTINATION': 266, 'HOW_TO_PLAY': 267, 'DUEL_ZONE': 268, 'META_CRYSTAL': 269,
@@ -75,7 +77,7 @@ VANILLA_MAPS = {
 }
 
 
-def remix_maps():
+def remix_stages():
     """Remix stages' header (Map) files: File.asm STG_<NAME>_HEADER constants."""
     file_asm = os.path.join(APPENDER_DIR, 'smashremix', 'src', 'File.asm')
     out = {}
@@ -309,6 +311,13 @@ class Exporter:
                         self.script_of.setdefault(ms, sc)
         self.manifest['lights'] = FF.model_lights(f)
         self.manifest['expressions'] = []
+        # MPGroundData: light_angle (x, y degrees: the scene light's direction, which every lit
+        # model is shaded with; z: the camera's tilt, radians) and the camera bounds
+        g = f.object['ground']
+        if g + 0x74 <= len(f.main):
+            self.manifest['stage_view'] = dict(
+                light_angle=[round(v, 6) for v in struct.unpack_from('>3f', f.main, g + 0x60)],
+                camera_bounds=list(struct.unpack_from('>4h', f.main, g + 0x6C)))     # top, bottom, right, left
         anims = []                                    # (joint node, rest joint, [{track: value}])
         n_frames = 0
         for name, d in f.details.items():
@@ -384,6 +393,34 @@ class Exporter:
             out.append({k: f'{fr.get(k, base[k]):08X}' for k in on})
         return out
 
+    def material_scripts(self):
+        """Do the MObj scripts animate materials (stages, items, projectiles)? A fighter's
+        are its costume scripts (a frame per costume)."""
+        return bool(getattr(self.f, 'object', None))
+
+    def mobj_anim(self, entry, mobj):
+        """Stages / items: the MObj's starting values (offsets, scales, LOD fraction) and tile
+        setup, and its material script (texture flips, scrolling, palette / color changes)
+        played into keyframes (matanim.py) for Blender. The import keeps the script as it
+        is unless the keyframes were edited."""
+        if not self.material_scripts():
+            return
+        f = self.f
+        static = MA.mobj_static(f.char, mobj)
+        entry['mobj_static'] = {k: static[k] for k in ('trau', 'trav', 'scau', 'scav', 'scrollu', 'scrollv', 'lfrac')}
+        entry['tile'] = MA.tile_info(f.char, mobj)
+        sc = self.script_of.get(mobj)
+        if sc is None:
+            return
+        a = MA.play(f.char, f.char_int, sc, static)
+        if not a['samples']:
+            return
+        entry['anim'] = dict(script=sc, frames=a['frames'], loop=a['loop'], loop_start=a['loop_start'],
+                             keys={k: MA.to_keys(v, k) for k, v in a['samples'].items()})
+        what = ', '.join(MA.PROP[k] for k in a['samples'])
+        print(f'  material animation 0x{mobj:X}: {what}; {a["frames"]} frames'
+              + (' (loops)' if a['loop'] else ''))
+
     def real_entries(self, addrs, size, name, what):
         """An image / palette list stops at its first entry that can't be one: data that runs
         into something else (another pointer target inside it). Lists have no stored length,
@@ -437,7 +474,9 @@ class Exporter:
             entry['color'] = [(prim >> sh) & 255 for sh in (24, 16, 8, 0)]
             ms = bytearray(f.char[mobj:mobj + 0x78])
             ms[0x04:0x08] = ms[0x2C:0x30] = b'\0' * 4
-            sig = ('untextured', json.dumps(entry['state']), json.dumps(entry['costume_colors']), bytes(ms))
+            self.mobj_anim(entry, mobj)
+            sig = ('untextured', json.dumps(entry['state']), json.dumps(entry['costume_colors']), bytes(ms),
+                   self.script_of.get(mobj) if self.material_scripts() else None)
             if sig in self.mat_sig:
                 self.mat_index[key] = self.mat_sig[sig]
                 return self.mat_index[key]
@@ -458,9 +497,12 @@ class Exporter:
                 imgs = self.real_entries(info['images'] if flags & 0x11 else [], FF.row_bytes(w, siz) * h, name, 'image')
                 # palette size: what's loaded (the DL's TLUT load, or the MObj's: 256 if sub.siz is 8b)
                 n_cols = desc.get('tlut_n') or (256 if f.char[mobj + 3] == 1 else 16)
+                if flags & 0x04 and flags & 0x03:    # the MObj loads its palette itself (objdisplay.c)
+                    n_cols = 256 if f.char[mobj + 3] == 1 else 16
                 entry['palette_colors'] = n_cols
                 pals = self.real_entries(info['palettes'] if flags & 0x04 else [], 2 * n_cols, name, 'palette')
                 entry.update(mobj=mobj, flags=flags, mobj_fmt=f.char[mobj + 2], mobj_siz=f.char[mobj + 3])
+                self.mobj_anim(entry, mobj)
                 if flags & COLOR_FLAGS:
                     entry['costume_colors'] = self.costume_colors(mobj)
                 if not imgs:
@@ -503,7 +545,9 @@ class Exporter:
                    entry.get('image_source'), entry.get('palette_source'),
                    tuple(bytes(f.char[a:a + nb]) if a is not None else None for a in imgs),
                    tuple(bytes(f.char[a:a + npb]) if a is not None else None for a in pals),
-                   json.dumps(cmap), bytes(ms), json.dumps(entry.get('costume_colors')))
+                   json.dumps(cmap), bytes(ms), json.dumps(entry.get('costume_colors')),
+                   # (stages, items: MObjs alike but for their material script are separate materials)
+                   self.script_of.get(entry['mobj']) if key[0] == 'mobj' and self.material_scripts() else None)
             if sig in self.mat_sig:
                 self.mat_index[key] = self.mat_sig[sig]
                 return self.mat_index[key]
@@ -762,11 +806,17 @@ def main():
     ap.add_argument('--attr-heads', default='3FFFC,0', help='hex internal,external chain heads of --attr')
     ap.add_argument('--model-head', type=lambda v: int(v, 16), default=0x3FFFC, help='hex internal chain head of --model')
     ap.add_argument('--item', type=str.upper, choices=VANILLA_ITEMS, help='vanilla common item from --rom')
-    ap.add_argument('--stage', action='store_true',
-                    help="CHAR_DIR is a stage folder: export its geometry layers (header.bin -> stage.bin)")
-    ap.add_argument('--map', metavar='STAGE', help='a stage from --rom: vanilla name (' + ', '.join(VANILLA_MAPS) +
-                    '), a Remix File.asm STG_<NAME>_HEADER name (e.g. BATTLEFIELD), or the Map file\'s hex ID')
+    stage_names = list(VANILLA_STAGES) + [n for n in remix_stages() if n not in VANILLA_STAGES]
+    ap.add_argument('--stage', nargs='?', const=True, default=None, type=str.upper,
+                    metavar='{' + ','.join(stage_names) + '}',
+                    help='alone: CHAR_DIR is a stage folder (its geometry layers: header.bin -> stage.bin); '
+                         'with a name and --rom: a stage to extract from the ROM (vanilla name or File.asm '
+                         'STG_<NAME>_HEADER constant), or its header file\'s hex ID')
     a = ap.parse_args()
+    if isinstance(a.stage, str) and not a.rom:
+        # no ROM: what followed --stage is the stage folder (--stage STAGE_DIR OUT_DIR)
+        a.paths.insert(0, os.path.normpath(next(x for x in sys.argv[1:] if x.upper() == a.stage)))
+        a.stage = True
     if len(a.paths) == 1:
         char_dir, out_dir = None, a.paths[0]
     elif len(a.paths) == 2:
@@ -776,17 +826,15 @@ def main():
 
     if a.rom and (a.main or a.char):
         ap.error('--rom cannot be combined with --main or --char')
-    if a.stage and a.map:
-        ap.error('--stage (a stage folder) and --map (a stage from --rom) are mutually exclusive')
     if not a.rom and (a.fighter or a.main_file_id is not None or a.char_file_id is not None):
         ap.error('--fighter and ROM file IDs require --rom')
 
     cfg = read_config(char_dir) if char_dir else {}
-    if a.stage or a.map:
-        if a.map:
-            if not a.rom:
-                ap.error('--map requires --rom')
-            f = load_rom_stage(a.rom, a.map, ap)
+    if a.stage:
+        if isinstance(a.stage, str):
+            f = load_rom_stage(a.rom, a.stage, ap)
+        elif a.rom:
+            ap.error('--stage with --rom needs the stage\'s name')
         elif not char_dir:
             ap.error('--stage needs the stage folder (STAGE_DIR OUT_DIR)')
         else:
@@ -881,13 +929,13 @@ def main():
 
 
 def load_rom_stage(rom, name, ap):
-    """A stage's Map file (MPGroundData at 0x14) from the ROM, and the file its geometry
+    """A stage's header file (decomp: Map file; MPGroundData at 0x14) from the ROM, and the file its geometry
     layers point into (its external chain: which file each pointer goes to is the
     entry's ID list, in chain order)."""
     key = name.upper()
-    remix = remix_maps()
-    if key in VANILLA_MAPS:
-        map_id = VANILLA_MAPS[key]
+    remix = remix_stages()
+    if key in VANILLA_STAGES:
+        header_id = VANILLA_STAGES[key]
     else:
         remix_name = key
         if remix_name.startswith('STG_'):
@@ -895,25 +943,26 @@ def load_rom_stage(rom, name, ap):
         if remix_name.endswith('_HEADER'):
             remix_name = remix_name[:-7]
         if key in remix:
-            map_id = remix[key]
+            header_id = remix[key]
         elif remix_name in remix:
-            map_id = remix[remix_name]
+            header_id = remix[remix_name]
         else:
             try:
-                map_id = int(name, 16)
+                header_id = int(name, 16)
             except ValueError:
-                ap.error(f'unknown stage {name!r} (vanilla: {", ".join(VANILLA_MAPS)}; Remix: File.asm STG_*_HEADER)')
+                ap.error(f'unknown stage {name!r} (choose from {", ".join(list(VANILLA_STAGES) + list(remix))}, '
+                         'or a hex header file ID)')
     entries = SSBtbl.fromROM(N64(open(rom, 'rb').read()))
-    if not 0 <= map_id < len(entries):
-        ap.error(f'stage Map file ID 0x{map_id:X} is outside the ROM file table (0..0x{len(entries) - 1:X})')
-    entry = entries[map_id]
+    if not 0 <= header_id < len(entries):
+        ap.error(f'stage header file ID 0x{header_id:X} is outside the ROM file table (0..0x{len(entries) - 1:X})')
+    entry = entries[header_id]
     header = entry.extract('data')
     ids = [int.from_bytes(entry.idx[i:i + 2], 'big') for i in range(0, len(entry.idx or b''), 2)]
     links = list(FF.chain(header, entry.res).keys()) if entry.res is not None else []
     layer_files = {ids[links.index(FF.GROUND_DATA + 0x10 * L)] for L in range(FF.GROUND_LAYERS)
                    if FF.GROUND_DATA + 0x10 * L in links}
     if not layer_files:
-        raise SystemExit(f'Map file 0x{map_id:X}: no geometry layers')
+        raise SystemExit(f'stage header file 0x{header_id:X}: no geometry layers')
     stage_id = min(layer_files)
     if len(layer_files) > 1:
         print(f'  note: layers point into files {sorted(hex(x) for x in layer_files)}; '
@@ -927,7 +976,7 @@ def load_rom_stage(rom, name, ap):
                           entry.res if entry.res is not None else 0x3FFFC,
                           entries[stage_id].tbl if entries[stage_id].tbl is not None else 0x3FFFC,
                           stage_ext=stage_ext, only_file=(ids, links, stage_id))
-    f.object.update(rom_map=map_id, rom_stage=stage_id, name=name)
+    f.object.update(rom_header=header_id, rom_stage=stage_id, name=name)
     return f
 
 

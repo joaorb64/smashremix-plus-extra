@@ -23,13 +23,94 @@ os.makedirs(OUT, exist_ok=True)
 BLEND_DIR = os.path.dirname(bpy.data.filepath)
 
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import matanim as MA  # noqa: E402
+import n64_fighter_panel as PANEL  # noqa: E402
+
+
+def image_path(img):
+    if not img.filepath:                                # made in Blender, no file yet: one in OUT
+        path = os.path.join(OUT, 'images', re.sub(r'[^\w.-]', '_', img.name) + '.png')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        img.filepath_raw, img.file_format = path, 'PNG'
+        img.save()
+        return path
+    if img.is_dirty or img.packed_file is not None:     # painted in Blender, not saved / a packed copy:
+        img.save()                                      # its file gets what Blender shows
+    return os.path.normpath(bpy.path.abspath(img.filepath, library=img.library))
+
+
+def anim_info(m):
+    """A material's animation (matanim.py tracks: the n64_offset_x / n64_tex_index / ...
+    properties): keys per track [frame, value, interpolation, slope in, slope out] (colors:
+    RGBA words), the values at every frame 0..frames (what the build checks the script
+    against), loop, the starting values of the properties that aren't animated, and its
+    image list ('N64 Frame <i>' nodes). None: nothing to say."""
+    props = PANEL.anim_props(m)
+    frames_imgs = [image_path(n.image) for n in PANEL.frame_nodes(m) if n.image]
+    pal_imgs = [image_path(n.image) for n in PANEL.frame_nodes(m, 'Palette') if n.image]
+    if not props and not frames_imgs and not pal_imgs and 'n64_mobj' not in m.keys():
+        return None
+    animated = PANEL.anim_animated(m)
+
+    def pack(vals):
+        return sum(max(0, min(255, round(float(v) * 255))) << sh for v, sh in zip(vals, (24, 16, 8, 0)))
+    static = {}
+    for p in props:
+        if p not in animated:
+            v = m[p]
+            static[MA.TRACK_OF_PROP[p]] = pack(v) if PANEL.ANIM_INFO[p][2] == 'color' else float(v)
+    last = max((kp.co.x for fcs in animated.values() for fc in fcs for kp in fc.keyframe_points), default=0)
+    end = int(m.get('n64_anim_frames', round(last)) or round(last))
+    cycles = any(md.type == 'CYCLES' for fcs in animated.values() for fc in fcs for md in fc.modifiers)
+    loop = bool(m.get('n64_anim_loop', cycles))
+    if loop and cycles:      # Blender repeats each curve's key span; the game the animation's length
+        for p, fcs in animated.items():
+            span = {(round(fc.keyframe_points[0].co.x), round(fc.keyframe_points[-1].co.x)) for fc in fcs}
+            if any(sp != (0, end) for sp in span):
+                print(f'  warning: {m.name}: {p} keys span frames {sorted(span)[0]} but the loop is 0..{end}: '
+                      f'the game repeats every {end} frames (key frames 0 and {end} for it to look the same)')
+    tracks, samples = {}, {}
+    for p, fcs in animated.items():
+        track = MA.TRACK_OF_PROP[p]
+        if PANEL.ANIM_INFO[p][2] == 'color':
+            by = {fc.array_index: fc for fc in fcs}
+            base = list(m[p])
+
+            def at(f, _by=by, _base=base):
+                return pack([_by[i].evaluate(f) if i in _by else _base[i] for i in range(4)])
+            times = sorted({int(round(kp.co.x)) for fc in fcs for kp in fc.keyframe_points})
+            keys = []
+            for t in times:          # a step only if every channel holds there
+                ips = [next((kp.interpolation for kp in reversed(fc.keyframe_points) if kp.co.x <= t + 1e-3),
+                            'CONSTANT') for fc in fcs]
+                keys.append([t, at(t), 'CONSTANT' if all(i == 'CONSTANT' for i in ips) else 'LINEAR', 0.0, 0.0])
+            tracks[track] = keys
+            samples[track] = [at(f) for f in range(end + 1)]
+            continue
+        fc = fcs[0]
+        disc = track in MA.DISCRETE
+        keys = []
+        for kp in fc.keyframe_points:
+            (x, y), (lx, ly), (rx, ry) = kp.co, kp.handle_left, kp.handle_right
+            ip = kp.interpolation if kp.interpolation in ('CONSTANT', 'LINEAR') else 'BEZIER'
+            s_in = (y - ly) / (x - lx) if abs(x - lx) > 1e-6 else 0.0
+            s_out = (ry - y) / (rx - x) if abs(rx - x) > 1e-6 else 0.0
+            keys.append([int(round(x)), float(round(y) if disc else y), 'CONSTANT' if disc else ip, s_in, s_out])
+        tracks[track] = keys
+        samples[track] = [float(round(fc.evaluate(f)) if disc else fc.evaluate(f)) for f in range(end + 1)]
+    return dict(tracks=tracks, samples=samples, frames=end, loop=loop,
+                loop_start=int(m.get('n64_anim_loop_start', 0)) if loop else 0,
+                static=static, images=frames_imgs, palettes=pal_imgs, mobj=(m['n64_mobj'].to_dict() if 'n64_mobj' in m.keys() else None))
+
+
 def mat_info(m):
     if m is None:
         return None
     img, color = None, None
     if m.node_tree:
         for node in m.node_tree.nodes:
-            if node.type == 'TEX_IMAGE' and node.image:
+            if node.type == 'TEX_IMAGE' and node.image and not node.name.startswith('N64 '):
                 img = os.path.normpath(bpy.path.abspath(node.image.filepath, library=node.image.library))
                 if node.image.is_dirty:                     # painted in Blender, not saved: save next to the blend
                     node.image.save()
@@ -72,7 +153,7 @@ for m in bpy.data.materials:
                 break
             costumes[name][k] = dict(image=sib, color=info.get('color'))
 # N64 settings (custom properties) per material; costume copies inherit costume 0's
-props = {}
+props, anims = {}, {}
 for m in bpy.data.materials:
     name = base_name(m.name)
     if name in props and m.name != name:
@@ -84,6 +165,15 @@ for m in bpy.data.materials:
     # n64_cull only for what it can't say (front / both)
     if p.get('n64_cull') not in ('front', 'both'):
         p['n64_cull'] = 'back' if m.use_backface_culling else 'none'
+    a = anim_info(m)
+    if a is not None:
+        anims[name] = a
+        if a['images']:
+            p['n64_frames'] = a['images']
+        if a['palettes']:
+            p['n64_palettes'] = a['palettes']
+        if a['tracks']:
+            p['n64_animated'] = sorted(a['tracks'])
     if p:
         props[name] = p
 # images painted in Blender but not saved yet (expressions, palettes)
@@ -93,7 +183,7 @@ for img in bpy.data.images:
 export_dir = os.path.normpath(bpy.path.abspath(bpy.context.scene.get('fighter_export_dir', '//')))
 sc = bpy.context.scene
 lights = {k: str(sc[f'n64_{k}_color']) for k in ('light', 'shadow') if f'n64_{k}_color' in sc.keys()}
-json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights),
+json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims),
           open(os.path.join(OUT, 'costumes.json'), 'w'), indent=1)
 
 # the N64 view setup (unlit = emission x vertex color node) only exists for looking at it

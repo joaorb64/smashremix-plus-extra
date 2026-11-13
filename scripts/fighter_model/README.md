@@ -13,8 +13,8 @@ same MObj order); so do items and projectiles (rebuilt model files have no lefto
 data). ROM export reads Remix fighters (from `File.asm`) and vanilla fighters and
 items, including vanilla display-list features (shifted / scaled texture tiles,
 mirrored clamped tiles, vertex edits across joints, shared files). Not yet: writing
-items back into the vanilla shared item file, editing stage animations in Blender
-(they're kept), adding model-part variants,
+items back into the vanilla shared item file, editing stage joint animations in Blender
+(they're kept; material animations are editable, see [Material animations](#material-animations)), adding model-part variants,
 build-process wiring (planned: .blend files in the repo, compiled at build).
 
 Blender commands are given twice: as `blender`, and for Blender installed from
@@ -101,16 +101,64 @@ every frame into the glTF animation `Stage`: the `Stage` armature's action, 60 f
 timeline covering one loop (capped at 30 s for scripts the stage code drives, e.g.
 moving platforms). They're for viewing: the import keeps the original scripts as they
 are. Vanilla stages are available by name too (`DREAMLAND`, `CASTLE`, `SECTOR_Z`...:
-`VANILLA_MAPS` in export_fighter.py).
+`VANILLA_STAGES` in export_fighter.py).
 
-To export a stage directly from a Smash Remix ROM, give its `File.asm` header name:
+To export a stage directly from a Smash Remix ROM, give its name to `--stage`:
 ```
-python3 appender/scripts/fighter_model/export_fighter.py --rom ROM.z64 --map=BATTLEFIELD OUT_DIR
+python3 appender/scripts/fighter_model/export_fighter.py --rom ROM.z64 --stage BATTLEFIELD OUT_DIR
 ```
-Use a stage name such as `BATTLEFIELD`, `DEKU`, or `MUTE` (the `STG_` prefix and
-`_HEADER` suffix are optional), or the Map file's hexadecimal ID. The ROM supplies
-the stage header and its referenced geometry files. `--map BATTLEFIELD` works too;
-the equals form is useful when keeping option/value pairs together in scripts.
+Use a stage name such as `BATTLEFIELD`, `DEKU`, or `MUTE` (`File.asm`'s
+`STG_<NAME>_HEADER` constants; the `STG_` prefix and `_HEADER` suffix are optional;
+`--help` lists them all), or the stage header file's hexadecimal ID (the decomp calls
+it the Map file). The ROM supplies the stage header and its referenced geometry files.
+Without `--rom`, `--stage` (with no name) means the folder given is a stage folder.
+
+### Material animations
+
+Stages, items and projectiles can animate their materials (an MObj's material script,
+decomp objanim.c / objdisplay.c): flip through an image list (water, screens, Ryu's
+hadouken), scroll the texture, change the palette or the prim / env / blend / light
+colors. The export plays each script like the game and writes it as keyframes; the
+import writes the script back (the original, byte for byte, when the keyframes weren't
+changed). Fighters' MObj scripts are their costume scripts, not animations.
+
+In Blender each animated value is a custom property of the material, keyframed in
+the material's action (60 frames per second, like the game), shown in Material Preview
+while the timeline plays. The **N64 Fighter** panel's **Material Animation** box lists
+them; hover one + I to keyframe, **Add** for another:
+
+| Property | Track | What |
+|---|---|---|
+| `n64_tex_index` | texture_id_curr | which image of the list is drawn (the `N64 Frame <i>` texture nodes) |
+| `n64_pal_index` | palette_id | which palette of the list (`N64 Palette <i>` nodes) |
+| `n64_offset_x` / `_y` | trau / trav | texture position, in texture widths / heights: scrolling |
+| `n64_scale_x` / `_y` | scau / scav | divide the offset (with MObj flag 0x80 also the texture scale) |
+| `n64_scroll2_x` / `_y` | scrollu / scrollv | the second tile's offset (two-texture combiners; not previewed) |
+| `n64_tex_next` | texture_id_next | the second image (blended by the LOD fraction) |
+| `n64_lod_frac` | lfrac | prim LOD fraction (combiner PRIM_LOD_FRAC) |
+| `n64_prim_color`, `n64_env_color`, `n64_blend_color`, `n64_light1_color`, `n64_light2_color` | colors | RGBA, faded linearly or stepped |
+
+- **Length / loop**: `n64_anim_frames` (the frame it ends or starts over), `n64_anim_loop`,
+  `n64_anim_loop_start`. Looping curves carry a Cycles modifier: Blender repeats each
+  curve's keyed span, the game repeats `n64_anim_frames`, so key frame 0 and the last
+  frame for both to look the same (blend_to_gltf.py warns otherwise).
+- **Keys**: Constant (holds, then steps: image / palette indices always do), Linear, and
+  Bezier (written as the game's cubic segments, from the handles' slopes). The import
+  plays the new script and compares every frame with Blender's curve; a curve it can't
+  write as segments (other easings, Bezier handles not at a third) is written frame by
+  frame, exact (and said so).
+- **Image list**: the `N64 Frame <i>` nodes, in order (panel: **Add Image** copies the
+  texture to a new PNG to paint; images past the original's are added to its list, CI
+  ones mapped to its palette). A new material with frames gets one image per frame (CI:
+  one shared palette).
+- **Palette list** (CI formats): the `N64 Palette <i>` nodes, each the texture drawn in
+  that palette's colors (panel: **Add Palette** copies the texture to a new PNG: recolor
+  it, same drawing; the build reads the palette from it). A material with one palette
+  shows none until you add one; adding the Palette property makes its texture palette 0.
+- A value that isn't animated is the MObj's starting value (e.g. a fixed offset). An
+  animated material always draws through an MObj: one is made for materials that had
+  none, with the flags its tracks need (0x20 tile offset, 0x40 second tile, 0x200..
+  colors). Removing every key removes the script.
 
 ```
 blender -b --factory-startup --python appender/scripts/fighter_model/build_blend.py -- OUT_DIR
@@ -146,7 +194,25 @@ shadow colors and per-material culling:
 Textures are external files (`textures/`, relative paths): keep the export folder
 together. Judge colors in Material Preview: it runs the N64 setup (combiner, wrap
 / mirror / clamp per axis, per-material light colors); Solid view has one wrap mode
-per texture and no combiner.
+per texture and no combiner. What the preview does like the game:
+
+- **Lighting**: lit materials are shaded by the game's light, not Blender's: shadow color +
+  light color x max(0, N . L), shown as emission (Blender's lights don't change it). The
+  direction is the scene's `n64_light_angle` (Scene > N64 Fighter > Light Angle): a stage's
+  `light_angle` from its header, else the usual 20, 45. In battle the scene sets it once
+  per frame for everything (decomp scvsbattle.c `scVSBattleFuncLights`): stage display
+  lists set only their light colors, so stages and items are lit from the same direction.
+- **Edges** by the render mode: translucent modes blend; alpha compare cuts at the blend
+  color's alpha; anti-aliased texture edges (`CVG_X_ALPHA` + `ALPHA_CVG_SEL` + `AA_EN`,
+  e.g. `00553048`) fade by coverage, alpha in eighths (the soft border of sprites; blended
+  when the mode doesn't write depth, dithered when it does).
+- **Texture format**: `n64_format` shows what the build stores: I / IA formats gray (I: alpha
+  = intensity), each channel cut to its bits (I4 16 levels, RGBA16 5 bits...), 1-bit alpha
+  for IA4, RGBA16 and CI palettes. CI colors aren't reduced in the preview (the build cuts
+  them to 16 / 256).
+- **Game Camera** (the scene camera; Numpad 0): the battle camera's 38 degree vertical field
+  of view (gmcamera.c), 320 x 240, tilted down by the stage's `light_angle` z, framing a
+  stage's camera bounds (else the model; a flat sprite facing x from its side).
 
 Identical materials (e.g. the hi and lo models' copies) are exported once, so an
 edit applies everywhere they're used. Vertex normals are the model's own (custom
@@ -296,7 +362,8 @@ python3 appender/scripts/fighter_model/import_object.py FOLDER NAME WORK_DIR [--
   FOLDER is touched and the new head is printed instead.
 - Stage builds derive the `FILES.<NAME>.*` offsets (mobjsub, sprites, sprite0..)
   from the files, so they follow the new layout.
-- Material scripts (texture animations) are kept as they are, and so is each display
+- Material scripts (texture animations) are kept as they are unless edited in Blender
+  ([Material animations](#material-animations)), and so is each display
   list's original end state (render mode restored...: items drawn with no render mode
   of their own, like stage hazards, inherit what a model leaves set).
 

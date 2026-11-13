@@ -9,6 +9,8 @@ build_blend.py embeds this file in the .blend as a text block that registers
 itself when Blender is allowed to run the file's scripts. It also installs as an
 add-on: Edit > Preferences > Add-ons > Install from Disk.
 """
+import os
+
 import bpy
 
 bl_info = {
@@ -53,6 +55,9 @@ def hex_color(key, default, name='', description=''):
         self[key] = ''.join(f'{max(0, min(255, round(c * 255))):02X}' for c in rgb)
         if isinstance(self, bpy.types.Material):
             update_view(self)
+        elif isinstance(self, bpy.types.Scene):          # the model's light colors: every material
+            for mat in bpy.data.materials:
+                update_view(mat)
     return bpy.props.FloatVectorProperty(subtype='COLOR_GAMMA', size=3, min=0.0, max=1.0, get=get, set=set,
                                          name=name, description=description)
 
@@ -119,7 +124,203 @@ def _node(nt, name, kind, x, y):
 def _image_node(m):
     if m.node_tree is None:
         return None
-    return next((n for n in m.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image), None)
+    return next((n for n in m.node_tree.nodes if n.type == 'TEX_IMAGE' and n.image
+                 and not n.name.startswith('N64 ')), None)
+
+
+# ---------------------------------------------------------------- material animation
+# Stages / items: an MObj's material script animates these (matanim.py: texture flips,
+# scrolling, palette / color changes). Each is an animatable custom property on the
+# material: keyframe it (hover + I) and the build writes the script; the game plays 60
+# frames per second. (property, label, kind, default, description)
+ANIM_PROPS = [
+    ('n64_tex_index', 'Image', 'index', 0, 'Which image of the material\'s list it draws (the N64 Frame '
+     'nodes): animate it to flip through them'),
+    ('n64_pal_index', 'Palette', 'index', 0, 'Which palette of the material\'s list it draws with'),
+    ('n64_offset_x', 'Offset X', 'float', 0.0, 'Texture position, in texture widths (animate it to scroll)'),
+    ('n64_offset_y', 'Offset Y', 'float', 0.0, 'Texture position, in texture heights (animate it to scroll)'),
+    ('n64_scale_x', 'Scale X', 'float', 1.0, 'Texture scale X (divides the offset)'),
+    ('n64_scale_y', 'Scale Y', 'float', 1.0, 'Texture scale Y (divides the offset)'),
+    ('n64_scroll2_x', 'Second Tile X', 'float', 0.0, 'Offset of the second texture tile (two-texture combiners)'),
+    ('n64_scroll2_y', 'Second Tile Y', 'float', 0.0, 'Offset of the second texture tile (two-texture combiners)'),
+    ('n64_tex_next', 'Second Image', 'index', 0, 'The second image (blended by the LOD fraction)'),
+    ('n64_lod_frac', 'LOD Fraction', 'float', 0.0, 'Prim LOD fraction (combiner input PRIM_LOD_FRAC)'),
+    ('n64_prim_color', 'Prim Color', 'color', (1.0, 1.0, 1.0, 1.0), 'The MObj\'s prim color (RGBA)'),
+    ('n64_env_color', 'Env Color', 'color', (1.0, 1.0, 1.0, 1.0), 'The MObj\'s env color (RGBA)'),
+    ('n64_blend_color', 'Blend Color', 'color', (1.0, 1.0, 1.0, 1.0), 'The MObj\'s blend color (RGBA)'),
+    ('n64_light1_color', 'Light Color', 'color', (1.0, 1.0, 1.0, 1.0), 'The MObj\'s light color (RGBA)'),
+    ('n64_light2_color', 'Shadow Color', 'color', (0.5, 0.5, 0.5, 1.0), 'The MObj\'s shadow (ambient) color'),
+]
+ANIM_INFO = {p[0]: p for p in ANIM_PROPS}
+
+
+def anim_fcurves(idb, create=False):
+    """The ID's action F-curves (Blender 4.4+: its slot's channelbag), or None."""
+    ad = idb.animation_data
+    if ad is None:
+        if not create:
+            return None
+        ad = idb.animation_data_create()
+    act = ad.action
+    if act is None:
+        if not create:
+            return None
+        act = ad.action = bpy.data.actions.new(f'{idb.name} N64')
+    if hasattr(act, 'slots') and hasattr(ad, 'action_slot'):
+        slot = ad.action_slot
+        if slot is None:
+            if not create:
+                return None
+            slot = act.slots.new(id_type=type(idb).__name__.upper(), name=idb.name)
+            ad.action_slot = slot
+        from bpy_extras import anim_utils
+        if create:
+            return anim_utils.action_ensure_channelbag_for_slot(act, slot).fcurves
+        cb = anim_utils.action_get_channelbag_for_slot(act, slot)
+        return cb.fcurves if cb is not None else None
+    return act.fcurves
+
+
+def anim_prop_create(m, prop, value=None):
+    """Material m's animatable property `prop` (with its starting value)."""
+    _, label, kind, default, desc = ANIM_INFO[prop]
+    if prop in m.keys():
+        return
+    if value is None:
+        value = default
+    if kind == 'color':
+        if isinstance(value, int):                       # an RGBA word
+            value = [((value >> sh) & 255) / 255 for sh in (24, 16, 8, 0)]
+        m[prop] = [float(x) for x in value]
+    elif kind == 'index':
+        m[prop] = int(value)
+    else:
+        m[prop] = float(value)
+    try:
+        ui = m.id_properties_ui(prop)
+        if kind == 'color':
+            ui.update(subtype='COLOR_GAMMA', min=0.0, max=1.0, description=desc)
+        elif kind == 'index':
+            ui.update(min=0, max=255, description=desc)
+        else:
+            ui.update(description=desc, step=1, precision=4)
+    except (TypeError, AttributeError):
+        pass
+
+
+def anim_set_keys(m, prop, keys, color=False, cycle=False):
+    """Keyframes [[frame, value, 'CONSTANT' | 'LINEAR'], ...] on m's property (colors: RGBA
+    words, one curve per channel); cycle: the curve repeats (the script loops)."""
+    fcs = anim_fcurves(m, create=True)
+    for i in range(4 if color else 1):
+        path = f'["{prop}"]'
+        old = fcs.find(path, index=i)
+        if old is not None:
+            fcs.remove(old)
+        fc = fcs.new(path, index=i, group_name='N64 Material')
+        fc.keyframe_points.add(len(keys))
+        for kp, (t, v, ip) in zip(fc.keyframe_points, keys):
+            if color:
+                v = ((int(v) >> (24 - 8 * i)) & 255) / 255
+            kp.co = (float(t), float(v))
+            kp.interpolation = ip
+        if cycle:
+            fc.modifiers.new('CYCLES')
+        fc.update()
+
+
+def anim_props(m):
+    """m's material-animation properties present, in panel order."""
+    return [p[0] for p in ANIM_PROPS if p[0] in m.keys()]
+
+
+def anim_animated(m):
+    """{property: [F-curves]} of m's keyframed material-animation properties."""
+    fcs = anim_fcurves(m)
+    out = {}
+    for fc in (fcs or []):
+        name = fc.data_path[2:-2] if fc.data_path.startswith('["') else None
+        if name in ANIM_INFO and len(fc.keyframe_points):
+            out.setdefault(name, []).append(fc)
+    return out
+
+
+def frame_nodes(m, kind='Frame'):
+    """The material's 'N64 Frame <i>' (image list) / 'N64 Palette <i>' texture nodes, by index."""
+    if m.node_tree is None:
+        return []
+    out = {}
+    for n in m.node_tree.nodes:
+        if n.type == 'TEX_IMAGE' and n.name.startswith(f'N64 {kind} '):
+            try:
+                out[int(n.name.split()[-1])] = n
+            except ValueError:
+                pass
+    return [out[i] for i in sorted(out)]
+
+
+def frame_node(m, kind, i):
+    nt = m.node_tree
+    name = f'N64 {kind} {i}'
+    n = nt.nodes.get(name)
+    if n is None:
+        n = nt.nodes.new('ShaderNodeTexImage')
+        n.name = n.label = name
+        tex = _tex_node(m)
+        x, y = tex.location if tex is not None else (-600, 0)
+        n.location = (x - 300 * (1 + (kind == 'Palette')), y - 280 * (i + 1))
+        n.hide = True
+    return n
+
+
+def _drive(owner, path, m, expr, variables, index=-1, id_type='MATERIAL'):
+    """A driver on owner.path (a node socket value) computing expr from m's properties
+    (id_type 'SCENE': m is the scene)."""
+    fc = owner.driver_add(path, index) if index >= 0 else owner.driver_add(path)
+    drv = fc.driver
+    drv.type = 'SCRIPTED'
+    for v in list(drv.variables):
+        drv.variables.remove(v)
+    for name, data_path in variables.items():
+        var = drv.variables.new()
+        var.name, var.type = name, 'SINGLE_PROP'
+        var.targets[0].id_type = id_type
+        var.targets[0].id = m
+        var.targets[0].data_path = data_path
+    drv.expression = expr
+    return fc
+
+
+def _clear_drivers(nt, prefix):
+    ad = nt.animation_data
+    if ad is None:
+        return
+    for fc in list(ad.drivers):
+        if f'nodes["{prefix}' in fc.data_path:
+            ad.drivers.remove(fc)
+
+
+def _offset_exprs(m):
+    """Driver expressions for the tile offset the MObj draws with (objdisplay.c: tile 0's
+    upper-left from trau / trav / scau / scav), in Blender UV units, or None."""
+    info = m.get('n64_mobj')
+    if not info or not (int(info.get('flags', 0)) & 0x20):
+        return None
+    if not all(p in m.keys() for p in ('n64_offset_x', 'n64_offset_y', 'n64_scale_x', 'n64_scale_y')):
+        return None
+    w, h = (int(x) or 1 for x in info.get('tex_size', (32, 32)))
+    cs, ct = (int(x) for x in info.get('size0', (w, h)))
+    a = int(info.get('unk0a', 0))
+    # the RDP subtracts the tile's upper-left from s, t: u - uls / w; Blender's v is 1 - t / h,
+    # so v + ult / h
+    if int(info.get('mode', 0)) == 2:
+        ex = f'-(max(0.0, {cs}*tu/su) if abs(su) > 1.5e-5 else 0.0)/{w}'
+        ey = f'(max(0.0, {ct}*tv/sv) if abs(sv) > 1.5e-5 else 0.0)/{h}'
+    else:
+        ex = f'-(({cs}*tu+{a})/su if abs(su) > 1.5e-5 else 0.0)/{w}'
+        ey = f'(((1.0-sv-tv)*{ct}+{a})/sv if abs(sv) > 1.5e-5 else 0.0)/{h}'
+    v = {'tu': '["n64_offset_x"]', 'tv': '["n64_offset_y"]', 'su': '["n64_scale_x"]', 'sv': '["n64_scale_y"]'}
+    return ex, ey, v
 
 
 def update_view(m, context=None):
@@ -143,9 +344,19 @@ def update_view(m, context=None):
         sep = _node(nt, 'N64 Separate UV', 'ShaderNodeSeparateXYZ', x - 700, y)
         comb = _node(nt, 'N64 Combine UV', 'ShaderNodeCombineXYZ', x - 200, y)
         nt.links.new(uv.outputs['UV'], sep.inputs[0])
+        offs = _offset_exprs(m)
+        _clear_drivers(nt, 'N64 Offset')
         for i, (axis, mode) in enumerate((('X', ws), ('Y', wt))):
             mth = _node(nt, f'N64 Wrap {axis}', 'ShaderNodeMath', x - 450, y + 120 - 240 * i)
             src = sep.outputs[axis]
+            if offs:                           # the MObj's tile offset (animated: scrolling)
+                off = _node(nt, f'N64 Offset {axis}', 'ShaderNodeMath', x - 900, y + 180 - 240 * i)
+                off.operation = 'ADD'
+                nt.links.new(src, off.inputs[0])
+                _drive(off.inputs[1], 'default_value', m, offs[i], offs[2])
+                src = off.outputs[0]
+            elif nt.nodes.get(f'N64 Offset {axis}') is not None:
+                nt.nodes.remove(nt.nodes[f'N64 Offset {axis}'])
             if axis == 'Y':
                 # glTF import flips V (v = 1 - t): wrap / clamp in the N64's t, flip back after.
                 # (Clamping at a tile extent isn't symmetric, so this matters: DK's fur.)
@@ -187,6 +398,11 @@ def update_view(m, context=None):
                 res = fout.outputs[0]
             nt.links.new(res, comb.inputs[axis])
         nt.links.new(comb.outputs[0], tex.inputs['Vector'])
+        for kind in ('Frame', 'Palette'):      # the image / palette list entries: same sampling
+            for n in frame_nodes(m, kind):
+                _use_file(n.image)
+                nt.links.new(comb.outputs[0], n.inputs['Vector'])
+                n.interpolation, n.extension = tex.interpolation, tex.extension
     if out is None or bsdf is None:
         return
     build_combiner(m, nt, tex, out, bsdf)
@@ -196,10 +412,260 @@ def _srgb_lin(c):
     return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
 
+def _recolored(src, pal0, palp, name):
+    """Image src (drawn in palette 0's colors) in palette p's: each color of palette 0's
+    image becomes the color at the same pixels of palette p's (a preview: indices that
+    share a color in palette 0 take one of their palette-p colors). In memory only."""
+    import numpy as np
+
+    def px(img):
+        n = len(img.pixels)                    # (loads it)
+        a = np.empty(n, np.float32)
+        if n:
+            img.pixels.foreach_get(a)
+        return a.reshape(-1, 4)
+    a, b, s_ = px(pal0), px(palp), px(src)
+    if not len(a) or not len(s_) or len(a) != len(b):
+        return src
+    key = lambda c: (np.round(c * 255).astype(np.int64) * [1 << 24, 1 << 16, 1 << 8, 1]).sum(-1)  # noqa: E731
+    lut = dict(zip(key(a).tolist(), b.tolist()))
+    out = np.array([lut.get(k, c) for k, c in zip(key(s_).tolist(), s_.tolist())], np.float32)
+    img = bpy.data.images.get(name)
+    if img is None or tuple(img.size) != tuple(src.size):
+        if img is not None:
+            bpy.data.images.remove(img)
+        img = bpy.data.images.new(name, src.size[0], src.size[1], alpha=True)
+    img.pixels.foreach_set(out.ravel())
+    img.update()
+    try:
+        img.pack()                       # (a generated image's pixels aren't saved otherwise)
+    except RuntimeError:
+        pass
+    return img
+
+
+def _anim_texture(m, nt, tex, node, tex_c, tex_a):
+    """The texture's color / alpha as the animated Image (N64 Frame nodes) and Palette
+    (N64 Palette nodes) properties pick it; both: image i recolored to palette p."""
+    if tex is None:
+        return tex_c, tex_a
+    frames = frame_nodes(m) if 'n64_tex_index' in m.keys() else []
+    pals = frame_nodes(m, 'Palette') if 'n64_pal_index' in m.keys() else []
+    frames = frames if len(frames) > 1 else []
+    pals = pals if len(pals) > 1 and all(n.image is not None for n in pals) else []
+    if not frames and not pals:
+        return tex_c, tex_a
+    picks = {}
+
+    def pick(prop, i):
+        if prop not in picks:
+            idx = node('ShaderNodeValue')
+            _drive(idx.outputs[0], 'default_value', m, 'floor(i)', {'i': f'["{prop}"]'})
+            picks[prop] = idx.outputs[0]
+        c = node('ShaderNodeMath', operation='COMPARE')
+        nt.links.new(picks[prop], c.inputs[0])
+        c.inputs[1].default_value, c.inputs[2].default_value = float(i), 0.25
+        return c.outputs[0]
+    uv = nt.nodes.get('N64 Combine UV')
+    entries = []                         # (texture node, [pick sockets])
+    if frames and pals:                  # every image in every palette
+        for i, fr in enumerate(frames):
+            for p, pl in enumerate(pals):
+                if fr.image is None:
+                    continue
+                img = fr.image if p == 0 else _recolored(fr.image, pals[0].image, pl.image,
+                                                         f'{m.name} N64 image{i} palette{p}')
+                t = node('ShaderNodeTexImage')
+                t.image, t.interpolation, t.extension = img, tex.interpolation, tex.extension
+                if uv is not None:
+                    nt.links.new(uv.outputs[0], t.inputs['Vector'])
+                entries.append((t, [pick('n64_tex_index', i), pick('n64_pal_index', p)]))
+    else:
+        prop = 'n64_tex_index' if frames else 'n64_pal_index'
+        entries = [(n, [pick(prop, i)]) for i, n in enumerate(frames or pals)]
+    tex_c, tex_a = entries[0][0].outputs['Color'], entries[0][0].outputs['Alpha']
+    for t, sel in entries[1:]:
+        f = sel[0]
+        if len(sel) > 1:
+            both = node('ShaderNodeMath', operation='MULTIPLY')
+            nt.links.new(sel[0], both.inputs[0])
+            nt.links.new(sel[1], both.inputs[1])
+            f = both.outputs[0]
+        mc = node('ShaderNodeMix', data_type='RGBA', blend_type='MIX')
+        nt.links.new(f, mc.inputs['Factor'])
+        nt.links.new(tex_c, mc.inputs['A'])
+        nt.links.new(t.outputs['Color'], mc.inputs['B'])
+        ma = node('ShaderNodeMix', data_type='FLOAT')
+        nt.links.new(f, ma.inputs['Factor'])
+        nt.links.new(tex_a, ma.inputs['A'])
+        nt.links.new(t.outputs['Alpha'], ma.inputs['B'])
+        tex_c, tex_a = mc.outputs['Result'], ma.outputs['Result']
+    return tex_c, tex_a
+
+
+# the game's light (ftdisplaylights.c): from the stage's light_angle (x, y degrees; fighters,
+# items: the usual 20, 45). Shade = ambient (shadow color) + light color x max(0, N . L), in
+# the game's (sRGB) values, then to Blender's linear colors
+DEFAULT_LIGHT_ANGLE = (20.0, 45.0)
+
+
+def _hex_rgb(h, default):
+    try:
+        v = int(str(h or default).lstrip('#'), 16)
+    except ValueError:
+        v = int(default, 16)
+    return [((v >> sh) & 255) / 255 for sh in (16, 8, 0)]
+
+
+def _game_shade(m, node, nt):
+    scn = bpy.context.scene
+    light = _hex_rgb(m.get('n64_light_color') or m.get('n64_costume_light') or
+                     (scn.get('n64_light_color') if scn else None), 'FFFFFF')
+    shadow = _hex_rgb(m.get('n64_shadow_color') or m.get('n64_costume_shadow') or
+                      (scn.get('n64_shadow_color') if scn else None), '808080')
+    geo = node('ShaderNodeNewGeometry')
+    ldir = node('ShaderNodeCombineXYZ')
+    if scn is not None and 'n64_light_angle' not in scn.keys():
+        scn['n64_light_angle'] = list(DEFAULT_LIGHT_ANGLE)
+    # game direction (x, y, z) = (sin ax cos ay, sin ay, cos ax cos ay); Blender (x, -z, y)
+    r = 0.017453292519943295
+    exprs = (f'sin(ax*{r})*cos(ay*{r})', f'-cos(ax*{r})*cos(ay*{r})', f'sin(ay*{r})')
+    for i, e in enumerate(exprs):
+        if scn is not None:
+            _drive(ldir.inputs[i], 'default_value', scn, e,
+                   {'ax': '["n64_light_angle"][0]', 'ay': '["n64_light_angle"][1]'}, id_type='SCENE')
+    dot = node('ShaderNodeVectorMath', operation='DOT_PRODUCT')
+    nt.links.new(geo.outputs['Normal'], dot.inputs[0])
+    nt.links.new(ldir.outputs[0], dot.inputs[1])
+    ndl = node('ShaderNodeMath', operation='MAXIMUM')
+    nt.links.new(dot.outputs['Value'], ndl.inputs[0])
+    ndl.inputs[1].default_value = 0.0
+    lc = node('ShaderNodeRGB')
+    lc.outputs[0].default_value = (*light, 1.0)
+    sc = node('ShaderNodeRGB')
+    sc.outputs[0].default_value = (*shadow, 1.0)
+    lit = node('ShaderNodeVectorMath', operation='SCALE')
+    nt.links.new(lc.outputs[0], lit.inputs[0])
+    nt.links.new(ndl.outputs[0], lit.inputs['Scale'])
+    add = node('ShaderNodeVectorMath', operation='ADD')
+    nt.links.new(lit.outputs[0], add.inputs[0])
+    nt.links.new(sc.outputs[0], add.inputs[1])
+    cl = node('ShaderNodeMix', data_type='RGBA', blend_type='MIX', clamp_result=True)
+    cl.inputs['Factor'].default_value = 1.0
+    nt.links.new(add.outputs[0], cl.inputs['B'])
+    gam = node('ShaderNodeGamma')                 # the game's values -> linear
+    nt.links.new(cl.outputs['Result'], gam.inputs['Color'])
+    gam.inputs['Gamma'].default_value = 2.2
+    return gam.outputs[0]
+
+
+def _format_view(m, node, nt, color, alpha):
+    """The texture as its n64_format stores it: intensity formats are gray (I: alpha = the
+    intensity too), each channel cut to its bits (truncated, like the build), 1-bit alpha
+    (IA4, RGBA16, CI palettes). CI formats keep their colors (the build reduces them to
+    16 / 256)."""
+    fmt = str(m.get('n64_format', 'CI4'))
+    if fmt == 'RGBA32':
+        return color, alpha
+
+    def math(op, a, b=None):
+        n = node('ShaderNodeMath', operation=op)
+        if isinstance(a, float):
+            n.inputs[0].default_value = a
+        else:
+            nt.links.new(a, n.inputs[0])
+        if b is not None:
+            if isinstance(b, float):
+                n.inputs[1].default_value = b
+            else:
+                nt.links.new(b, n.inputs[1])
+        return n.outputs[0]
+
+    def bits(x, b):                      # 8-bit value cut to b bits, read back (n * 255 / (2^b - 1))
+        if b >= 8:
+            return x
+        return math('DIVIDE', math('FLOOR', math('MULTIPLY', x, 255.0 / (1 << (8 - b)))), float((1 << b) - 1))
+
+    def one_bit(a):
+        return math('GREATER_THAN', a, 0.4999)
+    if fmt.startswith('CI'):             # palette colors are RGBA5551: alpha on / off
+        return color, one_bit(alpha)
+    g = node('ShaderNodeGamma')          # linear -> the game's values
+    nt.links.new(color, g.inputs['Color'])
+    g.inputs['Gamma'].default_value = 1 / 2.2
+    srgb = g.outputs[0]
+    if fmt == 'RGBA16':
+        sep = node('ShaderNodeSeparateXYZ')
+        nt.links.new(srgb, sep.inputs[0])
+        comb = node('ShaderNodeCombineXYZ')
+        for k in range(3):
+            nt.links.new(bits(sep.outputs[k], 5), comb.inputs[k])
+        out_c, out_a = comb.outputs[0], one_bit(alpha)
+    else:
+        lum = node('ShaderNodeVectorMath', operation='DOT_PRODUCT')
+        nt.links.new(srgb, lum.inputs[0])
+        lum.inputs[1].default_value = (0.299, 0.587, 0.114)
+        ib, ab = {'I4': (4, None), 'I8': (8, None), 'IA4': (3, 1), 'IA8': (4, 4), 'IA16': (8, 8)}.get(fmt, (8, 8))
+        i = bits(lum.outputs['Value'], ib)
+        gray = node('ShaderNodeCombineXYZ')
+        for k in range(3):
+            nt.links.new(i, gray.inputs[k])
+        out_c = gray.outputs[0]
+        out_a = i if ab is None else (one_bit(alpha) if ab == 1 else bits(alpha, ab))
+    back = node('ShaderNodeGamma')
+    nt.links.new(out_c, back.inputs['Color'])
+    back.inputs['Gamma'].default_value = 2.2
+    return back.outputs[0], out_a
+
+
+def _edge_alpha(m, cmds, node, nt, alpha):
+    """How transparent texels show, by the render mode (E200001C) and alpha compare
+    (E2001E01): -> (blended?, alpha socket).
+      translucent modes: alpha blended
+      alpha compare: drawn only where alpha > the blend color's alpha (hard edge)
+      anti-aliased texture edge (CVG_X_ALPHA + ALPHA_CVG_SEL + AA_EN): coverage = alpha in
+        eighths, blended at the edges: the soft border of the game's sprites (depth-writing
+        modes are dithered in Blender, which can't sort blended surfaces by depth)"""
+    rm = next((b for a, b in cmds if a == 0xE200001C), None)
+    if rm is not None and (rm >> 16) & 3 == 0:
+        return True, alpha
+    compare = next((b & 3 for a, b in cmds if a == 0xE2001E01), 0)
+    thr = next(((b & 255) / 255 for a, b in cmds if a >> 24 == 0xF9), 0.0) if compare == 1 else None
+    cvg_x_alpha = (rm is not None and rm & 0x1000) or any(a == 0xE2001300 and b & 0x1000 for a, b in cmds)
+    soft = rm is not None and rm & 0x3008 == 0x3008
+    if thr is not None:                              # alpha compare: nothing at or under the threshold
+        keep = node('ShaderNodeMath', operation='GREATER_THAN')
+        nt.links.new(alpha, keep.inputs[0])
+        keep.inputs[1].default_value = thr
+        if not soft:
+            return False, keep.outputs[0]
+        cut = node('ShaderNodeMath', operation='MULTIPLY')
+        nt.links.new(alpha, cut.inputs[0])
+        nt.links.new(keep.outputs[0], cut.inputs[1])
+        alpha = cut.outputs[0]
+    if soft:                                         # coverage = alpha in eighths, AA-blended
+        q = node('ShaderNodeMath', operation='MULTIPLY')
+        nt.links.new(alpha, q.inputs[0])
+        q.inputs[1].default_value = 8.0
+        fl = node('ShaderNodeMath', operation='FLOOR')
+        nt.links.new(q.outputs[0], fl.inputs[0])
+        d = node('ShaderNodeMath', operation='DIVIDE')
+        nt.links.new(fl.outputs[0], d.inputs[0])
+        d.inputs[1].default_value = 8.0
+        return not rm & 0x20, d.outputs[0]          # (Z_UPD: written to the depth buffer: dithered)
+    if cvg_x_alpha:                                  # coverage x alpha without AA: on / off
+        clip = node('ShaderNodeMath', operation='GREATER_THAN')
+        nt.links.new(alpha, clip.inputs[0])
+        clip.inputs[1].default_value = 0.124
+        return False, clip.outputs[0]
+    return False, alpha
+
+
 def build_combiner(m, nt, tex, out, bsdf):
     """The material's N64 color combiner as shader nodes: two cycles of (a - b) * c + d,
     color and alpha, with its prim / env colors and the texture. SHADE is Blender's own
     lighting when lit (multiplied by the BSDF), the vertex color when unlit."""
+    _clear_drivers(nt, 'N64 CC')
     for n in [n for n in nt.nodes if n.name.startswith('N64 CC') or n.name in (
             'N64 Light Tint', 'N64 Unlit', 'N64 Unlit Color', 'N64 Vertex Color')]:
         nt.nodes.remove(n)
@@ -244,23 +710,28 @@ def build_combiner(m, nt, tex, out, bsdf):
     one, zero = val(1.0), val(0.0)
     tex_c = tex.outputs['Color'] if tex is not None else one_c
     tex_a = tex.outputs['Alpha'] if tex is not None else one
+    # material animation: the image list entry / palette its index properties pick
+    tex_c, tex_a = _anim_texture(m, nt, tex, node, tex_c, tex_a)
+    if tex is not None:                  # how the texture's format stores it (materials.encode_direct)
+        tex_c, tex_a = _format_view(m, node, nt, tex_c, tex_a)
     if lit:
-        # Blender's lighting stands in for the model's light. A material lit by its own
-        # light color (n64_light_color, or its MObj's: n64_costume_light) is tinted by
-        # how that color compares with the model's (vanilla Mario's shoes: white, lit brown)
-        own = m.get('n64_light_color') or m.get('n64_costume_light')
-        if own:
-            scn = bpy.context.scene.get('n64_light_color', 'FFFFFF') if bpy.context.scene else 'FFFFFF'
-            a = [_srgb_lin(((int(str(own), 16) >> sh) & 255) / 255) for sh in (16, 8, 0)]
-            b = [_srgb_lin(((int(str(scn), 16) >> sh) & 255) / 255) for sh in (16, 8, 0)]
-            shade_c = rgb([min(x / y, 1.0) if y > 0 else x for x, y in zip(a, b)])
-        else:
-            shade_c = one_c
+        shade_c = _game_shade(m, node, nt)
         shade_a = one
     else:
         vc = node('ShaderNodeVertexColor')
         shade_c, shade_a = vc.outputs['Color'], vc.outputs['Alpha']
     P, Pa, E, Ea = rgb(prim_c), val(prim_a), rgb(env_c), val(env_a)
+    # the MObj's colors (animated: material animation) instead of the display list's
+    lin = 'c/12.92 if c <= 0.04045 else pow((c+0.055)/1.055, 2.4)'
+    for prop, (sock, sock_a) in (('n64_prim_color', (P, Pa)), ('n64_env_color', (E, Ea))):
+        if prop in m.keys():
+            for ch in range(3):
+                _drive(sock, 'default_value', m, lin, {'c': f'["{prop}"][{ch}]'}, index=ch)
+            _drive(sock_a, 'default_value', m, 'c', {'c': f'["{prop}"][3]'})
+    lod = zero
+    if 'n64_lod_frac' in m.keys():
+        lod = val(0.0)
+        _drive(lod, 'default_value', m, 'c', {'c': '["n64_lod_frac"]'})
     half = rgb((0.5, 0.5, 0.5))
     inv = lambda d: {v: key for key, v in d.items()}  # noqa: E731
     A, B, C, D = inv(CC_A), inv(CC_B), inv(CC_C), inv(CC_D)
@@ -276,9 +747,9 @@ def build_combiner(m, nt, tex, out, bsdf):
         csrc = {'COMBINED': comb_c, 'TEXEL0': tex_c, 'TEXEL1': tex_c, 'PRIM': P, 'SHADE': shade_c, 'ENV': E,
                 '1': one_c, 'NOISE': half, 'COMBINED_ALPHA': comb_a, 'TEXEL0_ALPHA': tex_a,
                 'TEXEL1_ALPHA': tex_a, 'PRIM_ALPHA': Pa, 'SHADE_ALPHA': shade_a, 'ENV_ALPHA': Ea,
-                'LOD_FRACTION': one, 'PRIM_LOD_FRAC': zero}
+                'LOD_FRACTION': one, 'PRIM_LOD_FRAC': lod}
         asrc = {'COMBINED': comb_a, 'TEXEL0': tex_a, 'TEXEL1': tex_a, 'PRIM': Pa, 'SHADE': shade_a, 'ENV': Ea,
-                '1': one, 'LOD_FRACTION': one, 'PRIM_LOD_FRAC': zero}
+                '1': one, 'LOD_FRACTION': one, 'PRIM_LOD_FRAC': lod}
         sub = node('ShaderNodeVectorMath', operation='SUBTRACT')
         nt.links.new(csrc.get(ca, zero_c), sub.inputs[0])
         nt.links.new(csrc.get(cb, zero_c), sub.inputs[1])
@@ -303,18 +774,14 @@ def build_combiner(m, nt, tex, out, bsdf):
         comb_c, comb_a = clampc.outputs['Result'], aadd.outputs[0]
     # translucent: the render mode's (cycle 2) blender weighs memory by 1 - alpha (XLU modes:
     # 0x0050...., 0x4410....); opaque / cut-out modes use memory coverage (0x0055...., 0xC411....)
-    blending = any(a == 0xE200001C and (b >> 16) & 3 == 0 for a, b in cmds)
+    blending, comb_a = _edge_alpha(m, cmds, node, nt, comb_a)
     for attr, value in (('surface_render_method', 'BLENDED' if blending else 'DITHERED'),
                         ('blend_method', 'BLEND' if blending else 'HASHED')):
         try:
             setattr(m, attr, value)
         except (AttributeError, TypeError):
             pass
-    if lit:
-        nt.links.new(comb_c, bsdf.inputs['Base Color'])
-        nt.links.new(comb_a, bsdf.inputs['Alpha'])
-        nt.links.new(bsdf.outputs[0], out.inputs['Surface'])
-    else:                    # unlit: the combined color as is
+    if True:                 # the combined color as is (lit: SHADE is the game's lighting)
         em = node('ShaderNodeEmission')
         tr = node('ShaderNodeBsdfTransparent')
         mix = node('ShaderNodeMixShader')
@@ -550,7 +1017,7 @@ def _tex_node(m):
     """The material's image texture node (with or without an image)."""
     if m.node_tree is None:
         return None
-    return next((n for n in m.node_tree.nodes if n.type == 'TEX_IMAGE'), None)
+    return next((n for n in m.node_tree.nodes if n.type == 'TEX_IMAGE' and not n.name.startswith('N64 ')), None)
 
 
 def _bsdf(m):
@@ -954,6 +1421,230 @@ class N64_PT_material(bpy.types.Panel):
             op.index = i
             op = row.operator('n64.state_remove', text='', icon='X')
             op.index = i
+        draw_anim(lay, m, context)
+
+
+def draw_anim(lay, m, context):
+    """Material animation (stages / items): the animatable properties, loop, image list."""
+    scn = context.scene
+    props = anim_props(m)
+    frames = frame_nodes(m)
+    if not props and not frames and not (scn and scn.get('n64_kind')):
+        return
+    box = lay.box()
+    head = box.row()
+    head.label(text='Material Animation', icon='ANIM')
+    head.operator_menu_enum('n64.anim_add', 'prop', text='Add', icon='ADD')
+    animated = anim_animated(m)
+    if not props:
+        box.label(text='None: add a property, then keyframe it (hover it + I)')
+    col = box.column()
+    col.use_property_split = True
+    for p in props:
+        row = col.row(align=True)
+        row.prop(m, f'["{p}"]', text=ANIM_INFO[p][1])
+        op = row.operator('n64.anim_remove', text='', icon='X')
+        op.prop = p
+    if animated:
+        col.separator()
+        if 'n64_anim_frames' in m.keys():
+            col.prop(m, '["n64_anim_frames"]', text='Length (frames)')
+        if 'n64_anim_loop' in m.keys():
+            col.prop(m, '["n64_anim_loop"]', text='Loop')
+        if m.get('n64_anim_loop') and 'n64_anim_loop_start' in m.keys():
+            col.prop(m, '["n64_anim_loop_start"]', text='Loop Start')
+        if 'n64_anim_frames' not in m.keys():
+            col.operator('n64.anim_settings', text='Set Length / Loop', icon='PREVIEW_RANGE')
+        box.label(text='60 frames per second, like the game', icon='INFO')
+    tex = _tex_node(m)
+    if tex is not None:
+        sub = box.box()
+        row = sub.row()
+        row.label(text=f'Images ({len(frames)})', icon='IMAGE_DATA')
+        row.operator('n64.frame_add', text='Add Image', icon='ADD').kind = 'Frame'
+        for i, n in enumerate(frames):
+            r = sub.row(align=True)
+            r.label(text=f'{i}')
+            r.template_ID(n, 'image', open='image.open')
+            op = r.operator('n64.frame_remove', text='', icon='X')
+            op.index, op.kind = i, 'Frame'
+        if frames and 'n64_tex_index' not in m.keys():
+            sub.label(text='Add the Image property to pick / animate which one is drawn')
+        if 'n64_tex_index' in animated and len(frames) < 2:
+            sub.label(text='The Image property is animated: add the images it picks', icon='ERROR')
+        if str(m.get('n64_format', 'CI4')).startswith('CI'):     # palette formats: a palette list
+            pals = frame_nodes(m, 'Palette')
+            sub = box.box()
+            row = sub.row()
+            row.label(text=f'Palettes ({len(pals)})', icon='COLOR')
+            row.operator('n64.frame_add', text='Add Palette', icon='ADD').kind = 'Palette'
+            for i, n in enumerate(pals):
+                r = sub.row(align=True)
+                r.label(text=f'{i}')
+                r.template_ID(n, 'image', open='image.open')
+                op = r.operator('n64.frame_remove', text='', icon='X')
+                op.index, op.kind = i, 'Palette'
+            if pals:
+                sub.label(text='Each is the texture in that palette\'s colors: recolor it (same drawing)')
+            if 'n64_pal_index' in animated and len(pals) < 2:
+                sub.label(text='The Palette property is animated: add the palettes it picks', icon='ERROR')
+
+
+def _anim_add_items(self, context):
+    m = context.material
+    have = set(anim_props(m)) if m else set()
+    return [(p, label, desc) for p, label, kind, d, desc in ANIM_PROPS if p not in have] or \
+        [('NONE', 'All added', '')]
+
+
+class N64_OT_anim_add(bpy.types.Operator):
+    bl_idname = 'n64.anim_add'
+    bl_label = 'Add Animated Property'
+    bl_description = 'A material property the game can animate (scrolling, image / palette flips, colors)'
+    bl_options = {'UNDO'}
+    prop: bpy.props.EnumProperty(items=_anim_add_items, name='Property')
+
+    def execute(self, context):
+        m = context.material
+        if self.prop == 'NONE':
+            return {'CANCELLED'}
+        anim_prop_create(m, self.prop)
+        if self.prop.startswith(('n64_offset', 'n64_scale')):     # the offset pair goes together
+            for p in ('n64_offset_x', 'n64_offset_y', 'n64_scale_x', 'n64_scale_y'):
+                anim_prop_create(m, p)
+            info = dict(m.get('n64_mobj') or {})
+            tex = _image_node(m)
+            size = list(tex.image.size) if tex is not None and tex.image is not None else [32, 32]
+            if not info:
+                m['n64_mobj'] = dict(flags=0x20, mode=0, unk0a=0, size0=size, size1=size, tex_size=size)
+            elif not int(info.get('flags', 0)) & 0x20:
+                info['flags'] = int(info.get('flags', 0)) | 0x20
+                m['n64_mobj'] = info
+        for prop, kind in (('n64_tex_index', 'Frame'), ('n64_pal_index', 'Palette')):
+            if self.prop == prop and not frame_nodes(m, kind):
+                tex = _tex_node(m)
+                if tex is not None and tex.image is not None:        # its texture is entry 0
+                    frame_node(m, kind, 0).image = tex.image
+        update_view(m)
+        return {'FINISHED'}
+
+
+class N64_OT_anim_remove(bpy.types.Operator):
+    bl_idname = 'n64.anim_remove'
+    bl_label = 'Remove Animated Property'
+    bl_description = 'Remove this property and its keyframes'
+    bl_options = {'UNDO'}
+    prop: bpy.props.StringProperty()
+
+    def execute(self, context):
+        m = context.material
+        fcs = anim_fcurves(m)
+        for fc in [fc for fc in (fcs or []) if fc.data_path == f'["{self.prop}"]']:
+            fcs.remove(fc)
+        if self.prop in m.keys():
+            del m[self.prop]
+        update_view(m)
+        return {'FINISHED'}
+
+
+class N64_OT_anim_settings(bpy.types.Operator):
+    bl_idname = 'n64.anim_settings'
+    bl_label = 'Animation Length'
+    bl_description = 'How long the material animation is, and whether it loops'
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        m = context.material
+        last = max((kp.co.x for fcs in anim_animated(m).values() for fc in fcs for kp in fc.keyframe_points),
+                   default=60)
+        m['n64_anim_frames'] = max(1, int(round(last)))
+        m['n64_anim_loop'] = True
+        m['n64_anim_loop_start'] = 0
+        return {'FINISHED'}
+
+
+class N64_OT_frame_add(bpy.types.Operator):
+    bl_idname = 'n64.frame_add'
+    bl_label = 'Add Image'
+    bl_description = ('Another entry in the material\'s image list (the Image property picks which is drawn) or '
+                      'palette list (a copy of the texture: recolor it, the build reads the palette from it)')
+    bl_options = {'UNDO'}
+    kind: bpy.props.EnumProperty(items=[('Frame', 'Image', ''), ('Palette', 'Palette', '')], default='Frame')
+
+    def execute(self, context):
+        m = context.material
+        frames = frame_nodes(m, self.kind)
+        tex = _tex_node(m)
+        if not frames and tex is not None and tex.image is not None:     # its texture is entry 0
+            frame_node(m, self.kind, 0).image = tex.image
+            frames = frame_nodes(m, self.kind)
+        n = frame_node(m, self.kind, len(frames))
+        src = frames[0].image if frames and frames[0].image is not None else (tex.image if tex else None)
+        if src is not None:                                       # same size: paint / recolor a copy
+            n.image = new_frame_image(src, f'{m.name}_{"frame" if self.kind == "Frame" else "palette"}{len(frames)}')
+        anim_prop_create(m, 'n64_tex_index' if self.kind == 'Frame' else 'n64_pal_index')
+        update_view(m)
+        return {'FINISHED'}
+
+
+def new_frame_image(src, name):
+    """A copy of image src as its own PNG in the .blend's textures folder (what src shows:
+    its file copied, or its pixels when it has none / is painted), loaded as a new image."""
+    import shutil
+    rel = f'//textures/{name}.png'
+    k = 1
+    while os.path.exists(bpy.path.abspath(rel)):
+        k += 1
+        rel = f'//textures/{name}_{k}.png'
+    path = bpy.path.abspath(rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    src_path = bpy.path.abspath(src.filepath, library=src.library) if src.filepath else ''
+    if src_path and os.path.exists(src_path) and not src.is_dirty and src.packed_file is None:
+        shutil.copyfile(src_path, path)
+    else:
+        w, h = src.size
+        tmp = bpy.data.images.new(name, w, h, alpha=True)
+        tmp.pixels.foreach_set(src.pixels[:])
+        tmp.filepath_raw, tmp.file_format = path, 'PNG'
+        tmp.save()
+        bpy.data.images.remove(tmp)
+    img = bpy.data.images.load(path)
+    img.name = name
+    img.filepath = rel
+    return img
+
+
+def _use_file(img):
+    """A list entry's image reads its PNG, not a packed copy (Image.copy() packs the source's
+    pixels: the .blend would keep showing those however the PNG is edited). What it shows is
+    written to the PNG first."""
+    if img is None or img.packed_file is None or not img.filepath:
+        return
+    try:
+        img.save()
+        img.unpack(method='REMOVE')
+        img.reload()
+    except (RuntimeError, OSError):
+        pass
+
+
+class N64_OT_frame_remove(bpy.types.Operator):
+    bl_idname = 'n64.frame_remove'
+    bl_label = 'Remove Image'
+    bl_description = 'Remove this image from the list (the later ones move up)'
+    bl_options = {'UNDO'}
+    index: bpy.props.IntProperty()
+    kind: bpy.props.StringProperty(default='Frame')
+
+    def execute(self, context):
+        m = context.material
+        frames = frame_nodes(m, self.kind)
+        if 0 <= self.index < len(frames):
+            m.node_tree.nodes.remove(frames[self.index])
+            for i, n in enumerate(frame_nodes(m, self.kind)):
+                n.name = n.label = f'N64 {self.kind} {i}'
+        update_view(m)
+        return {'FINISHED'}
 
 
 class N64_PT_scene(bpy.types.Panel):
@@ -967,9 +1658,12 @@ class N64_PT_scene(bpy.types.Panel):
         lay.use_property_split = True
         lay.prop(context.scene, 'n64ui_light', text='Light Color')
         lay.prop(context.scene, 'n64ui_shadow', text='Shadow Color')
+        if 'n64_light_angle' in context.scene.keys():
+            lay.prop(context.scene, '["n64_light_angle"]', text='Light Angle')
 
 
-CLASSES = (N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene)
+CLASSES = (N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
+           N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene)
 
 
 def _collapse_outliner():
