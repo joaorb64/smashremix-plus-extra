@@ -85,6 +85,16 @@ class StageProcessor:
                         f"groups, {info['lines']} lines, {info['vertices']} "
                         f"vertices (+{info['bytes_added']} B in stage.bin)")
 
+        # config['map_objects']: replace the whole map-object list (starts, item
+        # spawns, rebirth, demo / 1P positions). Same shape as the
+        # stage_attributes.yaml dump. Runs before `rebirth:` so that still wins.
+        if config.get("map_objects"):
+            from smashremix_extra.stage import collision as _collision
+            n = _collision.set_map_objects(
+                f"{output_path}/stage.bin", int(config['offsets']['stage'][0], 16),
+                config["map_objects"], label=stage_folder)
+            logger.info(f"{stage_folder}: wrote {n} map objects")
+
         # config['rebirth']: [x, y] of the rebirth (revival) platform - the
         # kind-0x20 map object in stage.bin. In-place; header.bin untouched.
         if config.get("rebirth"):
@@ -535,6 +545,9 @@ class StageProcessor:
             for oname, ooff in self._model_offsets(
                     output_path, name, opts.get("footer")).items():
                 lines.append(f"        constant {oname}(0x{ooff:X})")
+            # opts constants: {name: int} extra FILES.<NAME>.<name> constants
+            for cname, cval in (opts.get("constants") or {}).items():
+                lines.append(f"        constant {cname}(0x{int(cval):X})")
             lines.append("    }")
             file_constants.append("\n".join(lines))
 

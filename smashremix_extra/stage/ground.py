@@ -69,6 +69,7 @@ _FIELDS = (
     ("camera_tilt",        0x68, "angle_deg"),   # camera baseline pitch, degrees
     ("camera_bounds",      0x6C, "bounds"),
     ("blast_zones",        0x74, "bounds"),
+    ("bgm_id",             0x7C, "u32"),     # default (main) music, BGM.stage id
     ("alt_warning",        0x88, "s16"),
     ("camera_bounds_team", 0x8A, "bounds"),
     ("blast_zones_team",   0x92, "bounds"),
