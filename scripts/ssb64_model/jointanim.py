@@ -65,7 +65,8 @@ def uses_interp(d, ptrs, script, limit=4096):
 def play(d, ptrs, script, joint, max_frames=1800, max_loop=8192):
     """A joint's script -> dict(frames, loop, loop_start, samples={track: per frame 0..frames},
     tracks=[the tracks it sets]) like matanim.play: a cycle ends with its first frame again."""
-    out, loop = MF.simulate_anim(d, ptrs, script, max_loop + 1)
+    keys = {}
+    out, loop = MF.simulate_anim(d, ptrs, script, max_loop + 1, keys)
     rest = rest_values(joint)
     looping, n = False, None
     if loop == 0:
@@ -87,7 +88,26 @@ def play(d, ptrs, script, joint, max_frames=1800, max_loop=8192):
             cur = fr.get(i, cur)
             seq.append(float(cur))
         samples[name] = seq
-    return dict(frames=n, loop=looping, loop_start=0, samples=samples, tracks=[NAMES[i] for i in tracks])
+    keys = group_keys(keys, n)
+    return dict(frames=n, loop=looping, loop_start=0, samples=samples, tracks=[NAMES[i] for i in tracks],
+                keys=keys)
+
+
+GROUPS = {'rotation': (0, 1, 2), 'location': (4, 5, 6), 'scale': (7, 8, 9)}
+
+
+def group_keys(track_keys, last, starts=()):
+    """Per-track key frames ({track: frames}, simulate_anim's) -> per Blender channel group
+    {'rotation' | 'location' | 'scale': sorted frames}: the union of its tracks' keys (a bone's
+    rotation curves turn all three axes at once), with the ends (and `starts`) when the group
+    is animated at all; [] when the script never sets it (constant: one key)."""
+    out = {}
+    for g, tracks in GROUPS.items():
+        ks = set()
+        for t in tracks:
+            ks |= {k for k in track_keys.get(t, ()) if 0 <= k <= last}
+        out[g] = sorted(ks | {0, last} | set(starts)) if ks else []
+    return out
 
 
 def decompose(L, prev=None):

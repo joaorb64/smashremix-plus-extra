@@ -28,6 +28,9 @@ import sys
 
 import bpy
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import keyreduce as KR  # noqa: E402
+
 args = sys.argv[sys.argv.index('--') + 1:] if '--' in sys.argv else []
 DIR = os.path.abspath(args[0])
 man = json.load(open(os.path.join(DIR, 'manifest.json')))
@@ -269,7 +272,16 @@ arm = next((o for o in scene.objects if o.type == 'ARMATURE'), None)
 c_arm = coll('Armature')
 for a in [o for o in scene.objects if o.type == 'ARMATURE']:     # (stages: the glTF import merges
     move(a, c_arm)                                                 # the layers' skins into one)
+    rest_before = {b.name: b.matrix_local.to_3x3() for b in a.data.bones}
     tidy_bones(a)
+    # the imported actions' keys are in the bones' axes from before: re-expressed in the new ones
+    # (the same poses), or e.g. TransN's forward root motion would play downward
+    bone_names = set(rest_before)
+    acts_ = [act for act in bpy.data.actions
+             if any(KR._bone_of(fc)[0] in bone_names for fc in KR.action_fcurves(act))]
+    n_ = KR.rebase_actions(a, rest_before, acts_)
+    if n_:
+        print(f'{a.name}: {n_} animation curves re-expressed in the tidied bones\' axes')
 if IS_STAGE:
     for a in [o for o in scene.objects if o.type == 'ARMATURE']:
         a.name = 'Stage'                   # every layer's bones (L<n>_joint_NN), and the animation
@@ -299,7 +311,105 @@ if man.get('animations'):                  # joint animations (stage layers: L<n
                 kp.handle_left.x += d_
                 kp.handle_right.x += d_
             fc.update()
+        # keys only where needed (the glTF has one per frame), within tolerance of the game
+        # (the game's key frames first; more only where Blender's curve can't follow the game's
+        # within tolerance: the import samples every frame, so an unedited stage keeps its scripts)
+        hints_ = {_bone(L, j): ji.get('keys') or () for L, an in man['animations'].items()
+                  for j, ji in (an.get('joint_info') or {}).items()}
+        b_, a_, e_ = KR.reduce_fcurves(_P.anim_fcurves(a) or [], hints=hints_)
+        if b_:
+            print(f"joint animation keys: {b_} -> {a_} (worst frame: {e_['rotation']:.4f} deg, "
+                  f"{e_['location']:.4f} units, {e_['scale']:.5f} scale)")
         _P.sync_loops()                                    # looping joints repeat (Cycles), each at its own length
+FIGHTER_ANIMS = man.get('fighter_animations') or {}
+if FIGHTER_ANIMS and arm is not None:
+    # Fighter animations (figatree.py): one action each, named after its file (ROM: its first
+    # action), kept and not assigned (pick one in the Action Editor). Keys: as few as follow the
+    # game's motion (keyreduce.TOL_ANIM: ~0.5 degrees, 0.25 units), on the game's own key frames
+    # where they can be (baked animations, a key every frame, keep the ones that matter); each
+    # action's frame range is the animation's.
+    n_b = n_a = 0
+    worst = 0.0
+    for name, info in FIGHTER_ANIMS.items():
+        act = bpy.data.actions.get(info.get('gltf', name))
+        if act is None:
+            print(f'  note: animation {name!r} not imported')
+            continue
+        act.name = name                                   # its file | every action playing it
+        act.use_fake_user = True
+        b_, a_, e_ = KR.reduce_fcurves(KR.action_fcurves(act), hints=info.get('keys') or {}, candidates=True,
+                                       tol=KR.TOL_ANIM)
+        n_b, n_a, worst = n_b + b_, n_a + a_, max(worst, e_['rotation'])
+        try:
+            act.use_frame_range = True
+            act.frame_start, act.frame_end = 0, max(1, int(info['frames']) - 1)
+        except (AttributeError, TypeError):
+            pass
+        act['n64_flags'] = info['flags']                  # the motion flags (hidden parts, ...):
+        act['n64_actions'] = ', '.join(info.get('actions') or []) or '(none in main.asm)'   # see the
+        act['n64_flags_guessed'] = bool(info.get('flags_guessed'))         # N64 Animation panel
+        act['n64_source'] = info.get('source') or ''
+        act['n64_loop'] = bool(info.get('loop'))          # its scripts start over at the end
+        # what it was exported as (blend_to_gltf.py writes back the actions that changed)
+        act['n64_export'] = dict(name=name, flags=info['flags'], loop=bool(info.get('loop')))
+    arm['n64_hidden_parts'] = list(man.get('hidden_parts') or [])
+    arm['n64_hidden_part_parents'] = list(man.get('hidden_part_parents') or [])
+    print(f"fighter animations: {len(FIGHTER_ANIMS)}, keys {n_b} -> {n_a} (Blender's curves are at "
+          f"most {worst:.2f} deg from the game's)")
+    for name in FIGHTER_ANIMS:                            # (after every curve is final)
+        act = bpy.data.actions.get(name)
+        if act is not None and 'n64_export' in act.keys():
+            act['n64_export']['keys'] = KR.action_signature(act)
+    ad = arm.animation_data
+    if ad is not None:
+        for tr in list(ad.nla_tracks):
+            ad.nla_tracks.remove(tr)
+        ad.action = None
+    for pb in arm.pose.bones:
+        pb.location, pb.rotation_quaternion, pb.scale = (0, 0, 0), (1, 0, 0, 0), (1, 1, 1)
+SHIELD = man.get('shield')
+if SHIELD and arm is not None:
+    # The shield pose (shieldpose.py): actions 'Shield' (frame = stick angle in degrees: 0
+    # forward, 90 up, 180 back, 270 down) and 'Shield Neutral' (the pose every scripted joint
+    # leans toward as the stick comes back to the center). Kept, not assigned: the armature
+    # stays at rest; pick one in the Action Editor to see it. The bubble (radius shield_size,
+    # full health) follows YRotN, where the shield sits.
+    for act in bpy.data.actions:
+        if act.name in ('Shield', 'Shield Neutral'):
+            act.use_fake_user = True
+            # keys exactly on the game's key frames (the sector starts, every 45, and where the
+            # scripts set values), with the game's values; Bezier handles fitted between
+            try:
+                act.use_frame_range = True
+                act.frame_start, act.frame_end = 0, int(SHIELD['frames']) - 1
+            except (AttributeError, TypeError):
+                pass
+            hints_ = SHIELD.get('keys') or range(0, int(SHIELD['frames']), 45)
+            b_, a_, e_ = KR.reduce_fcurves(KR.action_fcurves(act), hints=hints_, exact=True)
+            print(f"{act.name}: keys {b_} -> {a_} (between keys, Blender's curve is at most "
+                  f"{e_['rotation']:.2f} deg / {e_['location']:.2f} units from the game's)")
+            # per bone, as built: the import tells the bones edited since (blend_to_gltf.py)
+            act['n64_bone_signatures'] = KR.bone_signatures(act)
+    ad = arm.animation_data
+    if ad is not None:
+        for tr in list(ad.nla_tracks):
+            ad.nla_tracks.remove(tr)
+        ad.action = None
+    for pb in arm.pose.bones:
+        pb.location, pb.rotation_quaternion, pb.scale = (0, 0, 0), (1, 0, 0, 0), (1, 1, 1)
+    if 'YRotN' in arm.data.bones:
+        c_sh = coll('Shield', hide=True)
+        bub = bpy.data.objects.new('Shield Bubble', None)
+        bub.empty_display_type = 'SPHERE'
+        bub.empty_display_size = float(SHIELD.get('radius') or 30.0)
+        c_sh.objects.link(bub)
+        bub.parent = arm
+        bub.parent_type = 'BONE'
+        bub.parent_bone = 'YRotN'
+        bpy.context.view_layer.update()
+        bub.matrix_world = arm.matrix_world @ arm.data.bones['YRotN'].matrix_local     # at the joint
+        bub.show_in_front = True
+    scene['n64_shield_frames'] = int(SHIELD['frames'])
 if IS_STAGE:
     # One type collection per MPGroundData slot (layer), holding its rooms' meshes.
     stage_types = {
@@ -551,6 +661,32 @@ height = max((max((ob.matrix_world @ v.co).z for v in ob.data.vertices) for ob i
 if IS_STAGE:                                  # a whole stage: frame its width too
     xs = [(ob.matrix_world @ v.co).x for ob in view_objs for v in ob.data.vertices]
     height = max(height, (max(xs) - min(xs)) / 2 if xs else 0)
+# the viewport renders with EEVEE: a plain gray world (the viewport's usual background; the
+# emission materials don't take light from it), nothing it doesn't need
+for engine in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'):      # (4.2 - 4.x / 5.x)
+    try:
+        scene.render.engine = engine
+        break
+    except TypeError:
+        pass
+if scene.world is None:
+    scene.world = bpy.data.worlds.new('N64 Background')
+scene.world.color = (0.045, 0.045, 0.045)
+try:
+    scene.world.use_nodes = False
+except (AttributeError, TypeError):
+    pass
+bg = next((n for n in (scene.world.node_tree.nodes if scene.world.node_tree else []) if n.type == 'BACKGROUND'), None)
+if bg is not None:                            # (Blender 5: worlds always use their nodes)
+    bg.inputs['Color'].default_value = (0.045, 0.045, 0.045, 1.0)
+    bg.inputs['Strength'].default_value = 1.0
+for attr, value in (('use_shadows', False), ('use_raytracing', False), ('use_gtao', False),
+                    ('use_bloom', False), ('use_ssr', False), ('use_volumetric_shadows', False)):
+    if hasattr(scene.eevee, attr):
+        try:
+            setattr(scene.eevee, attr, value)
+        except (AttributeError, TypeError):
+            pass
 for screen in bpy.data.screens:
     for area in screen.areas:
         if area.type != 'VIEW_3D':
@@ -562,8 +698,14 @@ for screen in bpy.data.screens:
             space.clip_end = 100000.0
             space.shading.color_type = 'TEXTURE'               # (Solid view, if switched to)
             space.shading.show_specular_highlight = False
-            space.shading.type = 'MATERIAL'                    # Material Preview: shows the N64 setup
-            space.shading.studiolight_intensity = 0.6          # (the preview light is much brighter than the game's)
+            # Material Preview with the scene's plain world and lights (none): shows the N64 setup
+            # (the materials are emission: the game's lighting is in the shader, no Blender light
+            # or HDRI changes them), without lighting the scene from the studio HDRI, which is
+            # what made it slow
+            space.shading.type = 'MATERIAL'
+            space.shading.use_scene_world = True
+            space.shading.use_scene_lights = True
+            space.shading.studiolight_intensity = 0.6
             space.shading.studiolight_background_alpha = 0.0
             space.overlay.show_stats = True                    # (Overlays > Statistics: triangle counts)
             r3d = space.region_3d
@@ -609,6 +751,21 @@ if os.path.exists(panel_src):
     txt = bpy.data.texts.get('n64_panel.py') or bpy.data.texts.new('n64_panel.py')
     txt.from_string(open(panel_src, encoding='utf-8').read())
     txt.use_module = True                          # 'Register': runs when the file is opened
+
+# the Animation workspace's Dope Sheet opens as the Action Editor (the armature's actions,
+# e.g. the shield pose's, one dropdown away), with the armature active
+for ws in bpy.data.workspaces:
+    if ws.name != 'Animation':
+        continue
+    for scr in ws.screens:
+        for area in scr.areas:
+            if area.type == 'DOPESHEET_EDITOR':
+                for sp in area.spaces:
+                    if sp.type == 'DOPESHEET_EDITOR':
+                        sp.ui_mode = 'ACTION'
+                        sp.show_region_ui = True       # its sidebar: N64 Animation, first in Action
+if arm is not None and arm.name in bpy.data.objects:
+    bpy.context.view_layer.objects.active = arm
 bpy.ops.wm.save_as_mainfile(filepath=os.path.join(DIR, 'model.blend'), relative_remap=True)
 print(f'built model.blend: {len(hi)} body pieces x {N} costumes (shared meshes), '
       f'{len(lo)} low-detail, {len(parts)} part objects, {n_entries} image/palette entries')

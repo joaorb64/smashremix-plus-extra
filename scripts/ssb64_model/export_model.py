@@ -39,6 +39,9 @@ import model_files as MF  # noqa: E402
 import matanim as MA  # noqa: E402
 import jointanim as JA  # noqa: E402
 import gamedata as GD  # noqa: E402
+import shieldpose as SP  # noqa: E402
+import figatree as FT  # noqa: E402
+import motions as MO  # noqa: E402
 from SSB import N64, SSBtbl  # noqa: E402
 
 FLOAT, USHORT, UINT = 5126, 5123, 5125
@@ -265,19 +268,37 @@ class Exporter:
             if kids:
                 self.gl['nodes'][self.joint_node[j.index]]['children'] = kids
         roots = [self.joint_node[j.index] for j in joints if j.parent is None]
+        ibm = [np.linalg.inv(j.world).T.reshape(-1) for j in joints]
+        skin_joints = [self.joint_node[j.index] for j in joints]
+        self.root_node = {}
+        if name == 'fighter' and not getattr(self.f, 'object', None):
+            # the hidden parts above the body (fp->joints[1..3]): TopN (the armature object) ->
+            # TransN -> XRotN -> the body's root joint(s), and YRotN (where the shield sits) as
+            # XRotN's last child. Their rest is the identity (the animations move them), so the
+            # body stays where it is; no vertices are on them. After the body joints in the skin,
+            # so joint_NN keeps skin index NN.
+            for nm in ('TransN', 'XRotN', 'YRotN'):
+                self.root_node[nm] = len(self.gl['nodes'])
+                self.gl['nodes'].append({'name': nm})
+            self.gl['nodes'][self.root_node['TransN']]['children'] = [self.root_node['XRotN']]
+            self.gl['nodes'][self.root_node['XRotN']]['children'] = roots + [self.root_node['YRotN']]
+            roots = [self.root_node['TransN']]
+            skin_joints += [self.root_node[nm] for nm in ('TransN', 'XRotN', 'YRotN')]
+            ibm += [np.eye(4).reshape(-1)] * 3
+            self.manifest['root_joints'] = ['TransN', 'XRotN', 'YRotN']
         self.gl['scenes'][0]['nodes'] += roots
-        ibm = np.array([np.linalg.inv(j.world).T.reshape(-1) for j in joints], '<f4')
         self.skin = len(self.gl['skins'])
-        self.gl['skins'].append({'name': name, 'skeleton': roots[0],
-                                 'joints': [self.joint_node[j.index] for j in joints],
-                                 'inverseBindMatrices': self.add(ibm, FLOAT, 'MAT4')})
+        self.gl['skins'].append({'name': name, 'skeleton': roots[0], 'joints': skin_joints,
+                                 'inverseBindMatrices': self.add(np.array(ibm, '<f4'), FLOAT, 'MAT4')})
         self.joints = joints
 
-    def animation(self, name, anims):
+    def animation(self, name, anims, every_joint=False):
         """A glTF animation sampling joint animations every frame (60 per second): the
         joint's rest transform with its animated tracks (rotation x/y/z, translation,
         scale) replaced, as the game plays them (the scripts themselves are kept by the
-        import, unchanged). Each joint has its own length (a looping one: one cycle)."""
+        import, unchanged). Each joint has its own length (a looping one: one cycle).
+        every_joint: key every joint even where it stays at its rest (actions swapped on one
+        armature, like the shield's, then never leave a joint posed by the other one)."""
         times_of = {}
         samplers, channels = [], []
         for node, j, seq in anims:
@@ -298,12 +319,75 @@ class Exporter:
             rest = {'translation': list(j.t), 'rotation': quat_from_matrix(MF.rot_zyx(*j.r)), 'scale': list(j.s)}
             for path, vals, typ in (('translation', T, 'VEC3'), ('rotation', R, 'VEC4'), ('scale', S, 'VEC3')):
                 arr = np.array(vals, '<f4')
-                if np.allclose(arr, arr[0]) and np.allclose(arr[0], np.array(rest[path], '<f4')):
-                    continue                              # not animated (it stays at the rest pose)
-                samplers.append({'input': times, 'output': self.add(arr, FLOAT, typ), 'interpolation': 'LINEAR'})
+                inp = times
+                if np.allclose(arr, arr[0], atol=1e-6):
+                    if not every_joint and np.allclose(arr[0], np.array(rest[path], '<f4')):
+                        continue                          # not animated (it stays at the rest pose)
+                    arr = arr[:1]                         # never changes: one key
+                    if 1 not in times_of:
+                        times_of[1] = self.add(np.zeros((1, 1), '<f4'), FLOAT, 'SCALAR', None, True)
+                    inp = times_of[1]
+                samplers.append({'input': inp, 'output': self.add(arr, FLOAT, typ), 'interpolation': 'LINEAR'})
                 channels.append({'sampler': len(samplers) - 1, 'target': {'node': node, 'path': path}})
         if channels:
             self.gl.setdefault('animations', []).append({'name': name, 'samplers': samplers, 'channels': channels})
+
+    def shield_animations(self, sp):
+        """The shield pose (shieldpose.py) as two glTF animations on the fighter's armature:
+        'Shield', frame = stick angle in degrees (0 forward, 90 up, 180 back, 270 down, 360
+        forward again), the stick all the way; 'Shield Neutral' (one frame): the neutral pose,
+        what every scripted joint leans toward as the stick comes back to the center."""
+        node = dict(self.joint_node)
+        joints = {f'joint_{j.index:02d}': j for j in self.joints}
+        ident = MF.Joint(-1, 0, None, None, np.zeros(3), np.zeros(3), np.ones(3))
+        tl = SP.timeline(sp)
+        turn, neutral = [], []
+        for i, nm in enumerate(sp['names']):
+            n = self.root_node.get(nm, node.get(joints[nm].index) if nm in joints else None)
+            if n is None:
+                continue
+            j = joints.get(nm, ident)
+            turn.append((n, j, tl[i]))
+            neutral.append((n, j, [SP.values_of(sp['lookup'][i])] * 2))
+        self.animation('Shield', turn, every_joint=True)
+        self.animation('Shield Neutral', neutral, every_joint=True)
+        self.manifest['shield'] = dict(
+            joints=sp['names'], frames=len(tl[0]), flags=f"{sp['flags']:08X}", int_head=sp['int_head'],
+            lookup=sp['lookup_off'], file_size=sp['size'], source=sp.get('source'),
+            radius=MF.f32(self.f.main, self.f.attr + SP.A_SHIELD_SIZE),
+            scripts=[''.join('S' if s is not None else '.' for s in sec['scripts']) for sec in sp['sectors']],
+            keys={nm: ks for nm, ks in zip(sp['names'], sp['keys'])})
+
+    def fighter_animations(self, anims):
+        """Fighter animations (figatree.py): one glTF animation each, named after it, keying
+        every bone (the joints an animation doesn't move: their rest; TransN / XRotN / YRotN:
+        the identity), so actions swapped on the armature never keep another's pose.
+        anims: [dict(name, anim (figatree.load), actions, flags, guessed, source)]."""
+        joints = {f'joint_{j.index:02d}': j for j in self.joints}
+        ident = MF.Joint(-1, 0, None, None, np.zeros(3), np.zeros(3), np.ones(3))
+        idx = {k: JA.NAMES.index(k) for k in JA.EDITABLE}
+        info = {}
+        for e in anims:
+            a = e['anim']
+            n = a['frames']
+            lst = []
+            for nm, node in [(k, self.joint_node[j.index]) for k, j in joints.items()] + list(self.root_node.items()):
+                j = joints.get(nm, ident)
+                vals = a['values'].get(nm)
+                if vals is None:
+                    rest = JA.rest_values(j)
+                    seq = [{idx[k]: rest[k] for k in JA.EDITABLE}] * n
+                else:
+                    seq = [{idx[k]: vals[k][t] for k in JA.EDITABLE} for t in range(n)]
+                lst.append((node, j, seq))
+            # (the glTF names it anim<N>: Blender's glTF importer drops longer names; the .blend
+            # renames each action to its full name)
+            gname = f'anim{len(info):03d}'
+            self.animation(gname, lst, every_joint=True)
+            info[e['name']] = dict(gltf=gname, frames=n, flags=f"{a['flags']:08X}", loop=bool(a.get('loop')), actions=e['actions'],
+                                   flags_guessed=e['guessed'], source=e['source'], joints=a['names'],
+                                   keys=a['keys'], **({'note': a['note']} if a['note'] else {}))
+        self.manifest['fighter_animations'] = info
 
     def joint_animations(self, name, d, anims):
         """Joint animations (anim_joints scripts; stage layers, items, projectiles): each joint's
@@ -317,7 +401,7 @@ class Exporter:
             if sc is None:
                 continue
             a = JA.play(f.char, f.char_int, sc, j)
-            info[j.index] = dict(frames=a['frames'], loop=a['loop'], loop_start=a['loop_start'],
+            info[j.index] = dict(frames=a['frames'], loop=a['loop'], loop_start=a['loop_start'], keys=a['keys'],
                                  tracks=a['tracks'], locked=JA.uses_interp(f.char, f.char_int, sc))
             idx = {k: JA.NAMES.index(k) for k in JA.EDITABLE}
             seq = [{idx[k]: a['samples'][k][n] for k in JA.EDITABLE} for n in range(a['frames'] + 1)]
@@ -713,6 +797,15 @@ class Exporter:
                             if sc is not None:
                                 self.script_of.setdefault(ms, sc)
         self.skeleton(hi['joints'])
+        if getattr(self, 'shield', None) and self.root_node:
+            self.shield_animations(self.shield)
+        if getattr(self, 'fighter_anims', None) and self.root_node:
+            self.fighter_animations(self.fighter_anims)
+        if self.root_node:
+            # attr->hiddenparts: the joint each motion-flag bit (31 - i) adds (Blender: the flags'
+            # checkboxes)
+            self.manifest['hidden_parts'] = [SP.joint_name(h[0]) for h in SP.hidden_parts(f)]
+            self.manifest['hidden_part_parents'] = [SP.joint_name(h[1]) if h[1] else 'TopN' for h in SP.hidden_parts(f)]
         self.manifest['lights'] = MF.model_lights(f)       # light / shadow (ambient) colors
         self.manifest['expressions'] = f.textureparts      # (texture-index switches: joint + material index)
         for detail in ('hi', 'lo'):
@@ -827,6 +920,7 @@ def main(argv=None):
                     help='hex ROM file ID for character.bin (use with --main-file-id)')
     ap.add_argument('--costumes', type=int)
     ap.add_argument('--no-preview', action='store_true', help="don't render previews/*.png")
+    ap.add_argument('--no-animations', action='store_true', help="fighters: don't export their animations")
     # items / projectiles (one model described by ITAttributes / WPAttributes)
     ap.add_argument('--object', metavar='NAME',
                     help="CHAR_DIR's (a character or stage folder) item / projectile NAME: config.yaml "
@@ -935,10 +1029,12 @@ def main(argv=None):
                 char_file.write(char_data)
             f = MF.load(main_path, char_path, main_entry.tbl or 0,
                         main_entry.res or 0, char_entry.tbl or 0, char_ext)
+        shield = rom_shield_pose(entries, main_entry, f)
     else:
         main_path = a.main or os.path.join(char_dir, 'main.bin')
         char_path = a.char or os.path.join(char_dir, 'character.bin')
         f = MF.load(main_path, char_path, mi, me, ci)
+        shield = folder_shield_pose(cfg, char_dir) if char_dir and not (a.main or a.char) else None
 
     tf = (cfg.get('attributes') or {}).get('texture_forms') if not a.rom else None
     if tf:   # texture parts the build writes into main.bin (config.yaml attributes.texture_forms)
@@ -954,6 +1050,24 @@ def main(argv=None):
          or (VANILLA_FIGHTER_COSTUMES.get(a.fighter, 4) if a.fighter else None)
          or (1 if a.rom else costumes_in_scripts(f)) or 1)
     ex = Exporter(f, out_dir, n)
+    import legs
+    _, _, _, note = legs.check(f)
+    if note:
+        print('  note: ' + note)
+    if shield is not None:
+        data, head, src = shield
+        try:
+            ex.shield = SP.load(f, data, head)
+            ex.shield['source'] = src
+        except ValueError as e:
+            print(f'  note: no shield pose exported ({e})')
+    if not a.no_animations:
+        try:
+            ex.fighter_anims = (rom_animations(entries, f, a.fighter) if a.rom else
+                                folder_animations(cfg, char_dir, f) if char_dir and not (a.main or a.char) else [])
+        except (OSError, ValueError, KeyError) as e:
+            print(f'  note: no animations exported ({e})')
+            ex.fighter_anims = []
     ex.manifest['source'] = source_info('fighter', None if (a.main or a.char) else char_dir, a, a.fighter)
     ex.manifest['hurtboxes'] = GD.hurtboxes(f, {} if a.rom else cfg)     # (Blender: 'Hurtboxes')
     ex.run()
@@ -968,6 +1082,177 @@ def main(argv=None):
         import preview
         for p in preview.save_sheets(out_dir):
             print(f'preview: {p}')
+
+
+def animation_name(parts, suffix=''):
+    """An animation's Blender name: its file and every action that plays it, ' | ' between (a
+    search for any one of them finds it), each once."""
+    seen, out = set(), []
+    for p in parts:
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return ' | '.join(out) + suffix
+
+
+def folder_animations(cfg, char_dir, f):
+    """A character folder's animations/*.bin, with the flags main.asm gives the actions that
+    play them (motions.py; -1: the base character's, from the original ROM)."""
+    adir = os.path.join(char_dir, 'animations')
+    if not os.path.isdir(adir):
+        return []
+    base = (cfg.get('definitions') or {}).get('base_character')
+    name = os.path.basename(os.path.normpath(char_dir))
+    try:
+        mot, overridden = MO.folder_motions(char_dir, name, base)
+    except OSError as e:
+        print(f'  note: action flags not read ({e}); guessing them from each file\'s joint count')
+        mot, overridden = {}, set()
+    out = []
+    for fn in sorted(os.listdir(adir), key=str.lower):
+        if not fn.lower().endswith('.bin'):
+            continue
+        stem = fn[:-4]
+        data = open(os.path.join(adir, fn), 'rb').read()
+        e = mot.get(stem) or dict(flags=None, actions=[], conflicts=[])
+        flags, guessed = FT.pick_flags(f, data, [e['flags']] + [c[1] for c in e['conflicts']])
+        try:
+            anim = FT.load(f, data, flags=flags)
+        except Exception as err:          # (a file that isn't an animation)
+            print(f'  note: {fn}: not read ({err})')
+            continue
+        out.append(dict(name=animation_name([stem] + e['actions']), anim=anim, actions=e['actions'],
+                        flags=flags, guessed=guessed or not e['actions'], source=f'animations/{fn}'))
+    print(f'  {len(out)} animations ({sum(1 for x in out if x["guessed"])} with guessed flags: '
+          f'no action in main.asm, or none whose flags fit the file)')
+    out += parent_animations(f, base, overridden, {x['name'] for x in out})
+    return out
+
+
+def parent_animations(f, base, overridden, taken):
+    """The base character's animations for the actions the character doesn't give its own
+    (main.asm): the game plays the parent's file for them, on this character's skeleton, with
+    the parent's flags. From the original ROM (motions.ORIGINAL_ROM). Named '<action> | ... (<PARENT>)'."""
+    cid = MO.CHAR_IDS.get(str(base).upper()) if base else None
+    if cid is None or not os.path.exists(MO.ORIGINAL_ROM):
+        if cid is not None:
+            print(f'  note: no parent animations ({MO.ORIGINAL_ROM} not found)')
+        return []
+    entries = SSBtbl.fromROM(N64(open(MO.ORIGINAL_ROM, 'rb').read()))
+    by_file = {}
+    for key, m in MO.rom_motions(cid).items():
+        fid = m['file_id']
+        acts = [x for x in m['actions'] if x not in overridden]
+        if not fid or not acts or m['flags'] & FT.FLAG_SHIELDPOSE:
+            continue
+        e = by_file.setdefault(fid, dict(actions=[], flags=[]))
+        e['actions'] += acts
+        e['flags'].append(m['flags'])
+    out, used = [], set(taken)
+    tag = str(base).upper()
+    for fid, e in sorted(by_file.items()):
+        if not 0 <= fid < len(entries):
+            continue
+        ent = entries[fid]
+        data = ent.extract('data')
+        flags, _ = FT.pick_flags(f, data, e['flags'])
+        try:
+            anim = FT.load(f, data, ent.tbl if ent.tbl is not None else None, flags)
+        except Exception as err:
+            print(f'  note: parent file 0x{fid:X}: not read ({err})')
+            continue
+        name = animation_name(e['actions'], f' ({tag})')
+        while name in used:
+            name += '_'
+        used.add(name)
+        out.append(dict(name=name, anim=anim, actions=e['actions'], flags=flags, guessed=False,
+                        source=f'{tag} (original ROM file 0x{fid:X})'))
+    print(f'  {len(out)} {tag} animations for the actions main.asm leaves to the parent')
+    return out
+
+
+def rom_animations(entries, f, fighter):
+    """A vanilla fighter's animations from the ROM: its motion table (original ROM: anim file
+    IDs and flags per action), one animation per file, named after the actions playing it."""
+    cid = MO.CHAR_IDS.get(str(fighter).upper())
+    if cid is None:
+        print(f'  note: no animations exported ({fighter}: not a vanilla fighter)')
+        return []
+    by_file = {}
+    for key, m in MO.rom_motions(cid).items():
+        fid = m['file_id']
+        if not fid or not m['actions']:
+            continue
+        if m['flags'] & FT.FLAG_SHIELDPOSE:
+            continue                          # (guard on / off: played from the shield-pose file)
+        e = by_file.setdefault(fid, dict(actions=[], flags=[]))
+        e['actions'] += m['actions']
+        e['flags'].append(m['flags'])
+    out, used = [], set()
+    for fid, e in sorted(by_file.items()):
+        if not 0 <= fid < len(entries):
+            continue
+        ent = entries[fid]
+        data = ent.extract('data')
+        flags, guessed = FT.pick_flags(f, data, e['flags'])
+        try:
+            anim = FT.load(f, data, ent.tbl if ent.tbl is not None else None, flags)
+        except Exception as err:
+            print(f'  note: file 0x{fid:X}: not read ({err})')
+            continue
+        name = animation_name(e['actions'])
+        while name in used:
+            name += '_'
+        used.add(name)
+        out.append(dict(name=name, anim=anim, actions=e['actions'], flags=flags, guessed=guessed,
+                        source=f'ROM file 0x{fid:X}'))
+    print(f'  {len(out)} animations')
+    return out
+
+
+def rom_shield_pose(entries, main_entry, f):
+    """A ROM fighter's shield-pose file: the one main.bin's attr + 0x2D8 pointer (external)
+    points into. Its file ID is the entry's ID list item in the external chain's order.
+    -> (data, internal chain head, source) or None."""
+    field = f.attr + SP.A_LOOKUP
+    ids = [int.from_bytes(main_entry.idx[i:i + 2], 'big') for i in range(0, len(main_entry.idx or b''), 2)]
+    fields = list(f.main_ext)
+    if field not in fields or fields.index(field) >= len(ids):
+        print('  note: no shield pose found (main.bin 0x2D8 is not an external pointer)')
+        return None
+    fid = ids[fields.index(field)]
+    if not 0 <= fid < len(entries):
+        return None
+    e = entries[fid]
+    return e.extract('data'), e.tbl if e.tbl is not None else 0x3FFFC, f'ROM file 0x{fid:X}'
+
+
+def folder_shield_pose(cfg, char_dir, quiet=False):
+    """A character folder's shield pose: config.yaml shield_pose: [internal head, external head]
+    -> its shield_pose.bin; a ROM file ID, or none (its base character's): that file, from the
+    original ROM (motions.ORIGINAL_ROM). -> (data, internal chain head, source) or None."""
+    sp = cfg.get('shield_pose')
+    path = os.path.join(char_dir, 'shield_pose.bin')
+    if isinstance(sp, list) and os.path.exists(path):
+        return open(path, 'rb').read(), int(str(sp[0]), 16), 'shield_pose.bin'
+    if isinstance(sp, list):
+        why = 'no shield_pose.bin'
+    else:
+        from smashremix_extra.constants import SHIELD_POSES
+        base = str((cfg.get('definitions') or {}).get('base_character') or '').upper()
+        fid = sp if sp is not None else SHIELD_POSES.get(base)
+        if fid is not None and os.path.exists(MO.ORIGINAL_ROM):
+            fid = int(str(fid), 16)
+            entries = SSBtbl.fromROM(N64(open(MO.ORIGINAL_ROM, 'rb').read()))
+            if 0 <= fid < len(entries):
+                e = entries[fid]
+                return (e.extract('data'), e.tbl if e.tbl is not None else 0x3FFFC,
+                        f'ROM file 0x{fid:X}' + ('' if sp is not None else f' ({base}\'s)'))
+        why = (f'ROM file {sp}' if sp is not None else f"its base character's ({base or '?'})") + \
+            f', and {MO.ORIGINAL_ROM} not found'
+    if not quiet:
+        print(f'  note: no shield pose exported ({why})')
+    return None
 
 
 def source_info(kind, folder, a, name=None):

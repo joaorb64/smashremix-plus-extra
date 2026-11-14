@@ -1732,9 +1732,30 @@ def sync_loops(*_):
                 _sync_cycles([fc], bool(m['n64_anim_loop']))
 
 
+_SHOWN_ACTION = {}
+
+
+def _follow_action_range(scene):
+    """An armature given another action (Action Editor): the scene's frame range becomes that
+    action's (its Manual Frame Range: a fighter animation's length, the shield's 0..360)."""
+    for ob in scene.objects:
+        if ob.type != 'ARMATURE' or ob.animation_data is None:
+            continue
+        act = ob.animation_data.action
+        name = act.name if act is not None else None
+        if _SHOWN_ACTION.get(ob.name) == name:
+            continue
+        _SHOWN_ACTION[ob.name] = name
+        if act is not None and getattr(act, 'use_frame_range', False):
+            scene.frame_start, scene.frame_end = int(act.frame_start), int(act.frame_end)
+            if not scene.frame_start <= scene.frame_current <= scene.frame_end:
+                scene.frame_current = scene.frame_start
+
+
 def _sync_loops_on_update(scene, depsgraph):
     if depsgraph.id_type_updated('ACTION') or depsgraph.id_type_updated('OBJECT'):
         sync_loops()
+        _follow_action_range(scene)
 
 
 def _last_key(fcurves):
@@ -1817,6 +1838,189 @@ class N64_PT_joint(bpy.types.Panel):
                            f'the length', icon='ERROR')
         lay.label(text='60 frames per second; each joint loops on its own', icon='INFO')
         lay.operator('n64.joint_anim_remove', icon='X')
+
+
+# ---------------------------------------------------------------- fighter animation flags
+# FTMotionDesc anim_desc (decomp ftdef.h / ftmain.c ftMainSetStatus): bit 31 - i turns the
+# fighter's hidden part i on (attr->hiddenparts: a joint added to its tree, e.g. TransN, XRotN,
+# YRotN); the low bits are modes
+MODE_FLAGS = (
+    (0x10, 'Submotion Script', 'Its command script is in the submotion file instead of the mainmotion one'),
+    (0x08, '32-bit Scripts', 'The animation uses the 32-bit script format (like stage animations) '
+                             'instead of the fighters\' 16-bit one'),
+    (0x04, 'No Translate Scales', 'Joint translations aren\'t scaled by the fighter\'s translate_scales '
+                                  '(only matters for fighters that have them)'),
+    (0x02, 'Shield Pose File', 'The animation is read from the shield-pose file (guard on / off)'),
+    (0x01, 'Animation Locks', 'The fighter\'s locked joints (attributes animlock) are animated too'),
+)
+HIDDEN_DESC = {
+    'TransN': 'Root motion: the game moves the fighter by its translation',
+    'XRotN': 'A joint above the body that turns all of it',
+    'YRotN': 'XRotN\'s last child: where the shield sits',
+}
+
+
+def _action_flags(act):
+    try:
+        return int(str(act.get('n64_flags', '0')), 16) & 0xFFFFFFFF
+    except ValueError:
+        return 0
+
+
+def _flag_bits_get(self):
+    v = _action_flags(self)
+    return [bool((v >> i) & 1) for i in range(32)]
+
+
+def _flag_bits_set(self, bits):
+    self['n64_flags'] = f'{sum(1 << i for i, b in enumerate(bits) if b):08X}'
+
+
+def _flags_hex_get(self):
+    return f'{_action_flags(self):08X}'
+
+
+def _flags_hex_set(self, text):
+    try:
+        self['n64_flags'] = f'{int(text.strip().lower().removeprefix("0x"), 16) & 0xFFFFFFFF:08X}'
+    except ValueError:
+        pass
+
+
+def _anim_loop_get(self):
+    return bool(self.get('n64_loop', False))
+
+
+def _anim_loop_set(self, on):
+    self['n64_loop'] = bool(on)
+
+
+def _flags_owner(context):
+    """The armature and its action with motion flags (the active object, or the scene's fighter)."""
+    ob = context.active_object
+    if ob is None or ob.type != 'ARMATURE':
+        ob = next((o for o in context.scene.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()), None)
+    if ob is None or ob.animation_data is None or ob.animation_data.action is None:
+        return ob, None
+    act = ob.animation_data.action
+    return ob, (act if 'n64_flags' in act.keys() else None)
+
+
+def draw_motion_flags(lay, context):
+    ob, act = _flags_owner(context)
+    if act is None:
+        lay.label(text='Pick a fighter animation in the Action Editor', icon='INFO')
+        return
+    lay.label(text=act.name, icon='ACTION')
+    if act.get('n64_actions'):
+        col = lay.column(align=True)
+        col.label(text='Played by:')
+        col.label(text='   ' + str(act['n64_actions']))
+    lay.prop(act, 'n64ui_anim_loop', text='Loop')
+    row = lay.row()
+    row.prop(act, 'n64ui_flags_hex', text='Flags 0x')
+    if act.get('n64_flags_guessed'):
+        lay.label(text='Guessed from the file\'s joint count', icon='QUESTION')
+    v = _action_flags(act)
+    parts = list(ob.get('n64_hidden_parts') or []) if ob is not None else []
+    box = lay.box()
+    box.label(text='Joints added (hidden parts)', icon='BONE_DATA')
+    col = box.column(align=True)
+    parents = list(ob.get('n64_hidden_part_parents') or []) if ob is not None else []
+    for i, name in enumerate(parts[:27]):
+        bit = 31 - i
+        r = col.row()
+        r.prop(act, 'n64ui_flag_bits', index=bit, text=f'{name}')
+        r.label(text=f'{1 << bit:08X}')
+        # a part hanging from another hidden part needs that one on (the game adds it under it)
+        par = parents[i] if i < len(parents) else None
+        if (v >> bit) & 1 and par in parts and not (v >> (31 - parts.index(par))) & 1:
+            col.label(text=f'{name} hangs from {par}: turn {par} on too (the game needs it)', icon='ERROR')
+    for bit in range(5, 32):                          # set bits the fighter has no part for
+        i = 31 - bit
+        if i >= len(parts) and (v >> bit) & 1:
+            r = col.row()
+            r.prop(act, 'n64ui_flag_bits', index=bit, text=f'Hidden part {i} (none)')
+            r.label(text=f'{1 << bit:08X}')
+    box.label(text='They set the joints the file\'s scripts drive, in order', icon='INFO')
+    box = lay.box()
+    box.label(text='Modes', icon='PREFERENCES')
+    col = box.column(align=True)
+    for bit_val, label, _ in MODE_FLAGS:
+        bit = bit_val.bit_length() - 1
+        r = col.row()
+        r.prop(act, 'n64ui_flag_bits', index=bit, text=label)
+        r.label(text=f'{bit_val:08X}')
+    if act.get('n64_source'):
+        lay.label(text=f"From: {act['n64_source']}")
+
+
+class N64_PT_motion_flags(bpy.types.Panel):
+    """The active fighter animation's motion flags (Properties > Object)."""
+    bl_label = 'N64 Animation'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'object'
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.type == 'ARMATURE' and 'n64_hidden_parts' in ob.keys()
+
+    def draw(self, context):
+        draw_motion_flags(self.layout, context)
+
+
+def _is_n64_fighter(context):
+    return any(o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys() for o in context.scene.objects)
+
+
+def _dopesheet_n64_draw(self, context):
+    """N64 Animation, first in the Action Editor's sidebar: drawn at the top of Blender's Action
+    panel (the sidebar keeps its saved panel order, so a panel of its own would come last)."""
+    if not _is_n64_fighter(context):
+        return
+    box = self.layout.box()
+    box.label(text='N64 Animation', icon='ARMATURE_DATA')
+    draw_motion_flags(box, context)
+
+
+def _remove_dopesheet_draws():
+    """Every N64 Animation draw added to the Action panel, by any copy of this script (the
+    add-on and the one embedded in the .blend, or an earlier file's): only one is drawn."""
+    cls = getattr(bpy.types, 'DOPESHEET_PT_action', None)
+    if cls is None or not hasattr(cls, '_dyn_ui_initialize'):
+        return
+    funcs = cls._dyn_ui_initialize()
+    for fn in [fn for fn in funcs if getattr(fn, '__name__', '') == '_dopesheet_n64_draw']:
+        funcs.remove(fn)
+
+
+_ASSET_POLL = []
+
+
+def _hide_pose_asset_panel():
+    """The Action tab's Create Pose Asset panel isn't used here: hidden in N64 fighter files."""
+    cls = getattr(bpy.types, 'DOPESHEET_PT_asset_panel', None)
+    if cls is None or _ASSET_POLL:
+        return
+    orig = cls.__dict__.get('poll')
+    _ASSET_POLL.append((cls, orig))
+
+    def poll(c, context):
+        if _is_n64_fighter(context):
+            return False
+        return orig.__func__(c, context) if orig is not None else True
+    cls.poll = classmethod(poll)
+
+
+def _restore_pose_asset_panel():
+    for cls, orig in _ASSET_POLL:
+        if orig is not None:
+            cls.poll = orig
+        else:
+            del cls.poll
+    _ASSET_POLL.clear()
 
 
 class N64_PT_scene(bpy.types.Panel):
@@ -3047,26 +3251,61 @@ class N64_PT_gamedata(bpy.types.Panel):
 CLASSES = (N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
            N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene, N64_PT_gamedata,
            N64_OT_hurtbox_add, N64_OT_hurtbox_remove, N64_OT_hurtbox_select, N64_PT_bone_hurtboxes,
-           N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools)
+           N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools,
+           N64_PT_motion_flags)
 
 
-def _collapse_outliner():
-    """Once, on the first open of a generated .blend: every collection collapsed."""
+def _collapse_visible_outliners():
+    """Collapse every entry of the outliners shown now (each screen once: the scene's
+    n64_collapsed_screens). The outliner operator only works on a visible area, so other
+    workspaces' outliners are collapsed when they're first shown."""
     scene = bpy.context.scene
     if scene is None or not scene.get('n64_collapse_outliner'):
-        return None
+        return
+    done = set(scene.get('n64_collapsed_screens') or [])
     for win in bpy.context.window_manager.windows:
-        for area in win.screen.areas:
+        scr = win.screen
+        if scr is None or scr.name in done:
+            continue
+        found = False
+        for area in scr.areas:
             if area.type != 'OUTLINER':
                 continue
             region = next((r for r in area.regions if r.type == 'WINDOW'), None)
-            with bpy.context.temp_override(window=win, area=area, region=region):
-                for _ in range(4):
+            if region is None:
+                continue
+            found = True
+            with bpy.context.temp_override(window=win, screen=scr, area=area, region=region):
+                for _ in range(12):            # one level per call, deepest first
                     try:
                         bpy.ops.outliner.show_one_level(open=False)
                     except RuntimeError:
                         break
-    scene['n64_collapse_outliner'] = False
+            area.tag_redraw()
+        if found:
+            done.add(scr.name)
+    scene['n64_collapsed_screens'] = sorted(done)
+
+
+def _collapse_outliner():
+    """On open of a generated .blend: the outliners collapsed (retried while the window
+    builds its outliner tree)."""
+    _collapse_outliner.tries = getattr(_collapse_outliner, 'tries', 0) + 1
+    scene = bpy.context.scene
+    if scene is None or not scene.get('n64_collapse_outliner'):
+        return None
+    scene['n64_collapsed_screens'] = []             # (again: the tree may not have been built yet)
+    _collapse_visible_outliners()
+    return 0.75 if _collapse_outliner.tries < 3 else None
+
+
+def _workspace_changed(*_):
+    """A workspace shown for the first time: its outliner collapsed."""
+    bpy.app.timers.register(_collapse_visible_outliners_once, first_interval=0.1)
+
+
+def _collapse_visible_outliners_once():
+    _collapse_visible_outliners()
     return None
 
 
@@ -3091,6 +3330,26 @@ def register():
                                                                 name='Loop', description=LOOP_DESC)
     bpy.types.PoseBone.n64ui_anim_loop = bpy.props.BoolProperty(get=_bone_loop_get, set=_bone_loop_set,
                                                                 name='Loop', description=LOOP_DESC)
+    bpy.types.Action.n64ui_flag_bits = bpy.props.BoolVectorProperty(
+        size=32, get=_flag_bits_get, set=_flag_bits_set, name='Motion Flags',
+        description='The animation\'s motion flags (anim_desc): bit 31 - i adds the fighter\'s hidden part i '
+                    '(a joint) to its tree, the low bits are modes')
+    bpy.types.Action.n64ui_anim_loop = bpy.props.BoolProperty(
+        get=_anim_loop_get, set=_anim_loop_set, name='Loop',
+        description='The animation starts over at its end (its scripts loop); off: it ends there')
+    _remove_dopesheet_draws()
+    if hasattr(bpy.types, 'DOPESHEET_PT_action'):
+        bpy.types.DOPESHEET_PT_action.prepend(_dopesheet_n64_draw)
+    old_tab = getattr(bpy.types, 'N64_PT_motion_flags_dopesheet', None)      # (an older version's
+    if old_tab is not None:                                                  # N64 tab panel)
+        try:
+            bpy.utils.unregister_class(old_tab)
+        except RuntimeError:
+            pass
+    _hide_pose_asset_panel()
+    bpy.types.Action.n64ui_flags_hex = bpy.props.StringProperty(
+        get=_flags_hex_get, set=_flags_hex_set, name='Flags',
+        description='The motion flags as the game stores them (hex): the checkboxes below, combined')
     handlers = bpy.app.handlers.depsgraph_update_post
     for h in [h for h in handlers if getattr(h, '__name__', '') == '_sync_loops_on_update']:
         handlers.remove(h)                         # (registered again: the add-on + embedded copy)
@@ -3109,7 +3368,10 @@ def register():
         except ValueError:                 # already registered (add-on + embedded copy)
             pass
     if not bpy.app.background:
+        _collapse_outliner.tries = 0
         bpy.app.timers.register(_collapse_outliner, first_interval=0.5)
+        bpy.msgbus.subscribe_rna(key=(bpy.types.Window, 'workspace'), owner=_MSGBUS_OWNER, args=(),
+                                 notify=_workspace_changed)
     # picking / opening an image on a texture node refreshes the N64 view
     bpy.msgbus.subscribe_rna(key=(bpy.types.ShaderNodeTexImage, 'image'), owner=_MSGBUS_OWNER, args=(),
                              notify=_image_changed)
@@ -3140,6 +3402,11 @@ def unregister():
     for t in (bpy.types.Material, bpy.types.PoseBone):
         if hasattr(t, 'n64ui_anim_loop'):
             delattr(t, 'n64ui_anim_loop')
+    for name in ('n64ui_flag_bits', 'n64ui_flags_hex', 'n64ui_anim_loop'):
+        if hasattr(bpy.types.Action, name):
+            delattr(bpy.types.Action, name)
+    _remove_dopesheet_draws()
+    _restore_pose_asset_panel()
     handlers = bpy.app.handlers.depsgraph_update_post
     for h in [h for h in handlers if getattr(h, '__name__', '') == '_sync_loops_on_update']:
         handlers.remove(h)

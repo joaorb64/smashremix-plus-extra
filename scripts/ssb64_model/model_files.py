@@ -333,11 +333,13 @@ def _anim_value(a):
     return None
 
 
-def simulate_anim(d, ptrs, script, frames):
+def simulate_anim(d, ptrs, script, frames, keys=None):
     """A DObj animation script (anim_joints[joint]: AObjEvent32 commands, objanim.c
     gcParseDObjAnimJoint + gcPlayDObjAnimJoint) played for `frames` frames ->
     [{track: value}] per frame (only the animated tracks: 0..2 rotation x/y/z, 4..6
-    translation, 7..9 scale), and the frame its script first loops back (or ends), if any."""
+    translation, 7..9 scale), and the frame its script first loops back (or ends), if any.
+    keys: a dict that gets, per track, the frames where the script sets its value (its
+    keyframes): {track: set of frames}."""
     END = 'end'
     tracks, out = {}, []
     wait, frame, ptr, seen, loop_at = 'changed', 0.0, script, {script}, None
@@ -374,6 +376,8 @@ def simulate_anim(d, ptrs, script, frames):
                         if not (flags >> i) & 1:
                             continue
                         a = track(i)
+                        if keys is not None:
+                            keys.setdefault(i, set()).add(n)
                         a['vb'], a['vt'] = a['vt'], f32_at(ptr)
                         ptr += 4
                         if op in (5, 6):                          # value + rate (cubic)

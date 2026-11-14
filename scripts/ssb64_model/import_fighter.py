@@ -687,13 +687,31 @@ def main(argv=None):
                              os.path.join(a.char_dir, 'config.yaml'), write_cfg=a.out is None)
     if msg:
         print('  ' + msg)
+    import legs
+    _, _, _, note = legs.check(f, main)   # slope foot IK: ids that don't point at legs (not changed)
+    if note:
+        print('  note: ' + note)
     out = a.out or a.char_dir
     os.makedirs(out, exist_ok=True)
+    shield = apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines)
     open(os.path.join(out, 'character.bin'), 'wb').write(newc)
     open(os.path.join(out, 'main.bin'), 'wb').write(main)
     open(os.path.join(out, 'main_reqlist.txt'), 'w', encoding='utf-8', newline='').write(
         newline.join(reqlist_lines) + (newline if reqlist_raw.endswith(b'\n') else ''))
     print(f'wrote {out}/character.bin ({len(newc)} bytes), main.bin, main_reqlist.txt')
+    if shield is not None:
+        open(os.path.join(out, 'shield_pose.bin'), 'wb').write(shield['data'])
+        print(f"wrote {out}/shield_pose.bin ({len(shield['data'])} bytes)")
+    # fighter animations edited in Blender (blend_to_gltf.py samples the ones that changed)
+    try:
+        changed = json.load(open(os.path.join(a.work_dir, 'costumes.json'))).get('fighter_anims') or []
+    except (OSError, ValueError):
+        changed = []
+    if changed:
+        import anim_import
+        anim_import.apply(a.char_dir, out, changed, getattr(textures, 'manifest', None) or {}, cfg, f)
+    else:
+        print('  animations: none changed')
     built = MF.load(os.path.join(out, 'main.bin'), os.path.join(out, 'character.bin'), mi_head, me_head, ci_head)
     check_cloaking(cfg, built)
     if a.preview:                     # what was built, read back like any fighter: export it, render that
@@ -709,6 +727,79 @@ def main(argv=None):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+
+
+def apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines):
+    """The .blend's shield pose (blend_to_gltf.shield_pose) -> a new shield_pose.bin
+    (shieldpose.build_file) when it changed: main.bin's 0x2D8..0x2F8 pointers (in place) point
+    into it, their main_reqlist.txt lines become ${SHIELD_POSE} (the build's ID for the
+    character's own file), config.yaml shield_pose: [its internal head, 3FFFC]. The Shield
+    Bubble's size -> shield_size (attr + 0x74). Returns the new file's dict or None."""
+    import export_model as EX
+    import shieldpose as SP
+    try:
+        blend = json.load(open(os.path.join(a.work_dir, 'costumes.json'))).get('shield_pose')
+    except (OSError, ValueError):
+        blend = None
+    if not blend:
+        return None
+    r = blend.get('radius')
+    old_r = MF.f32(main, f.attr + SP.A_SHIELD_SIZE)
+    in_cfg = (cfg.get('attributes') or {}).get('shield_size')
+    if in_cfg is not None:
+        old_r = float(in_cfg)                 # (the build writes config.yaml's over main.bin's)
+    if r and abs(r - old_r) > 0.01:
+        struct.pack_into('>f', main, f.attr + SP.A_SHIELD_SIZE, r)
+        print(f'  shield size: {old_r:g} -> {r:g}')
+        if in_cfg is not None:
+            line = f'shield_size: {round(r, 3)}'
+            if a.out is None:
+                import gamedata as GD
+                path = os.path.join(a.char_dir, 'config.yaml')
+                raw = open(path, encoding='utf-8', newline='').read()
+                nl = '\r\n' if '\r\n' in raw else '\n'
+                text = GD.set_yaml(raw.replace('\r\n', '\n'), 'attributes.shield_size', [line])
+                open(path, 'w', encoding='utf-8', newline='').write(text.replace('\n', nl))
+                print(f'  config.yaml attributes: {line}')
+            else:
+                print(f'  config.yaml attributes needs (not updated: --out): {line}')
+    old = EX.folder_shield_pose(cfg, a.char_dir, quiet=True)
+    if old is None:
+        print('  shield pose: no file to start from (config.yaml shield_pose / the original ROM): not written')
+        return None
+    sp = SP.load(f, *old[:2])
+    res = SP.build_file(sp, blend, old[0])
+    if res is None:
+        print('  shield pose: unchanged')
+        return None
+    fields = [f.attr + SP.A_LOOKUP] + [f.attr + SP.A_SECTORS + 4 * k for k in range(SP.N_SECTORS)]
+    targets = [res['lookup']] + res['sectors']
+    ext = list(MF.chain(bytes(main), me_head))
+    req = [i for i, ln in enumerate(reqlist_lines) if not ln.startswith('END OF')]
+    for fld, tgt in zip(fields, targets):
+        if fld not in ext:
+            raise SystemExit(f'main.bin 0x{fld:X} is not an external pointer: the shield pose can\'t be pointed at')
+        struct.pack_into('>H', main, fld + 2, tgt // 4)
+        reqlist_lines[req[ext.index(fld)]] = '${SHIELD_POSE}'
+    print(f"  shield pose ({old[2]}): {len(res['changed'])} change(s): " + ', '.join(res['changed'][:8])
+          + (' ...' if len(res['changed']) > 8 else ''))
+    for n in res['notes']:
+        print(f'    {n}')
+    want = [f"{res['int_head']:04X}", '3FFFC']
+    have = cfg.get('shield_pose')
+    if not (isinstance(have, list) and [str(x).upper() for x in have] == want):
+        line = f'shield_pose: ["{want[0]}", "{want[1]}"]'
+        if a.out is None:
+            import gamedata as GD
+            path = os.path.join(a.char_dir, 'config.yaml')
+            raw = open(path, encoding='utf-8', newline='').read()
+            nl = '\r\n' if '\r\n' in raw else '\n'
+            text = GD.set_yaml(raw.replace('\r\n', '\n'), 'shield_pose', [line])
+            open(path, 'w', encoding='utf-8', newline='').write(text.replace('\n', nl))
+            print(f'  config.yaml: {line}')
+        else:
+            print(f'  config.yaml needs (not updated: --out): {line}')
+    return res
 
 def check_cloaking(cfg, f):
     """config.yaml cloaking_fix points at render mode commands (byte offsets in a joint's

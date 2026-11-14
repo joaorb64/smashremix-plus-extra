@@ -174,6 +174,94 @@ They're read from config.yaml `attributes: hurtboxes` when it has them (the buil
 main.bin), else from main.bin. The import writes main.bin, and config.yaml's list when it has one
 (each box keeps its comments). Unchanged values stay exactly as they were.
 
+### Fighter animations
+
+Every animation the fighter plays, one Blender action each (kept, not assigned: pick one in the
+Animation workspace's Action Editor; the scene's frame range follows the action picked).
+
+Each is named after its file and every action that plays it, ` | ` between (`attackDash |
+DASHATTACK | DashAttack`): searching the Action Editor's list for any of them finds it.
+
+- **Character folder**: `animations/*.bin`. The flags each one is read with
+  come from `main.asm` (`edit_action_parameters`, `add_new_action_params`,
+  `edit_menu_action_parameters`); `-1` takes the base character's, from
+  `smashremix/roms/original.z64` like Remix's Character.asm macros do. Actions `main.asm` doesn't
+  give an animation play the base character's: those are exported too, from the original ROM,
+  as `<action> | ... (<PARENT>)` (on this character's skeleton, like the game plays them).
+- **ROM** (vanilla fighters): the fighter's motion table, one action per animation file, named
+  after the actions playing it (Remix's `Action.asm` names; `Menu <n>` for the menu poses).
+
+Why the flags matter (decomp `ftMainSetStatus`): an animation file is one script pointer per
+joint, in the order the game walks the fighter's joint tree from TopN, and which joints that tree
+has is the motion's flags: bit 31 - *i* turns hidden part *i* on (`attributes + 0x2D0`: XRotN,
+TransN, YRotN, extra joints like the one Snake's taunt uses), added to the joints `setup_parts`
+makes. The same file read with other flags animates the wrong joints. When several actions play
+one file with different flags, the export uses those whose joints the file covers: as many
+entries as joints, or more (the game stops at its last joint: Cloud's files carry one spare
+entry). When more than one fits, an exact count wins unless another reads translations much
+closer to the joints' rest (e.g. Cloud's idle: also Link's Menu 8, flags `0x80000000`, which
+would shift every joint by one). A file no action plays gets flags guessed the same way (the
+manifest's `flags_guessed`).
+
+The **N64 Animation** panel (Properties > Object with the armature selected, and the Action
+Editor's sidebar, open on the Action tab with this panel first) shows the action picked: which game actions play it, and its flags,
+as the final hex value (editable) and as checkboxes: one per hidden part, named after the joint
+it adds (this fighter's table: e.g. XRotN, TransN, YRotN, an extra joint), and the modes
+(submotion script, 32-bit scripts, no translate scales, shield-pose file, animation locks). Each
+box changes the hex value and the other way around. They're stored on the action
+(`n64_flags`); the import doesn't write animations yet.
+
+- **TransN**, when on, is the root motion: the game moves the fighter by its translation (a dash
+  attack's 1700 units forward), not the body; here it moves the armature's root, so it shows.
+- The scripts are the game's 16-bit format (`figatree.py`: values / 512 radians, / 4 units, / 4096
+  scale; flag `0x8`: the 32-bit stage format).
+- Keys: as few as follow the game's motion within ~0.5 degrees / 0.25 units, on the game's own
+  key frames where they can be (`keyreduce.py`): vanilla animations keep a subset of theirs,
+  baked ones (Blender's FBX export keys every frame) drop most of theirs.
+- Not handled yet: translate scales (attributes `translate_scales`, flag `0x4`), animation locks
+  (`0x1`), the guard animations stored in the shield-pose file (`0x2`); the import doesn't write
+  animations yet.
+
+### Shield pose (fighters)
+
+How the body leans while shielding, per stick direction (decomp `ftcommonguard1.c`; attributes
++ 0x2D8 `dobj_lookup`, + 0x2DC `shield_anim_joints[8]`, both external pointers into the shield-pose
+file). Exported from the character folder's `shield_pose.bin` (config.yaml `shield_pose: [internal
+head, external head]`), or from the ROM (the file main.bin's 0x2D8 pointer is in). A folder whose
+`shield_pose` is a ROM file ID, or that has none (its base character's), gets that file from the
+original ROM (`smashremix/roms/original.z64`). The import writes it back (see Import).
+
+The armature gets the game's hidden root joints above the body: `TransN` -> `XRotN` -> `joint_00`
+..., and `YRotN` (XRotN's last child: where the shield sits). Their rest is the identity, so the
+body doesn't move; no vertices go on them. Two actions, not assigned (the armature stays at
+rest): the Animation workspace opens with its Dope Sheet in **Action Editor**, pick one there:
+
+- **Shield**: frame = stick angle in degrees, the stick pushed all the way: 0 forward, 90 up, 180
+  back, 270 down, 360 forward again. The game stores it as 8 sectors of 45 frames (sector *i* =
+  frames 45 *i* .. 45 *i* + 45), each played at the angle within it.
+  Keys sit exactly on the game's key frames (the sector starts, plus wherever a script sets a
+  value, e.g. Mario's 44), with the game's values there. Between keys, the curves are Bezier
+  handles fitted to the game's motion: the game interpolates each joint's Euler angles, while
+  Blender turns the bone from its rest, so the two can differ slightly (the build prints the
+  worst case: Mario 0.5 degrees, Snake 0.2).
+- **Shield Neutral** (one frame): the pose each scripted joint goes back to as the stick returns
+  to the center. The game blends every body joint that has a script, and YRotN: `neutral +
+  (Shield - neutral) * stick range` (rotations as Euler angles). A joint without one keeps the
+  guard animation's pose (shown here at its neutral value). XRotN's neutral is never used: it
+  plays its sector script as it is (`ftCommonGuardInitJoints` starts at `dobj_lookup[1]`), so
+  e.g. Snake's 90-degree XRotN neutral doesn't show in game.
+
+The `Shield` collection (hidden at first) has **Shield Bubble**, a sphere on `YRotN` with the
+fighter's `shield_size` (attributes + 0x74) as its radius: the shield at full health (the game's
+30-unit sphere on YRotN, scaled `shield_size / 30`).
+
+Which joints the file covers, in its order: the tree `lbCommonAddDObjAnimJointAll` walks from
+XRotN while guarding. That's the body joints `setup_parts` (attributes + 0x29C) creates, plus the
+hidden parts (attributes + 0x2D0) the guard animations' motion flags turn on (0xA0000000 in every
+vanilla fighter: XRotN and YRotN). So it's XRotN, the body joints in order without the hidden
+ones (e.g. the last joint, hung under joint_00 only by other animations), then YRotN. The
+manifest's `shield` entry lists them, and which have a script per sector.
+
 ### Collision and stage objects (stages)
 
 | Collection | What | Written to |
@@ -198,6 +286,14 @@ groups (the Remix loader); the appender's collision writer numbers groups 1..N, 
 with gaps in their group ids (Saffron, Mushroom Kingdom) can't have their collision rewritten.
 
 ### Joint animations
+
+The glTF carries every animation sampled once per frame (what the game plays). The .blend
+rebuilds the curves with keys only where they're needed (`keyreduce.py`): the game's own key
+frames first (where its scripts set values), more only where Blender's curve can't follow the
+game's within tolerance (rotation ~0.002 degrees, 0.005 units), with Bezier handles fitted
+between. Keys go per channel group: a bone's rotation curves share the union of the game's
+rotation x / y / z keys (a quaternion turns all three axes at once), its location and its scale
+curves their own; a group the game never animates keeps a single key. The import samples every frame, so an unedited animation comes back the same.
 
 Each joint of a stage layer (bone `L<n>_joint_NN`), item or projectile (`joint_NN`: the
 attributes' anim_joints, +0x8, same format) plays its own script, with its own length and
@@ -235,8 +331,8 @@ import writes the script back (the original, byte for byte, when the keyframes w
 changed). Fighters' MObj scripts are their costume scripts, not animations.
 
 In Blender each animated value is a custom property of the material, keyframed in
-the material's action (60 frames per second, like the game), shown in Material Preview
-while the timeline plays. The **N64 Model** panel's **Material Animation** box lists
+the material's action (60 frames per second, like the game), shown in Material Preview while
+the timeline plays. The **N64 Model** panel's **Material Animation** box lists
 them; hover one + I to keyframe, **Add** for another:
 
 | Property | Track | What |
@@ -352,7 +448,9 @@ with a description on each option, including Render Mode (game / cut-out / trans
 tab), and a **Display List Commands** list: the material's extra commands
 (render mode, color combiner, prim / env / blend colors, alpha compare...) decoded
 in words, with color pickers, edit / remove buttons and an Add menu of presets (or a
-raw command). The .blend opens in Material Preview, where every material is drawn
+raw command). The .blend opens in Material Preview using the scene's world (a plain gray) and
+lights (none) instead of the studio HDRI: the materials light themselves (the game's light is in
+the shader), and lighting the scene from the HDRI is what made Material Preview slow. Every material is drawn
 through its real N64 color combiner (as nodes: prim / env colors, texture, vertex
 colors when unlit, blending), wrap modes and texture filtering, so it looks like the
 game; changing a setting updates the view. It's embedded in the .blend: allow the file's scripts when Blender asks
@@ -452,6 +550,54 @@ instead.
 
 Sizes (unedited round trip): Meta Knight 75,296 -> 55,088 bytes (its hi and lo
 models were duplicate data), Mega Man 107,632 -> 115,360, Snake 180,748 -> 107,800.
+
+#### Fighter animations
+
+Only the animations edited since the export are written (blend_to_gltf.py compares each
+action's keys, flags and Loop with what the export made). For each, every joint is sampled per
+frame in the game's space and written in the 16-bit format (`figatree.py`): as few keys as play
+it within ~0.23 degrees / 0.5 units, preferring the frames of the Blender keys, each segment
+linear or cubic (whichever is smaller per joint), looping when Loop is on. Then:
+
+- its own file: `animations/<file>.bin` is replaced; when its flags changed, every `main.asm`
+  line playing it gets them (`0x8`, 32-bit scripts, is cleared: it's written in 16-bit);
+- one of the base character's (`... (CAPTAIN)`): a new `animations/<action>.bin`, and `main.asm`
+  gets an `edit_action_parameters` (`edit_menu_action_parameters`) line per action playing it.
+
+`main.asm` keeps its line endings; with `--out`, it and the animations go there instead. Snake's
+139 files re-encoded this way: 915 KB -> 771 KB (its motion is detailed: a key every 2-3 frames
+stays needed at that tolerance).
+
+#### Shield pose
+
+When the `Shield` / `Shield Neutral` actions were edited (the build stores each bone's keys;
+only the bones whose keys changed are read), the import writes a new `shield_pose.bin`
+(`shieldpose.build_file`): the neutral DObjDesc array, the 8 sector arrays, the scripts. Each
+edited bone's sectors are compared with the file's (rotations as matrices, ~3 degrees /
+0.5 units); a changed one is sampled per frame in the game's space and written as an
+AObjEvent32 script (`jointanim.build`, Euler angles continuous from the file's own), every other
+script copied as it is. A joint the file gave no script in a sector gets one if it now moves
+away from its neutral pose. Then main.bin's 0x2D8..0x2F8 pointers point into the new file, their
+`main_reqlist.txt` lines become `${SHIELD_POSE}` (the build's ID for the character's own file:
+needed when it used a ROM file), and config.yaml gets `shield_pose: [its internal head,
+"3FFFC"]` (with `--out`: printed instead). The Shield Bubble's size (display size x scale) goes
+to `shield_size` (attributes + 0x74) when it changed.
+
+#### Slope foot IK (legs)
+
+On slopes the game bends each leg with 2-bone IK (`legs.py`; decomp
+`mpCommonUpdateFighterSlopeContour`). Attributes: + 0x2FC right thigh joint (fp->joints index),
++ 0x300 a length down the right shin, + 0x304 / + 0x308 the left's (the decomp calls the lengths
+`joint_*foot_rotate`). The IK moves the point that far down the shin by the floor's height
+difference under it (it doesn't put it on the floor), so the length only picks a point on the
+shin: a base character's works. The ids must point at the legs (thigh -> hip at the same place
+-> knee along x -> ankle): when they don't, the export and the import print a note with the
+joints that look like the legs. Nothing is changed automatically.
+
+The IK assumes the animation keeps the hip on the thigh joint and the knee at its rest offset
+(it bends the knee around z only, and reads the knee's current x offset as the thigh length).
+Animations that move those joints, or stand with straight knees, can make the legs jump on
+slopes.
 
 ### Items and projectiles
 
