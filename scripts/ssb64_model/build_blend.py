@@ -748,6 +748,11 @@ for idb in list(bpy.data.materials) + [scene]:
             except (TypeError, AttributeError):
                 pass
 
+# fighters: the 1P mode VS screen's cameras, in a collection that's off until enabled
+# (n64_panel make_vs_screen / _sync_vs_screen)
+if man.get('vs_1p') and bpy.data.collections.get('Costume 0') is not None:
+    PANEL.make_vs_screen(scene, man['vs_1p'])
+
 # the N64 Model panel (dropdowns / color pickers for the n64_* properties), registered
 # when the .blend is opened with its scripts allowed (or install n64_panel.py as an add-on)
 panel_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'n64_panel.py')

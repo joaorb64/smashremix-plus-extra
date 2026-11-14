@@ -672,6 +672,13 @@ def _edge_alpha(m, cmds, node, nt, alpha):
         return False, clip.outputs[0]
     if rm is not None:      # a mode that neither blends nor takes coverage from the texture alpha
         return False, 1.0   # (e.g. 00552078, AA opaque surface): opaque, whatever the alpha
+    scn = bpy.context.scene
+    if scn is not None and not scn.get('n64_kind'):
+        # fighters (no n64_kind: items / stages have one): the game sets an opaque mode per joint
+        # (ftDisplayMainDecideFogDraw: G_RM_AA_ZB_OPA_SURF2, coverage from the geometry), so a
+        # material without its own render mode is drawn solid whatever its texels' alpha
+        # (Ken's eyebrows: alpha-0 palette entries)
+        return False, 1.0
     return False, alpha
 
 
@@ -1753,6 +1760,7 @@ def _follow_action_range(scene):
 
 
 def _sync_loops_on_update(scene, depsgraph):
+    _sync_vs_screen(scene)
     if depsgraph.id_type_updated('ACTION') or depsgraph.id_type_updated('OBJECT'):
         sync_loops()
         _follow_action_range(scene)
@@ -2036,6 +2044,283 @@ class N64_PT_scene(bpy.types.Panel):
         lay.prop(context.scene, 'n64ui_shadow', text='Shadow Color')
         if 'n64_light_angle' in context.scene.keys():
             lay.prop(context.scene, '["n64_light_angle"]', text='Light Angle')
+        draw_vs_screen(lay, context.scene)
+
+
+# ------------------------------------------------------------------ 1P mode VS screen
+# The 'VS Screen' collection (build_blend.py, from the export's manifest vs_1p; excluded by
+# default) holds the 1P mode "VS" screen's cameras (sc1pintro.c): 'VS Camera 1P' frames the
+# player (its pose: Menu 13), 'VS Camera CPU' the CPU opponent (Menu 14, frozen at frame 0), by
+# the 1P stage it's met in. The fighter stands at the origin, unrotated, scale 1, lit from light
+# angle (-20, 30). Enabling the collection switches to the 1P view (camera, light angle, pose);
+# disabling it puts the previous camera / light angle / animation back.
+VS_COLLECTION = 'VS Screen'
+VS_CAM_1P, VS_CAM_CPU = 'VS Camera 1P', 'VS Camera CPU'
+VS_LIGHT_ANGLE = (-20.0, 30.0)
+VS_POSES = {'1P': 13, 'CPU': 14}
+
+
+def vs_pose_action(pose):
+    """The fighter's menu animation N (its Blender name lists 'Menu N' among its actions;
+    a parent's: 'Menu N (PARENT)')."""
+    import re
+    pat = re.compile(r'(^| \| )Menu ' + str(int(pose)) + r'( \||$| \()')
+    return next((a for a in bpy.data.actions if pat.search(a.name)), None)
+
+
+def _vs_info(scene):
+    import json
+    try:
+        return json.loads(scene.get('n64_vs1p', '') or 'null')
+    except ValueError:
+        return None
+
+
+def _vs_place(cam, c):
+    """A camera at the game's eye / at (game units; Blender (x, -z, y)), its vertical field of
+    view over the 240 screen lines (the 4:3 projection fills the 300 x 220 viewport)."""
+    import math
+    from mathutils import Vector
+    eye = Vector((c['eye'][0], -c['eye'][2], c['eye'][1]))
+    at = Vector((c['at'][0], -c['at'][2], c['at'][1]))
+    cam.location = eye
+    cam.rotation_euler = (at - eye).to_track_quat('-Z', 'Y').to_euler()
+    cam.data.sensor_fit = 'VERTICAL'
+    cam.data.angle_y = 2 * math.atan(math.tan(math.radians(float(c['fovy'])) / 2) * 240 / 220)
+    cam.data.clip_start, cam.data.clip_end = 128.0, 16384.0
+
+
+def _vs_stage_items(self, context):
+    info = _vs_info(context.scene) if context else None
+    return [(s, s, f'The CPU as the opponent of the 1P stage {s}') for s in (info or {}).get('cpu', {})] or \
+        [('NONE', 'None', '')]
+
+
+def _vs_stage_get(self):
+    info = _vs_info(self) or {}
+    stages = list(info.get('cpu', {}))
+    s = self.get('n64_vs_stage', 'Remix 1P')
+    return stages.index(s) if s in stages else 0
+
+
+def _vs_stage_set(self, i):
+    stages = list((_vs_info(self) or {}).get('cpu', {}))
+    if 0 <= i < len(stages):
+        self['n64_vs_stage'] = stages[i]
+        cam = bpy.data.objects.get(VS_CAM_CPU)
+        if cam is not None:
+            c = _vs_info(self)['cpu'][stages[i]]
+            _vs_place(cam, c)
+            _vs_hud_fit(cam, 'CPU', c['fovy'])
+
+
+# the HUD: quads at the game's screen pixels (320 x 240; the 3D viewport is 10..310 x 10..230,
+# its 4:3 projection centered at (160, 120): x 150, y 110 pixels per unit), parented to each
+# camera just past its near clip: the banners (sc1PIntroMakeBanners) and the screen's black border
+VS_HUD_DEPTH = 130.0
+VS_PIXEL_ASPECT_Y = (300 / 220) / (4 / 3)      # Blender: square pixels see this much less height
+VS_BORDER = (('border top', 0, 0, 320, 10), ('border bottom', 0, 230, 320, 10),
+             ('border left', 0, 10, 10, 220), ('border right', 310, 10, 10, 220))
+# the banners' screen rectangles (sprites at (10, 10) and (10, 182), 300 x 50; the bottom one cut
+# at the viewport's edge, 230), as flat quads
+# in roughly their average colors (sRGB)
+VS_BANNERS = (('banner top', 10, 10, 300, 50, (55, 33, 29)), ('banner bottom', 10, 182, 300, 48, (45, 26, 19)))
+
+
+def _vs_hud_quad(cam, name, x, y, w, h, fovy, mat):
+    """A quad covering screen pixels x..x+w, y..y+h, in front of camera cam."""
+    import math
+    t = math.tan(math.radians(float(fovy)) / 2) * VS_HUD_DEPTH
+
+    def pt(px, py):
+        return ((px - 160) / 150 * (4 / 3) * t, (120 - py) / 110 * t, -VS_HUD_DEPTH)
+    me = bpy.data.meshes.get(name) or bpy.data.meshes.new(name)
+    me.clear_geometry()
+    me.from_pydata([pt(x, y + h), pt(x + w, y + h), pt(x + w, y), pt(x, y)], [], [(0, 1, 2, 3)])
+    me.materials.clear()
+    me.materials.append(mat)
+    ob = bpy.data.objects.get(name) or bpy.data.objects.new(name, me)
+    ob.data = me
+    ob.parent = cam
+    ob.matrix_parent_inverse.identity()
+    ob.location, ob.rotation_euler, ob.scale = (0, 0, 0), (0, 0, 0), (1, 1, 1)
+    ob.hide_select = True
+    return ob
+
+
+def _vs_hud_material(name, rgb=(0, 0, 0)):
+    m = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    m['n64_helper'] = True                     # (not a model material: the import skips it)
+    try:
+        m.use_nodes = True
+    except (AttributeError, TypeError):
+        pass
+    nt = m.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new('ShaderNodeOutputMaterial')
+    em = nt.nodes.new('ShaderNodeEmission')
+    nt.links.new(em.outputs[0], out.inputs['Surface'])
+    em.inputs['Color'].default_value = (*(_srgb_lin(c / 255) for c in rgb), 1.0)
+    return m
+
+
+def _vs_hud_fit(cam, view, fovy):
+    """The camera's HUD quads re-fitted to its field of view (they're sized by it)."""
+    import math
+    for ob in bpy.data.objects:
+        if ob.get('n64_vs_hud') == view and ob.type == 'MESH' and ob.get('n64_vs_fovy'):
+            k = math.tan(math.radians(float(fovy)) / 2) / math.tan(math.radians(float(ob['n64_vs_fovy'])) / 2)
+            for v in ob.data.vertices:
+                v.co.x *= k
+                v.co.y *= k
+            ob['n64_vs_fovy'] = float(fovy)
+
+
+def make_vs_screen(scene, info):
+    """The VS Screen collection with the 1P / CPU cameras and their HUD (excluded from the
+    view layers)."""
+    import json
+    scene['n64_vs1p'] = json.dumps(info)
+    coll = bpy.data.collections.get(VS_COLLECTION) or bpy.data.collections.new(VS_COLLECTION)
+    if scene.collection.children.get(coll.name) is None:
+        scene.collection.children.link(coll)
+    for name in (VS_CAM_1P, VS_CAM_CPU):
+        if bpy.data.objects.get(name) is None:
+            coll.objects.link(bpy.data.objects.new(name, bpy.data.cameras.new(name)))
+    _vs_place(bpy.data.objects[VS_CAM_1P], info['player'])
+    stage = scene.get('n64_vs_stage', 'Remix 1P')
+    cpu = info['cpu'].get(stage) or next(iter(info['cpu'].values()))
+    _vs_place(bpy.data.objects[VS_CAM_CPU], cpu)
+    black = _vs_hud_material('VS HUD Border')
+    for view, cam_name, fovy in (('1P', VS_CAM_1P, info['player']['fovy']), ('CPU', VS_CAM_CPU, cpu['fovy'])):
+        cam = bpy.data.objects[cam_name]
+        quads = []
+        for name, x, y, w, h, rgb in VS_BANNERS:
+            quads.append(_vs_hud_quad(cam, f'VS HUD {view} {name}', x, y, w, h, fovy,
+                                      _vs_hud_material(f'VS HUD {name}', rgb)))
+        for name, x, y, w, h in VS_BORDER:
+            quads.append(_vs_hud_quad(cam, f'VS HUD {view} {name}', x, y, w, h, fovy, black))
+        for ob in quads:
+            ob['n64_vs_hud'] = view
+            ob['n64_vs_fovy'] = float(fovy)
+            if coll.objects.get(ob.name) is None:
+                coll.objects.link(ob)
+    for vl in scene.view_layers:
+        lc = vl.layer_collection.children.get(coll.name)
+        if lc is not None:
+            lc.exclude = True
+    return coll
+
+
+def _vs_enabled(scene):
+    for vl in scene.view_layers:
+        lc = vl.layer_collection.children.get(VS_COLLECTION) if vl.layer_collection else None
+        if lc is not None and not lc.exclude:
+            return True
+    return False
+
+
+def vs_show(scene, view):
+    """The 1P ('1P') or the CPU's ('CPU') view: camera and pose (1P: Menu 13 at its end; CPU:
+    Menu 14 at frame 0, as the game freezes it)."""
+    cam = bpy.data.objects.get(VS_CAM_1P if view == '1P' else VS_CAM_CPU)
+    if cam is not None:
+        scene.camera = cam
+    scene['n64_vs_view'] = view
+    for ob in bpy.data.objects:
+        if ob.get('n64_vs_hud'):
+            ob.hide_viewport = ob.hide_render = ob['n64_vs_hud'] != view
+    arm = next((o for o in scene.objects if o.type == 'ARMATURE'), None)
+    act = vs_pose_action(VS_POSES[view])
+    if arm is None or act is None:
+        return act is not None
+    ad = arm.animation_data or arm.animation_data_create()
+    ad.action = act
+    if hasattr(ad, 'action_slot') and ad.action_slot is None and getattr(act, 'slots', None):
+        ad.action_slot = act.slots[0]
+    _follow_action_range(scene)
+    scene.frame_current = scene.frame_end if view == '1P' else scene.frame_start
+    return True
+
+
+def _sync_vs_screen(scene):
+    """The VS Screen collection turned on / off: its view, or the previous one back."""
+    if bpy.data.objects.get(VS_CAM_1P) is None:
+        return
+    on = _vs_enabled(scene)
+    if bool(scene.get('n64_vs_on', False)) == on:
+        # a VS camera made the active one some other way (outliner, Ctrl+Numpad0): its view follows
+        cam = scene.camera.name if on and scene.camera else None
+        view = {VS_CAM_1P: '1P', VS_CAM_CPU: 'CPU'}.get(cam)
+        if view is not None and scene.get('n64_vs_view', '1P') != view:
+            vs_show(scene, view)
+        return
+    scene['n64_vs_on'] = on
+    arm = next((o for o in scene.objects if o.type == 'ARMATURE'), None)
+    ad = arm.animation_data if arm is not None else None
+    if on:
+        scene['n64_vs_saved'] = {
+            'light': [float(x) for x in scene.get('n64_light_angle', DEFAULT_LIGHT_ANGLE)],
+            'camera': scene.camera.name if scene.camera else '',
+            'action': ad.action.name if ad is not None and ad.action is not None else '',
+            'frame': scene.frame_current,
+            'pixel_aspect': [scene.render.pixel_aspect_x, scene.render.pixel_aspect_y]}
+        scene['n64_light_angle'] = list(VS_LIGHT_ANGLE)
+        scene.render.pixel_aspect_x, scene.render.pixel_aspect_y = 1.0, VS_PIXEL_ASPECT_Y
+        vs_show(scene, scene.get('n64_vs_view', '1P'))
+    else:
+        saved = scene.get('n64_vs_saved')
+        saved = saved.to_dict() if hasattr(saved, 'to_dict') else (saved or {})
+        if saved.get('light'):
+            scene['n64_light_angle'] = list(saved['light'])
+        if bpy.data.objects.get(saved.get('camera') or ''):
+            scene.camera = bpy.data.objects[saved['camera']]
+        if ad is not None and 'action' in saved:
+            ad.action = bpy.data.actions.get(saved['action']) if saved['action'] else None
+            _follow_action_range(scene)
+        if 'frame' in saved:
+            scene.frame_current = int(saved['frame'])
+        if saved.get('pixel_aspect'):
+            scene.render.pixel_aspect_x, scene.render.pixel_aspect_y = saved['pixel_aspect']
+    screen = getattr(bpy.context, 'screen', None)
+    for area in (screen.areas if screen else []):          # the camera's view while on
+        if area.type == 'VIEW_3D':
+            area.spaces[0].region_3d.view_perspective = 'CAMERA' if on else 'PERSP'
+            area.tag_redraw()
+
+
+class N64_OT_vs_view(bpy.types.Operator):
+    bl_idname = 'n64.vs_view'
+    bl_label = 'VS Screen View'
+    bl_description = 'The 1P mode VS screen: the player (1P pose, Menu 13) or the CPU opponent (Menu 14)'
+    bl_options = {'REGISTER', 'UNDO'}
+    view: bpy.props.EnumProperty(items=[('1P', '1P', 'The player'), ('CPU', 'CPU', 'The CPU opponent')])
+
+    def execute(self, context):
+        if not vs_show(context.scene, self.view):
+            self.report({'WARNING'}, f'No \'Menu {VS_POSES[self.view]}\' animation: the pose isn\'t set')
+        for area in (context.screen.areas if context.screen else []):
+            if area.type == 'VIEW_3D':
+                area.spaces[0].region_3d.view_perspective = 'CAMERA'
+        return {'FINISHED'}
+
+
+def draw_vs_screen(lay, scene):
+    if bpy.data.objects.get(VS_CAM_1P) is None:
+        return
+    box = lay.box()
+    box.label(text='1P Mode VS Screen', icon='CAMERA_DATA')
+    if not _vs_enabled(scene):
+        box.label(text='Enable the VS Screen collection to preview')
+        return
+    row = box.row(align=True)
+    view = scene.get('n64_vs_view', '1P')
+    for v in ('1P', 'CPU'):
+        row.operator('n64.vs_view', text=v, depress=view == v).view = v
+    box.prop(scene, 'n64ui_vs_stage', text='CPU Stage')
+    info = _vs_info(scene) or {}
+    if info.get('fighter'):
+        box.label(text=f'Cameras: {info["fighter"]}\'s (player), the stage\'s (CPU)')
 
 
 # ---------------------------------------------------------------------------- game data objects
@@ -3248,7 +3533,7 @@ class N64_PT_gamedata(bpy.types.Panel):
             lay.label(text=f'{ob.name}: scale / move its points (Edit Mode)', icon='SELECT_SET')
 
 
-CLASSES = (N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
+CLASSES = (N64_OT_vs_view, N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
            N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene, N64_PT_gamedata,
            N64_OT_hurtbox_add, N64_OT_hurtbox_remove, N64_OT_hurtbox_select, N64_PT_bone_hurtboxes,
            N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools,
@@ -3356,6 +3641,9 @@ def register():
     handlers.append(_sync_loops_on_update)
     for name, prop in SCENE_PROPS.items():
         setattr(bpy.types.Scene, name, prop)
+    bpy.types.Scene.n64ui_vs_stage = bpy.props.EnumProperty(
+        items=_vs_stage_items, get=_vs_stage_get, set=_vs_stage_set, name='CPU Stage',
+        description='The 1P stage the CPU is met in: its VS screen camera')
     for name, prop in COLLISION_SCENE_PROPS.items():
         setattr(bpy.types.Scene, name, prop)
     for name, prop in OBJECT_PROPS.items():
@@ -3397,6 +3685,8 @@ def unregister():
     for name in OBJECT_PROPS:
         if hasattr(bpy.types.Object, name):
             delattr(bpy.types.Object, name)
+    if hasattr(bpy.types.Scene, 'n64ui_vs_stage'):
+        delattr(bpy.types.Scene, 'n64ui_vs_stage')
     if hasattr(bpy.types.Scene, 'n64ui_show_hurtboxes'):
         delattr(bpy.types.Scene, 'n64ui_show_hurtboxes')
     for t in (bpy.types.Material, bpy.types.PoseBone):

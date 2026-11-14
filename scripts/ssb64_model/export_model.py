@@ -1070,6 +1070,10 @@ def main(argv=None):
             ex.fighter_anims = []
     ex.manifest['source'] = source_info('fighter', None if (a.main or a.char) else char_dir, a, a.fighter)
     ex.manifest['hurtboxes'] = GD.hurtboxes(f, {} if a.rom else cfg)     # (Blender: 'Hurtboxes')
+    try:
+        ex.manifest['vs_1p'] = vs1p_info(cfg, a, None if (a.main or a.char) else char_dir)
+    except (OSError, IndexError, ValueError, struct.error) as e:
+        print(f'  note: no 1P VS screen cameras ({e})')
     ex.run()
     m = ex.manifest
     tris = sum(o['triangles'] for o in m['objects'].values())
@@ -1253,6 +1257,80 @@ def folder_shield_pose(cfg, char_dir, quiet=False):
     if not quiet:
         print(f'  note: no shield pose exported ({why})')
     return None
+
+
+# the 1P mode "VS" screen (sc1pintro.c, overlay at RAM - 0x80006CC0 in the ROM): the player
+# fighter (Menu 13) is framed by its own camera (sc1PIntroMakeFighterCamera: eye / at from
+# the per-fighter CObjDesc table, fovy from its camera animation in file 0xB), the CPU (Menu 14,
+# frozen at frame 0) by its 1P stage's camera (sc1PIntroMakeStageCamera: the animation's eye / at
+# / fovy; VS Mario Bros: eye / at from the stage CObjDesc). Remix: a character uses its parent's
+# camera (Character.singleplayer_vs_preview).
+VS1P_FIGHTERS = ('MARIO', 'FOX', 'DK', 'SAMUS', 'LUIGI', 'LINK', 'YOSHI', 'CAPTAIN', 'KIRBY', 'PIKACHU',
+                 'JIGGLY', 'NESS')
+VS1P_STAGES = ('VS Link', 'VS Yoshi Team', 'VS Fox', None, 'VS Mario Bros.', 'VS Pikachu', 'VS Giant DK',
+               None, 'VS Kirby Team', 'VS Samus', 'VS Metal Mario', None, 'VS Fighting Polygon Team',
+               'VS Master Hand')
+VS1P_OVERLAY = 0x80006CC0
+VS1P_FIGHTER_DESCS, VS1P_STAGE_DESCS = 0x801351F0, 0x80134FF8      # CObjDesc: eye, at (f32 x 3), upz
+VS1P_FIGHTER_ANIMS, VS1P_STAGE_ANIMS = 0x801359D0, 0x80135180      # file 0xB offsets
+CHAR_ALIASES = {'DONKEY': 'DK', 'JIGGLYPUFF': 'JIGGLY', 'PURIN': 'JIGGLY', 'FALCON': 'CAPTAIN'}
+
+
+def _remix_parent(name):
+    src = os.path.join(APPENDER_DIR, 'smashremix', 'src', 'Character.asm')
+    try:
+        m = re.search(r'define_character\(' + re.escape(name) + r'\s*,\s*([A-Z0-9_]+)',
+                      open(src, encoding='utf-8', errors='replace').read())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def vs1p_info(cfg, a, char_dir):
+    """The 1P VS screen's cameras for this fighter -> dict(fighter, player={eye, at, fovy},
+    cpu={stage: {eye, at, fovy}}) in game units, or None (no original ROM / unknown fighter)."""
+    if not os.path.exists(MO.ORIGINAL_ROM):
+        return None
+    if not a.rom and char_dir:
+        name = str((cfg.get('definitions') or {}).get('base_character') or '').upper()
+    else:
+        name = (a.fighter or '').upper()
+        if CHAR_ALIASES.get(name, name) not in VS1P_FIGHTERS:
+            name = _remix_parent(name) or name
+    name = CHAR_ALIASES.get(name, name)
+    if name not in VS1P_FIGHTERS:
+        return None
+    rom = open(MO.ORIGINAL_ROM, 'rb').read()
+
+    def ram(addr, fmt):
+        o = addr - VS1P_OVERLAY
+        return struct.unpack(fmt, rom[o:o + struct.calcsize(fmt)])
+    data = SSBtbl.fromROM(N64(rom))[0xB].extract('data')
+
+    def anim(off):
+        frames, _ = MF.simulate_anim(data, None, off, 2)
+        v = frames[-1]                       # tracks: 0-2 eye, 4-6 at, 8 up x, 9 fovy
+        return dict(eye=[v.get(i, 0.0) for i in (0, 1, 2)], at=[v.get(i, 0.0) for i in (4, 5, 6)],
+                    fovy=v.get(9, 30.0))
+    k = VS1P_FIGHTERS.index(name)
+    # Remix's 1P mode: the CPU is framed by its match_pool entry's camera ("Model Scale":
+    # SinglePlayerModes.asm; extras: config.yaml singleplayer.scale, default 6F80 = VS Fox's)
+    remix_cam = int(str((cfg.get('singleplayer') or {}).get('scale', '6F80')), 16) \
+        if (not a.rom and char_dir) else 0x6F80
+    player = anim(ram(VS1P_FIGHTER_ANIMS + 4 * k, '>I')[0])
+    desc = ram(VS1P_FIGHTER_DESCS + 28 * 6 * k, '>7f')          # (cobj_id 0: no allies)
+    player.update(eye=list(desc[0:3]), at=list(desc[3:6]))
+    cpu = {'Remix 1P': anim(remix_cam)}
+    for s, stage in enumerate(VS1P_STAGES):
+        off = ram(VS1P_STAGE_ANIMS + 4 * s, '>I')[0]
+        if stage is None or not off:
+            continue
+        cam = anim(off)
+        if stage == 'VS Mario Bros.':
+            desc = ram(VS1P_STAGE_DESCS + 28 * s, '>7f')
+            cam.update(eye=list(desc[0:3]), at=list(desc[3:6]))
+        cpu[stage] = cam
+    return dict(fighter=name, player=player, cpu=cpu)
 
 
 def source_info(kind, folder, a, name=None):
