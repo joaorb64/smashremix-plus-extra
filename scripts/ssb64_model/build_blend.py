@@ -707,6 +707,10 @@ for screen in bpy.data.screens:
             space.shading.use_scene_lights = True
             space.shading.studiolight_intensity = 0.6
             space.shading.studiolight_background_alpha = 0.0
+            # no viewport compositor: the stage-layer compositing tree combines the per-layer view
+            # layers, which the viewport doesn't render, so it would show an empty view
+            if hasattr(space.shading, 'use_compositor'):
+                space.shading.use_compositor = 'DISABLED'
             space.overlay.show_stats = True                    # (Overlays > Statistics: triangle counts)
             r3d = space.region_3d
             if r3d:

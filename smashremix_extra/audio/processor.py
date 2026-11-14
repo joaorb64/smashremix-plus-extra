@@ -5,12 +5,16 @@ import lineinfile
 from typing import List
 
 from smashremix_extra.logger import logger
+from smashremix_extra.audio.bank import load_bank
+from smashremix_extra.audio.midi_to_bin import MidiConversionError, convert as convert_midi
+from smashremix_extra.constants import SMASHREMIX_PATH
 
 
 class AudioProcessor:
     """Processes extra_music/ and accumulates MIDI/BGM patch data."""
 
     def __init__(self):
+        self._bank = None
         self.midi_series_list: List[str] = []
         self.midi_files_list: List[str] = []
         self.midi_priority_overrides: List[str] = []
@@ -108,10 +112,22 @@ class AudioProcessor:
                                 f"dw menu_music_{midi_filename}"
                             )
 
+                        # A .mid next to the yaml is converted at build time into
+                        # build/ (takes priority over a prebuilt .bin of the same name)
+                        bin_path = f"../extra_music/{_dir}/{midi_filename}"
+                        midi_path = f"extra_music/{_dir}/{midi_filename}.mid"
+                        if os.path.exists(midi_path):
+                            out = f"build/extra_music/{_dir}/{midi_filename}"
+                            try:
+                                convert_midi(midi_path, f"{out}.bin", midi_config, self._get_bank())
+                            except MidiConversionError as e:
+                                raise SystemExit(f"Music: {midi_path} {e}")
+                            bin_path = f"../{out}"
+
                         self.midi_files_list.append(
                             f"insert_external_midi("
                             f"{_dir.upper()}_{midi_filename.upper()}, "
-                            f"../extra_music/{_dir}/{midi_filename}, "
+                            f"{bin_path}, "
                             f"{midi_config.get('random_tournament_profile', 'OS.TRUE')}, "
                             f"{midi_config.get('random_netplay_profile', 'OS.TRUE')}, "
                             f"{midi_config.get('can_toggle', 'OS.TRUE')}, "
@@ -124,6 +140,13 @@ class AudioProcessor:
                         logger.warning(f"Music: Error loading midi file {midi_file} for {_dir}: {e}")
             except Exception as e:
                 logger.warning(f"Music: Error loading game config for {_dir}: {e}")
+
+    def _get_bank(self):
+        """Instrument bank (vanilla from the ROM + Remix's midi.asm), loaded once."""
+        if self._bank is None:
+            self._bank = load_bank(
+                os.path.join(SMASHREMIX_PATH, "roms/original.z64"), "src/midi.asm")
+        return self._bank
 
     def patch_midi_asm(
         self,
