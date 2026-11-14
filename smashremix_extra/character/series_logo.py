@@ -1,11 +1,17 @@
 """Series logo: one mesh -> 3D results/data-screen logo + CSS logo + HUD emblem.
 
-The source is a mesh, from (first found in the character folder):
-- series_logo.blend: a copy of appender/templates/series_logo/series_logo.blend
-  with the logo mesh edited. Read through Blender (every visible mesh object,
-  modifiers applied); materials are ignored.
-- series_logo.bin: a GEE export of file 0x23 (legacy). Only its triangles are
-  read back.
+The source is a mesh in an open format, the first found in the character
+folder:
+- series_logo.obj  (Wavefront OBJ; polygons are triangulated here)
+- series_logo.gltf / series_logo.glb  (glTF 2.0)
+- series_logo.bin: a GEE export of file 0x23 (legacy; only its triangles are
+  read). `appender/scripts/series_logo.py convert` turns it into an OBJ.
+Materials, UVs and colors are ignored.
+
+Axes: Y up, the logo faces +Z (towards the viewer: the front view of OBJ /
+glTF, which Blender imports facing its front camera). Units don't matter: the
+logo is centered and scaled to the size of the vanilla logos (longest side
+LOGO_SIZE game units).
 
 From the mesh the build makes:
 - the 3D logo (file 0x23 block): DObjDesc tree, one display list and the
@@ -14,33 +20,24 @@ From the mesh the build makes:
 - series_logo.png (CSS, I8 64x48, gray 0x90) and hud.png (HUD emblem, white),
   front silhouettes fitted the way the vanilla logos sit, when the folder has
   no hand-made PNG.
-
-Coordinates: game units = Blender world * 100, game Y up = Blender Z, game Z
-(towards the camera) = Blender -Y. The template's armature (scale 0.01,
-rotated 90 on X) is just that conversion; any object setup works.
 """
 from __future__ import annotations
 
-import hashlib
+import base64
 import json
 import math
 import os
-import shlex
-import shutil
 import struct
-import subprocess
-import tempfile
 
 from PIL import Image
 
 APPENDER = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
-TEMPLATE_BLEND = os.path.join(APPENDER, "templates", "series_logo",
-                              "series_logo.blend")
-BLENDER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "series_logo_blender.py")
+TEMPLATE_OBJ = os.path.join(APPENDER, "templates", "series_logo",
+                            "series_logo.obj")
+SOURCE_NAMES = ("series_logo.obj", "series_logo.gltf", "series_logo.glb")
 
-GAME_PER_BLENDER = 100.0
+LOGO_SIZE = 300.0   # longest side, game units (vanilla ~280, Remix ~300-350)
 
 # Vanilla emblem material: FTEmblemModels Mario MObjSub[0] (file 0x23 +0x8),
 # untextured, flags 0x00022205, prim white, env black; the light colors come
@@ -171,125 +168,303 @@ def _decode_dl(d, o, m, t, s):
     return [tr for tr in tris if None not in tr]
 
 
-def mesh_from_json(path):
-    """Triangles dumped by series_logo_blender.py (Blender world units)."""
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _face_normal(pts):
+    """Newell normal of a polygon."""
+    n = [0.0, 0.0, 0.0]
+    for i, p in enumerate(pts):
+        q = pts[(i + 1) % len(pts)]
+        n[0] += (p[1] - q[1]) * (p[2] + q[2])
+        n[1] += (p[2] - q[2]) * (p[0] + q[0])
+        n[2] += (p[0] - q[0]) * (p[1] + q[1])
+    return _normalize(n)
+
+
+def _triangulate(pts):
+    """Ear clipping of a (possibly concave) planar polygon. Returns index
+    triples into PTS, keeping its winding."""
+    n = len(pts)
+    if n == 3:
+        return [(0, 1, 2)]
+    nrm = _face_normal(pts)
+    ax = max(range(3), key=lambda i: abs(nrm[i]))
+    u, v = [(1, 2), (2, 0), (0, 1)][ax]
+    sign = 1.0 if nrm[ax] >= 0 else -1.0
+    p2 = [(p[u], p[v]) for p in pts]
+
+    def cross2(o, a, b):
+        return ((a[0] - o[0]) * (b[1] - o[1]) -
+                (a[1] - o[1]) * (b[0] - o[0])) * sign
+
+    def inside(p, a, b, c):
+        return cross2(a, b, p) >= 0 and cross2(b, c, p) >= 0 and \
+            cross2(c, a, p) >= 0
+
+    idx = list(range(n))
     tris = []
-    for tri in data["triangles"]:
-        verts = []
-        for pos, nrm in tri:
-            bx, by, bz = pos
-            nx, ny, nz = nrm
-            verts.append(Vertex(
-                (bx * GAME_PER_BLENDER, bz * GAME_PER_BLENDER,
-                 -by * GAME_PER_BLENDER),
-                _normalize((nx, nz, -ny))))
-        tris.append(tuple(verts))
+    guard = 0
+    while len(idx) > 3 and guard < n * n:
+        guard += 1
+        for k in range(len(idx)):
+            i0, i1, i2 = idx[k - 1], idx[k], idx[(k + 1) % len(idx)]
+            a, b, c = p2[i0], p2[i1], p2[i2]
+            if cross2(a, b, c) <= 0:
+                continue                                # reflex corner
+            if any(inside(p2[j], a, b, c) for j in idx
+                   if j not in (i0, i1, i2) and p2[j] not in (a, b, c)):
+                continue
+            tris.append((i0, i1, i2))
+            idx.pop(k)
+            break
+        else:
+            break                                       # degenerate: fan
+    if len(idx) > 3:
+        tris += [(idx[0], idx[i], idx[i + 1]) for i in range(1, len(idx) - 1)]
+    else:
+        tris.append(tuple(idx))
     return tris
 
 
-# ------------------------------------------------------------------ Blender
-
-def find_blender():
-    """Blender command: $BLENDER, `blender` on the PATH, the usual Windows
-    install, or the Flatpak. None when not found."""
-    env = os.environ.get("BLENDER")
-    if env:
-        return shlex.split(env)
-    if shutil.which("blender"):
-        return ["blender"]
-    for root in (os.environ.get("ProgramFiles", ""),
-                 os.environ.get("ProgramFiles(x86)", "")):
-        base = os.path.join(root, "Blender Foundation") if root else ""
-        if base and os.path.isdir(base):
-            for sub in sorted(os.listdir(base), reverse=True):
-                exe = os.path.join(base, sub, "blender.exe")
-                if os.path.isfile(exe):
-                    return [exe]
-    if shutil.which("flatpak") and subprocess.run(
-            ["flatpak", "info", "org.blender.Blender"],
-            capture_output=True).returncode == 0:
-        return ["flatpak", "run", "org.blender.Blender"]
-    return None
+def _make_tri(pts, nrms):
+    if nrms is None or None in nrms:
+        fn = _normalize(_cross(_sub(pts[1], pts[0]), _sub(pts[2], pts[0])))
+        nrms = [fn] * 3
+    return tuple(Vertex(tuple(p), _normalize(n)) for p, n in zip(pts, nrms))
 
 
-def _run_blender_script(blend, args, cwd_hint):
-    cmd = find_blender()
-    if cmd is None:
-        raise RuntimeError(
-            "Blender not found (set $BLENDER, or put blender on the PATH)")
-    argv = cmd + ["-b", "--factory-startup"] + \
-        ([os.path.abspath(blend)] if blend else []) + \
-        ["--python-exit-code", "1", "--python", BLENDER_SCRIPT, "--"] + args
-    res = subprocess.run(argv, capture_output=True, text=True)
-    if res.returncode:
-        raise RuntimeError(f"Blender failed:\n{res.stdout[-3000:]}\n"
-                           f"{res.stderr[-3000:]}")
-    return res
+def mesh_from_obj(text):
+    """Triangles of a Wavefront OBJ (v / vn / f; ngons triangulated)."""
+    vs, vns, tris = [], [], []
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "v":
+            vs.append(tuple(float(x) for x in parts[1:4]))
+        elif parts[0] == "vn":
+            vns.append(tuple(float(x) for x in parts[1:4]))
+        elif parts[0] == "f":
+            corners = []
+            for c in parts[1:]:
+                f = c.split("/")
+                vi = int(f[0])
+                vi = vi - 1 if vi > 0 else len(vs) + vi
+                ni = None
+                if len(f) > 2 and f[2]:
+                    ni = int(f[2])
+                    ni = ni - 1 if ni > 0 else len(vns) + ni
+                corners.append((vs[vi], vns[ni] if ni is not None else None))
+            if len(corners) < 3:
+                continue
+            pts = [c[0] for c in corners]
+            for i, j, k in _triangulate(pts):
+                tri = [corners[i], corners[j], corners[k]]
+                nr = [c[1] for c in tri]
+                tris.append(_make_tri([c[0] for c in tri],
+                                      None if None in nr else nr))
+    return tris
 
 
-def mesh_from_blend(blend, cache_dir):
-    """Triangles of a .blend, cached in cache_dir by the .blend's hash."""
-    with open(blend, "rb") as f:
-        digest = hashlib.sha1(f.read()).hexdigest()
-    with open(BLENDER_SCRIPT, "rb") as f:
-        digest += hashlib.sha1(f.read()).hexdigest()[:8]
-    os.makedirs(cache_dir, exist_ok=True)
-    cache = os.path.join(cache_dir, "series_logo_mesh.json")
-    if os.path.isfile(cache):
-        with open(cache, "r", encoding="utf-8") as f:
-            if json.load(f).get("source_hash") == digest:
-                return mesh_from_json(cache)
-    # Flatpak Blender can't see /tmp: dump next to the cache
-    out = os.path.abspath(cache + ".tmp")
-    _run_blender_script(blend, ["dump", out], cache_dir)
-    with open(out, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    os.remove(out)
-    if not data["triangles"]:
-        raise ValueError(f"{blend}: no visible mesh triangles")
-    data["source_hash"] = digest
-    with open(cache, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    return mesh_from_json(cache)
+def write_obj(tris, path, frame=True):
+    """Triangles -> OBJ (positions / normals deduplicated). FRAME adds a
+    reference square (loose edges, ignored by the build): the box the build
+    fits the logo into, centered on the logo, side = its longest side."""
+    vi, ni, vl, nl, faces = {}, {}, [], [], []
+
+    def key(t, nd):
+        return tuple(round(c, nd) for c in t)
+    for tri in tris:
+        f = []
+        for v in tri:
+            pk, nk = key(v.pos, 4), key(v.normal, 4)
+            if pk not in vi:
+                vi[pk] = len(vl) + 1
+                vl.append(pk)
+            if nk not in ni:
+                ni[nk] = len(nl) + 1
+                nl.append(nk)
+            f.append(f"{vi[pk]}//{ni[nk]}")
+        faces.append("f " + " ".join(f))
+
+    def num(x):
+        return f"{x:.4f}".rstrip("0").rstrip(".") if x != int(x) \
+            else str(int(x))
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# Series logo (SR Extra): Y up, facing +Z\n")
+        for p in vl:
+            f.write("v " + " ".join(num(c) for c in p) + "\n")
+        for n in nl:
+            f.write("vn " + " ".join(num(c) for c in n) + "\n")
+        f.write("o SeriesLogo\n")
+        f.write("\n".join(faces) + "\n")
+        if frame and tris:
+            x0, y0, x1, y1 = _bounds(tris)
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            r = max(x1 - x0, y1 - y0) / 2
+            f.write("o Reference_frame\n# the box the build fits the logo "
+                    "into (edges only: not part of the logo)\n")
+            for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+                f.write(f"v {num(round(cx + sx * r, 4))} "
+                        f"{num(round(cy + sy * r, 4))} 0\n")
+            f.write("l -4 -3 -2 -1 -4\n")
 
 
-def write_blend(tris, out_blend):
-    """New .blend from the template with the template mesh replaced by TRIS."""
-    out_blend = os.path.abspath(out_blend)
-    tmp = out_blend + ".mesh.json"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"triangles": [
-            [[(v.pos[0] / GAME_PER_BLENDER, -v.pos[2] / GAME_PER_BLENDER,
-               v.pos[1] / GAME_PER_BLENDER),
-              (v.normal[0], -v.normal[2], v.normal[1])] for v in tri]
-            for tri in tris]}, f)
-    try:
-        _run_blender_script(TEMPLATE_BLEND, ["make", tmp, out_blend],
-                            os.path.dirname(out_blend))
-    finally:
-        os.remove(tmp)
+# glTF 2.0 ------------------------------------------------------------------
+
+_GLTF_COMP = {5120: "b", 5121: "B", 5122: "h", 5123: "H", 5125: "I",
+              5126: "f"}
+_GLTF_NCOMP = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
 
 
-def load_mesh(folder, cache_dir):
-    """(triangles, source file name) of FOLDER's logo, or (None, None).
-    Raises when the .blend can't be read and there's no .bin to fall back on;
-    with a .bin, the error is returned as the third value."""
-    blend = os.path.join(folder, "series_logo.blend")
-    gee = os.path.join(folder, "series_logo.bin")
-    err = None
-    if os.path.isfile(blend):
-        try:
-            return mesh_from_blend(blend, cache_dir), "series_logo.blend", None
-        except Exception as e:      # Blender missing / failing
-            if not os.path.isfile(gee):
-                raise
-            err = e
-    if os.path.isfile(gee):
-        with open(gee, "rb") as f:
-            return mesh_from_gee_bin(f.read()), "series_logo.bin", err
-    return None, None, err
+def _mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)]
+            for i in range(4)]
+
+
+def _node_matrix(node):
+    if "matrix" in node:
+        m = node["matrix"]                              # column-major
+        return [[m[c * 4 + r] for c in range(4)] for r in range(4)]
+    tx, ty, tz = node.get("translation", (0, 0, 0))
+    x, y, z, w = node.get("rotation", (0, 0, 0, 1))
+    sx, sy, sz = node.get("scale", (1, 1, 1))
+    r = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+    return [[r[0][0] * sx, r[0][1] * sy, r[0][2] * sz, tx],
+            [r[1][0] * sx, r[1][1] * sy, r[1][2] * sz, ty],
+            [r[2][0] * sx, r[2][1] * sy, r[2][2] * sz, tz],
+            [0, 0, 0, 1]]
+
+
+def mesh_from_gltf(path):
+    """Triangles of a .gltf / .glb (every mesh of the default scene, node
+    transforms applied)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    bin_chunk = None
+    if data[:4] == b"glTF":
+        o, doc = 12, None
+        while o < len(data):
+            ln, kind = struct.unpack_from("<II", data, o)
+            chunk = data[o + 8:o + 8 + ln]
+            if kind == 0x4E4F534A:
+                doc = json.loads(chunk)
+            elif kind == 0x004E4942:
+                bin_chunk = chunk
+            o += 8 + ln
+    else:
+        doc = json.loads(data)
+
+    buffers = []
+    for b in doc.get("buffers", []):
+        uri = b.get("uri")
+        if uri is None:
+            buffers.append(bin_chunk)
+        elif uri.startswith("data:"):
+            buffers.append(base64.b64decode(uri.split(",", 1)[1]))
+        else:
+            with open(os.path.join(os.path.dirname(path), uri), "rb") as f:
+                buffers.append(f.read())
+
+    def accessor(i):
+        acc = doc["accessors"][i]
+        view = doc["bufferViews"][acc["bufferView"]]
+        buf = buffers[view["buffer"]]
+        fmt = _GLTF_COMP[acc["componentType"]]
+        n = _GLTF_NCOMP[acc["type"]]
+        size = struct.calcsize("<" + fmt)
+        stride = view.get("byteStride") or size * n
+        base = view.get("byteOffset", 0) + acc.get("byteOffset", 0)
+        return [struct.unpack_from("<" + fmt * n, buf, base + k * stride)
+                for k in range(acc["count"])]
+
+    tris = []
+
+    def visit(ni, parent):
+        node = doc["nodes"][ni]
+        m = _mat_mul(parent, _node_matrix(node))
+        nm = [row[:3] for row in m[:3]]
+        if "mesh" in node:
+            for prim in doc["meshes"][node["mesh"]]["primitives"]:
+                if prim.get("mode", 4) != 4:
+                    continue
+                pos = accessor(prim["attributes"]["POSITION"])
+                nrm = accessor(prim["attributes"]["NORMAL"]) \
+                    if "NORMAL" in prim["attributes"] else None
+                idx = [i[0] for i in accessor(prim["indices"])] \
+                    if "indices" in prim else list(range(len(pos)))
+                for t in range(0, len(idx) - 2, 3):
+                    c = idx[t:t + 3]
+                    pts = [tuple(sum(m[r][k] * (pos[i] + (1,))[k]
+                                     for k in range(4)) for r in range(3))
+                           for i in c]
+                    nrs = None
+                    if nrm:
+                        # normals: inverse-transpose; uniform scale assumed
+                        nrs = [_mul(nm, nrm[i]) for i in c]
+                    tris.append(_make_tri(pts, nrs))
+        for ch in node.get("children", []):
+            visit(ch, m)
+
+    ident = [[1 if r == c else 0 for c in range(4)] for r in range(4)]
+    scenes = doc.get("scenes")
+    if scenes:
+        roots = scenes[doc.get("scene", 0)].get("nodes", [])
+    else:
+        children = {c for n in doc.get("nodes", []) for c in n.get("children", [])}
+        roots = [i for i in range(len(doc.get("nodes", []))) if i not in children]
+    for r in roots:
+        visit(r, ident)
+    return tris
+
+
+def normalize(tris):
+    """Center the logo (X/Y bounds, Z bounds) and scale it uniformly so its
+    longest side (X or Y) is LOGO_SIZE game units."""
+    xs = [v.pos[0] for t in tris for v in t]
+    ys = [v.pos[1] for t in tris for v in t]
+    zs = [v.pos[2] for t in tris for v in t]
+    side = max(max(xs) - min(xs), max(ys) - min(ys))
+    if side <= 0:
+        raise ValueError("the logo mesh is flat along X and Y")
+    k = LOGO_SIZE / side
+    c = ((max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2,
+         (max(zs) + min(zs)) / 2)
+    return [tuple(Vertex(tuple((p - o) * k for p, o in zip(v.pos, c)),
+                         v.normal) for v in t) for t in tris]
+
+
+def load_mesh(folder):
+    """(normalized triangles, source file name) of FOLDER's logo, or
+    (None, None)."""
+    for name in SOURCE_NAMES:
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            if name.endswith(".obj"):
+                with open(path, "r", encoding="utf-8") as f:
+                    tris = mesh_from_obj(f.read())
+            else:
+                tris = mesh_from_gltf(path)
+            break
+    else:
+        path = os.path.join(folder, "series_logo.bin")
+        if not os.path.isfile(path):
+            return None, None
+        name = "series_logo.bin"
+        with open(path, "rb") as f:
+            tris = mesh_from_gee_bin(f.read())
+    if not tris:
+        raise ValueError(f"{path}: no triangles")
+    return normalize(tris), name
 
 
 # ---------------------------------------------------------------- 3D logo
@@ -467,21 +642,37 @@ def _bounds(tris):
 
 def _coverage(tris, size, scale, ox, oy):
     """Antialiased coverage mask (L) of the front-projected triangles:
-    pixel = ((x - ox) * scale, (oy - y) * scale)."""
-    from PIL import ImageDraw
+    pixel = ((x - ox) * scale, (oy - y) * scale). Each pixel is SUPERSAMPLE^2
+    sample points, a point is covered when it's inside any triangle (exact,
+    so the result doesn't depend on how the shape was triangulated)."""
     ss = SUPERSAMPLE
     w, h = size
-    img = Image.new("L", (w * ss, h * ss), 0)
-    draw = ImageDraw.Draw(img)
+    W, H = w * ss, h * ss
+    hit = bytearray(W * H)
+    k = scale * ss
     for t in tris:
-        pts = [((v.pos[0] - ox) * scale * ss, (oy - v.pos[1]) * scale * ss)
-               for v in t]
-        # skip triangles seen edge-on
-        area = (pts[1][0] - pts[0][0]) * (pts[2][1] - pts[0][1]) - \
-            (pts[2][0] - pts[0][0]) * (pts[1][1] - pts[0][1])
-        if abs(area) < 1e-6:
-            continue
-        draw.polygon(pts, fill=255)
+        (x0, y0), (x1, y1), (x2, y2) = [
+            ((v.pos[0] - ox) * k, (oy - v.pos[1]) * k) for v in t]
+        area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)
+        if abs(area) < 1e-9:
+            continue                                    # edge-on
+        if area < 0:
+            x1, y1, x2, y2 = x2, y2, x1, y1
+        # sample centers (i + 0.5, j + 0.5) inside the bounding box
+        i0 = max(0, math.ceil(min(x0, x1, x2) - 0.5))
+        i1 = min(W - 1, math.floor(max(x0, x1, x2) - 0.5))
+        j0 = max(0, math.ceil(min(y0, y1, y2) - 0.5))
+        j1 = min(H - 1, math.floor(max(y0, y1, y2) - 0.5))
+        for j in range(j0, j1 + 1):
+            py = j + 0.5
+            row = j * W
+            for i in range(i0, i1 + 1):
+                px = i + 0.5
+                if ((x1 - x0) * (py - y0) - (y1 - y0) * (px - x0) >= 0 and
+                        (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1) >= 0 and
+                        (x0 - x2) * (py - y2) - (y0 - y2) * (px - x2) >= 0):
+                    hit[row + i] = 255
+    img = Image.frombytes("L", (W, H), bytes(hit))
     return img.resize((w, h), Image.BOX)
 
 

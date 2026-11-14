@@ -204,8 +204,8 @@ class CharacterProcessor:
     @staticmethod
     def _process_series_logo(character_folder, config, original_path,
                              output_path):
-        """Load the series logo mesh (series_logo.blend, else a GEE
-        series_logo.bin) and generate the CSS series_logo.png and hud.png
+        """Load the series logo mesh (series_logo.obj / .gltf / .glb, else a
+        GEE series_logo.bin) and generate the CSS series_logo.png and hud.png
         from it when the folder has no hand-made one. Optional config keys:
             series_logo:
               css: false   # don't generate series_logo.png
@@ -220,19 +220,18 @@ class CharacterProcessor:
         cfg = cfg or {}
 
         try:
-            tris, source, err = series_logo.load_mesh(
-                original_path, f"{output_path}/series_logo_cache")
+            tris, source = series_logo.load_mesh(original_path)
         except Exception as e:
-            logger.error(f"{character_folder}: can't read "
-                         f"series_logo.blend: {e}")
+            logger.error(f"{character_folder}: can't read the series logo: {e}")
             raise
-        if err is not None:
-            logger.warning(
-                f"{character_folder}: can't read series_logo.blend ({err}); "
-                "using series_logo.bin instead")
         if tris is not None:
             logger.info(f"{character_folder}: series logo from {source} "
                         f"({len(tris)} triangles)")
+            if source == "series_logo.bin":
+                logger.info(
+                    f"{character_folder}: series_logo.bin is a GEE export; "
+                    "`appender/scripts/series_logo.py convert` turns it into "
+                    "an editable series_logo.obj")
 
         def generated(name, allowed, render):
             """Hand-made PNG in the folder wins; else render one, or drop a
