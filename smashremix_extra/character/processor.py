@@ -24,7 +24,7 @@ from smashremix_extra.file_appender import append_file, get_pointer, update_poin
 from smashremix_extra.rom_util import get_attrib_offset
 from smashremix_extra.file_manager import FileManager
 from smashremix_extra.character.hurtbox import Hurtbox
-from smashremix_extra.character import hud_icons
+from smashremix_extra.character import hud_icons, series_logo
 from smashremix_extra.smashremix.kirbyshared import kirby_shared, KirbyJumpConfig
 from smashremix_extra.logger import logger
 from smashremix_extra import hex_util, asm_util
@@ -202,39 +202,64 @@ class CharacterProcessor:
         return f"{res.new_head:X}"
 
     @staticmethod
-    def _fix_logo_material_call(character_folder, logo):
-        """The logo's color comes from its material (per-player colors),
-        which the game applies through a display list call to segment 0x0E.
-        Some GEE imports leave that call out and only set a white prim color,
-        so the logo renders white. Replace that prim color with the call."""
-        material_call = bytes.fromhex("DE0000000E000000")
-        white_prim = bytes.fromhex("FA000000FFFFFFFF")
-        # DObjDesc display list pointer, 0x138 bytes before the end
-        dl = struct.unpack(">H", logo[-0x136:-0x134])[0] * 4
-        o = dl
-        while o + 8 <= len(logo):
-            cmd = logo[o:o + 8]
-            if cmd == material_call:
-                return
-            if cmd[0] == 0xDF:  # end of display list
-                break
-            o += 8
-        o = dl
-        while o + 8 <= len(logo) and logo[o] != 0xDF:
-            if logo[o:o + 8] == white_prim:
-                logo[o:o + 8] = material_call
-                logger.info(
-                    f"{character_folder}: series_logo.bin display list had "
-                    f"no material call; replaced the white prim color at "
-                    f"0x{o:X} with it so the logo uses the player colors")
-                return
-            o += 8
-        logger.warning(
-            f"{character_folder}: series_logo.bin has no material call and "
-            "no white prim color to replace; the logo may render white")
+    def _process_series_logo(character_folder, config, original_path,
+                             output_path):
+        """Load the series logo mesh (series_logo.blend, else a GEE
+        series_logo.bin) and generate the CSS series_logo.png and hud.png
+        from it when the folder has no hand-made one. Optional config keys:
+            series_logo:
+              css: false   # don't generate series_logo.png
+              hud: false   # don't generate hud.png
+        (`series_logo: false` turns both off). The CSS logo is also not
+        generated when definitions.series_logo_css picks an existing one.
+        Returns the triangles (None without a logo) and the hud.png path to
+        use (None: keep the base character's emblem)."""
+        cfg = config.get("series_logo", {})
+        if cfg is False:
+            cfg = {"css": False, "hud": False}
+        cfg = cfg or {}
+
+        try:
+            tris, source, err = series_logo.load_mesh(
+                original_path, f"{output_path}/series_logo_cache")
+        except Exception as e:
+            logger.error(f"{character_folder}: can't read "
+                         f"series_logo.blend: {e}")
+            raise
+        if err is not None:
+            logger.warning(
+                f"{character_folder}: can't read series_logo.blend ({err}); "
+                "using series_logo.bin instead")
+        if tris is not None:
+            logger.info(f"{character_folder}: series logo from {source} "
+                        f"({len(tris)} triangles)")
+
+        def generated(name, allowed, render):
+            """Hand-made PNG in the folder wins; else render one, or drop a
+            stale generated copy left in the build folder."""
+            if os.path.isfile(f"{original_path}/{name}"):
+                return f"{original_path}/{name}"
+            out = f"{output_path}/{name}"
+            if tris is not None and allowed:
+                render(tris).save(out)
+                logger.info(f"{character_folder}: generated {name} from "
+                            f"{source}")
+                return out
+            if os.path.isfile(out):
+                os.remove(out)
+            return None
+
+        generated(
+            "series_logo.png",
+            cfg.get("css", True) is not False and
+            "series_logo_css" not in config.get("definitions", {}),
+            series_logo.render_css)
+        hud_png = generated("hud.png", cfg.get("hud", True) is not False,
+                            series_logo.render_hud)
+        return tris, hud_png
 
     def _process_hud_icons(self, config, original_path, output_path,
-                           num_costumes):
+                           num_costumes, hud_png=None):
         """Replace the HUD emblem (hud.png) and stock icon
         (stock_icon_<n>.png) in character.bin, rebuild the stock palette
         array with one entry per costume when needed, and export the final
@@ -258,9 +283,8 @@ class CharacterProcessor:
             char = bytearray(f.read())
         char_int = int(config["offsets"]["character"][0], 16)
 
-        if os.path.isfile(f"{original_path}/hud.png"):
-            hud_icons.replace_emblem(
-                icons, char, char_int, f"{original_path}/hud.png")
+        if hud_png:
+            hud_icons.replace_emblem(icons, char, char_int, hud_png)
 
         palettes = None
         stock_paths = hud_icons.stock_icon_paths(original_path, num_costumes)
@@ -555,11 +579,14 @@ class CharacterProcessor:
                     1+len(extra_files_to_add)+len(append_files)+1
                 shield_pose_is_external = True
 
+        # Series logo mesh -> generated CSS logo / HUD emblem PNGs
+        logo_tris, hud_png = self._process_series_logo(
+            character_folder, config, original_path, output_path)
         # HUD emblem + stock icon (both live in character.bin). Must run
         # before the reqlist compile: it adds a ${CHARACTER} entry.
         hud_palette_array = self._process_hud_icons(
             config, original_path, output_path,
-            config.get("num_costumes", 8))
+            config.get("num_costumes", 8), hud_png)
 
         # Compile reqlists
         reqlist_files = [_f for _f in os.listdir(
@@ -1260,57 +1287,33 @@ class CharacterProcessor:
                 f"\n\t\taddiu   a0, a0, 0x000C              // a0 = offset to \"WIN!\""
             )
 
-        # Check for 3D results/data series logo file and use if found
-        if os.path.exists(f"{output_path}/series_logo.bin"):
-            with open(f"{output_path}/series_logo.bin", 'rb') as logo_file:
-                logo = bytearray(logo_file.read())
+        # 3D results/data series logo: rebuilt from the logo mesh with the
+        # vanilla emblem material, so it always takes the player colors
+        if logo_tris is not None:
+            block, head, offs = series_logo.build_logo(logo_tris)
+            block_path = f"{output_path}/series_logo_3d.bin"
+            with open(block_path, "wb") as f:
+                f.write(block)
 
-            # The logo/zoom/color offsets below are counted back from the end
-            # of the file, so a truncated or padded GEE export makes the game
-            # read the wrong data and crash on the results/data screens.
-            if logo[-0x170:-0x16C] != b"\xDF\x00\x00\x00" or \
-                    logo[-4:-2] != b"\xFF\xFF":
-                logger.warning(
-                    f"{character_folder}: series_logo.bin doesn't end like a "
-                    "GEE logo export (expected the display list end 0x170 "
-                    "bytes before the end and the last pointer in the final "
-                    "4 bytes). The 3D logo will likely crash; re-export it.")
-            else:
-                self._fix_logo_material_call(character_folder, logo)
+            # display lists and vertices need 8-byte alignment
+            with open("scripts/0023.bin", "rb") as f:
+                base = len(f.read())
+            if base % 8:
+                with open("scripts/0023.bin", "ab") as f:
+                    f.write(b"\0" * (8 - base % 8))
+                base += 8 - base % 8
 
-            # Seems like Ness logo data always begins here once imported through GEE
-            logo_offset = 0x5C58
+            append_file(block_path, 0, head,
+                        "scripts/0023.bin", 0x4, "scripts/0023.bin")
 
-            # Internal file table offset after GEE logo import (offset to first pointer)
-            pointer_offset = 0x624
-
-            while pointer_offset < logo_offset:
-                next_pointer = get_pointer(logo, pointer_offset, "next")
-
-                if next_pointer > logo_offset:
-                    # got first pointer in character's logo data
-                    pointer_offset = next_pointer - logo_offset
-                    break
-
-                pointer_offset = next_pointer
-
-            with open(f"{output_path}/series_logo.bin", 'wb') as logo_file:
-                logo_file.write(logo[logo_offset:])
-
-            append_file(
-                f"{output_path}/series_logo.bin", logo_offset, pointer_offset,
-                "scripts/0023.bin", 0x4,
-                "scripts/0023.bin"
-            )
-
-            logo_length = os.path.getsize("scripts/0023.bin")
-
-            # Get series logo offsets
             self.character_series_models[f"{character_folder}"] = {
-                "offset": f"0x{(logo_length - 0x168):0X}",
-                "zoom":   f"0x{(logo_length - 0x60):0X}",
-                "color":  f"0x{(logo_length - 0x8):0X}"
+                "offset": f"0x{base + offs['dobjdesc']:0X}",
+                "zoom":   f"0x{base + offs['mobjsub']:0X}",
+                "color":  f"0x{base + offs['matanim']:0X}"
             }
+            logger.info(
+                f"{character_folder}: 3D series logo {offs['triangles']} "
+                f"triangles, {offs['vertices']} vertices, {len(block)} B")
 
             series_model = character_folder.upper()
 
