@@ -134,6 +134,10 @@ def cmd_export(a, extra):
     if not a.no_blend:
         run_blender(blender_cmd(a.blender), 'build_blend.py', a.out_dir)
         print(f'-> {os.path.join(a.out_dir, "model.blend")}')
+        kh = os.path.join(a.out_dir, 'kirby_hat')
+        if os.path.exists(os.path.join(kh, 'manifest.json')):      # Kirby wearing its copy-ability hat
+            run_blender(blender_cmd(a.blender), 'build_blend.py', kh)
+            print(f'-> {os.path.join(kh, "model.blend")} (Kirby with the hat)')
 
 
 # ---------------------------------------------------------------------------- import
@@ -164,9 +168,22 @@ def cmd_import(a, extra):
         raise SystemExit(f'--no-blend: {work} has no blend_to_gltf.py output')
 
     print(f'importing {kind} into {target}')
+    if kind == 'kirby_hat':
+        import kirby_hat
+        kirby_hat.import_blend(work, out_dir, os.path.join(a.out or target, kirby_hat.BIN))
+        return
     if kind == 'fighter':
         import import_fighter
         import_fighter.main([target, work] + extra)
+        kh = os.path.join(out_dir, 'kirby_hat')
+        if os.path.exists(os.path.join(kh, 'manifest.json')) and os.path.exists(os.path.join(kh, 'model.blend')):
+            # its Kirby copy-ability hat (the Kirby .blend beside it) -> kirby_hat/kirby_hat.bin
+            sub = argparse.Namespace(**dict(vars(a), out_dir=kh, target=os.path.join(target, 'kirby_hat'),
+                                            kind='kirby_hat', blend=None, work=None,
+                                            out=os.path.join(a.out, 'kirby_hat') if a.out else None))
+            if sub.out:
+                os.makedirs(sub.out, exist_ok=True)
+            cmd_import(sub, [])
     elif kind == 'stage':
         import import_stage
         import_stage.main([target, work] + extra)

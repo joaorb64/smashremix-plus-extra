@@ -139,6 +139,9 @@ def load(main_path, char_path, main_int_head=0x2CC, main_ext_head=0x0, char_int_
     char_int.update(char_ext or {})
     f = Fighter(main, char, chain(main, main_int_head), chain(main, main_ext_head),
                 char_int, attributes_offset(main))
+    # (how it was loaded: an export saves the files and these, to read animation files later)
+    f.load_args = dict(main_int_head=main_int_head, main_ext_head=main_ext_head, char_int_head=char_int_head,
+                       char_ext={str(k): v for k, v in (char_ext or {}).items()})
     # ---- common parts (hi, lo)
     cp = f.ptr_main(f.attr + A_COMMONPARTS)
     if cp is None or cp[0] != 'main':

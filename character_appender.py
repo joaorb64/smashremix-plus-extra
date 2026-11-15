@@ -12,6 +12,7 @@ from smashremix_extra.constants import SMASHREMIX_PATH as smashremix_path, VARIA
 from smashremix_extra.asm_util import add_to_scope, add_to_scope_on_empty, add_to_label, add_to_label_on_empty
 from smashremix_extra.rom_util import run_windows_command, extract_files
 from smashremix_extra.smashremix.kirbyshared import kirby_shared
+from smashremix_extra.character.kirby_hat import kirby_hats
 from smashremix_extra.logger import logger
 from smashremix_extra import file_manager
 from smashremix_extra.character.processor import CharacterProcessor
@@ -224,6 +225,8 @@ class CharacterAppender:
                 compression_level=import_file.compression_level,
             )
 
+        # Kirby's character file: pointers to the extra characters' hat files
+
         injector.save(on_progress=print)
 
     def copy_remix_src(self):
@@ -313,12 +316,14 @@ class CharacterAppender:
         with open("main.asm", 'w', encoding='utf-8') as f:
             f.write(main_content)
 
-        # Insert new character asm files before Kirby
+        # Insert new character asm files after Kirby / J Kirby: their Kirby actions (copy
+        # abilities) then come after Remix's (Kirby.asm tells his new actions from vanilla
+        # ones by id)
         lineinfile.add_line_to_file(
             filepath="main.asm",
             line="// Extra characters\n"+"\n".join(
                 [f'include "build/extra_characters/{name}/main.asm"' for name in self.char_folders]),
-            inserter=lineinfile.BeforeFirst(r"\/\/ KIRBY")
+            inserter=lineinfile.AfterFirst(r'include "src/JKirby/JKirby.asm"')
         )
 
         # Update internal name
@@ -983,6 +988,9 @@ class CharacterAppender:
 
         # Inject patches related to Kirby clones
         kirby_shared.Inject()
+
+        # Kirby copy-ability hats / Kirby actions of extra characters
+        kirby_hats.patch_src()
 
         # Training.asm
         nameStrings = []

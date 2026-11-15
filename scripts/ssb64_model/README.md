@@ -663,3 +663,53 @@ collision tools (`stage_collision.py`) read the rebuilt file the same way.
 
 Not handled yet (passed through untouched): fighter DObjDLLink arrays (and two-DL
 skeleton entries), accessory parts, hidden parts.
+
+## Kirby copy-ability hats
+
+A fighter folder with `kirby_hat/kirby_hat.bin` (see `kirby_hat.py`) exports a second blend,
+`OUT_DIR/kirby_hat/model.blend`: Kirby from the ROM (high-detail body, bones, all his animations,
+costume 0) wearing
+the hat as his body's model part (`part<H>_*_j02`) and holding the item as his hand's
+(`part<I>_*_j13`), both shown in Model parts. `import OUT_DIR` writes the character's files and
+then `kirby_hat.bin` from that blend (`import OUT_DIR/kirby_hat` does only the hat). The hat
+part's Kirby-body triangles are reference only: the file always takes the ROM's body.
+`kirby_hat.py new HAT_DIR` starts one, `kirby_hat.py preview BIN OUT.png` renders it.
+
+## Reference items and opponent (fighters)
+
+Fighter exports also write `OUT_DIR/reference/` (`reference.py`; `--no-reference` skips it) and
+model.blend gets a hidden **Reference** collection, never imported back:
+- **Items**: Ray Gun, Beam Sword, Hammer (light: on `attr->joint_itemlight_id`) and Crate,
+  Barrel (heavy: `attr->joint_itemheavy_id`), from the ROM, one collection each. Like the game
+  (itMainSetFighterHold), each sits in its hold joint's frame and follows the animation: a
+  Child Of constraint on the bone with scale off (the game takes the joint's scale out), its
+  offset from the rest pose. The game scales the fighter by `attr->size` but not what it holds,
+  so next to the fighter (drawn at model size) items are 1 / size.
+  Held items are drawn without their root joint's transform (the game ejects the root DObj when
+  the item is made and, when held, sets the descs again from the new hold root down): the
+  Crate / Barrel sit their child joint's offset (z +225 / +210) away from the hold joint.
+- **Opponent**: Mario (armature `Opponent`) with his grabbed / thrown animations
+  (`Opponent: CapturePulled`, `Thrown1`, `Thrown2`, `ThrownDK`...; pick one in its Action Editor).
+  Like a grabbed fighter (ftCommonCapturePulledRotateScale) he's turned like the heavy item joint
+  with his TransN joint on it (his animations' TransN moves are dropped: the game cancels them),
+  at his own size relative to the thrower's (Mario's `attr->size` / the fighter's).
+  Which thrown animation a throw plays comes from the thrower's `attr->thrown_status`.
+Scripts that look for the fighter's armature skip ones flagged `n64_reference`.
+Mario is minimal: high-detail model, flat colors (each texture's average), the thrown animations.
+
+## Loading animation files in Blender
+
+Action Editor sidebar > N64 Animation > **Load Animation .bin**: an animation file (the
+character's `animations/`, `kirby_hat/animations/`, a ROM extract...) becomes a new action on the
+fighter (`anim_load.py`), keyed like the exported ones (every bone; keys reduced within
+keyreduce.TOL_ANIM). Its motion flags are guessed from the file's joint count unless given
+(Flags 0x in the file dialog's options). The export saves the fighter's files for this
+(`OUT_DIR/fighter/`, manifest `fighter_files`). A loaded action isn't one of the exported
+animations: the import doesn't write it back.
+
+**Save Animation .bin** (next to it) writes the current action to a file (`anim_save.py`):
+sampled and encoded like the import writes edited animations (blend_gamespace.sample_action,
+figatree.encode_animation), for the flags in the dialog (default: the action's, else 0) and its
+Loop setting. Files are written in the 16-bit format, so the motion playing it needs the flags
+without 0x8 (the report says which). Default path: the file the action was loaded from, else the
+character's `animations/<action>.bin`.

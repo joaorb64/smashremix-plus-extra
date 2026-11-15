@@ -1914,7 +1914,136 @@ def _flags_owner(context):
     return ob, (act if 'n64_flags' in act.keys() else None)
 
 
+class N64_OT_anim_load_bin(bpy.types.Operator):
+    """An animation .bin file (the character's animations/, a ROM extract...) -> a new action
+    on the fighter, keyed like the exported animations (anim_load.py)"""
+    bl_idname = 'n64.anim_load_bin'
+    bl_label = 'Load Animation .bin'
+    bl_options = {'REGISTER', 'UNDO'}
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default='*.bin', options={'HIDDEN'})
+    flags: bpy.props.StringProperty(name='Flags 0x', default='',
+                                    description='The motion flags to read it with (hex); empty: guessed '
+                                                'from the file\'s joint count')
+
+    @staticmethod
+    def _tools():
+        import sys
+        d = bpy.context.scene.get('n64_tools_dir') or os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import anim_load
+        return anim_load
+
+    def invoke(self, context, event):
+        import json
+        try:
+            ed = self._tools().export_dir_of(context.scene)
+            src = (json.load(open(os.path.join(ed, 'manifest.json'))).get('source') or {}).get('folder')
+            for d in (os.path.join(src, 'animations') if src else None, src):
+                if d and os.path.isdir(d):
+                    self.filepath = d + os.sep
+                    break
+        except (OSError, ValueError, ImportError):
+            pass
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        arm = next((o for o in context.scene.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()), None)
+        if arm is None:
+            self.report({'ERROR'}, 'No N64 fighter armature in this scene')
+            return {'CANCELLED'}
+        try:
+            al = self._tools()
+            flags = int(self.flags, 16) if self.flags.strip() else None
+            act, flags, guessed = al.load_bin(arm, self.filepath, al.export_dir_of(context.scene), flags)
+        except Exception as e:                                  # noqa: BLE001 (shown to the user)
+            self.report({'ERROR'}, f'{os.path.basename(self.filepath)}: {e}')
+            return {'CANCELLED'}
+        context.scene.frame_start, context.scene.frame_end = 0, int(act.frame_end)
+        self.report({'INFO'}, f'{act.name}: {int(act.frame_end) + 1} frames, flags {flags:08X}'
+                    + (' (guessed)' if guessed else ''))
+        return {'FINISHED'}
+
+
+class N64_OT_anim_save_bin(bpy.types.Operator):
+    """The fighter's current action -> an animation .bin file (anim_save.py), in the 16-bit
+    format the game reads: play it with the flags shown in the report (0x8 off)"""
+    bl_idname = 'n64.anim_save_bin'
+    bl_label = 'Save Animation .bin'
+    bl_options = {'REGISTER'}
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filter_glob: bpy.props.StringProperty(default='*.bin', options={'HIDDEN'})
+    check_existing: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
+    flags: bpy.props.StringProperty(name='Flags 0x', default='',
+                                    description='The motion flags to write it for (hex); empty: the '
+                                                'action\'s (N64 Animation panel), else 0')
+    loop: bpy.props.BoolProperty(name='Loop', default=False,
+                                 description='Scripts that loop (the action\'s Loop setting by default)')
+
+    @staticmethod
+    def _arm(context):
+        return next((o for o in context.scene.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()), None)
+
+    def invoke(self, context, event):
+        import json
+        import re
+        arm = self._arm(context)
+        act = arm.animation_data.action if arm is not None and arm.animation_data else None
+        if act is None:
+            self.report({'ERROR'}, 'Pick the fighter animation to save in the Action Editor')
+            return {'CANCELLED'}
+        if not self.flags:
+            self.flags = f'{_action_flags(act):08X}'
+        self.loop = bool(act.get('n64_loop', False))
+        stem = re.sub(r'[^A-Za-z0-9_]+', '_', act.name.split(' (')[0]).strip('_') or 'animation'
+        folder = None
+        src = act.get('n64_source')
+        if src and os.path.isdir(os.path.dirname(str(src))):
+            folder, stem = os.path.dirname(str(src)), os.path.splitext(os.path.basename(str(src)))[0]
+        else:
+            try:
+                ed = N64_OT_anim_load_bin._tools().export_dir_of(context.scene)
+                sf = (json.load(open(os.path.join(ed, 'manifest.json'))).get('source') or {}).get('folder')
+                for d in (os.path.join(sf, 'animations') if sf else None, sf, ed):
+                    if d and os.path.isdir(d):
+                        folder = d
+                        break
+            except (OSError, ValueError, ImportError):
+                pass
+        self.filepath = os.path.join(folder or '', stem + '.bin')
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        import sys
+        arm = self._arm(context)
+        act = arm.animation_data.action if arm is not None and arm.animation_data else None
+        if act is None:
+            self.report({'ERROR'}, 'No fighter animation picked')
+            return {'CANCELLED'}
+        path = bpy.path.ensure_ext(self.filepath, '.bin')
+        try:
+            d = context.scene.get('n64_tools_dir') or os.path.dirname(os.path.abspath(__file__))
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            import anim_save
+            flags = int(self.flags.strip().lower().removeprefix('0x') or '0', 16)
+            written, frames, size = anim_save.save_bin(act, path, anim_save.export_dir_of(context.scene),
+                                                       flags, self.loop)
+        except Exception as e:                                  # noqa: BLE001 (shown to the user)
+            self.report({'ERROR'}, f'{os.path.basename(path)}: {e}')
+            return {'CANCELLED'}
+        self.report({'INFO'}, f'{os.path.basename(path)}: {frames} frames, {size} bytes; play it with '
+                    f'flags 0x{written:08X}' + (' (0x8 cleared: 16-bit format)' if written != flags else ''))
+        return {'FINISHED'}
+
+
 def draw_motion_flags(lay, context):
+    row = lay.row(align=True)
+    row.operator('n64.anim_load_bin', icon='IMPORT')
+    row.operator('n64.anim_save_bin', icon='EXPORT')
     ob, act = _flags_owner(context)
     if act is None:
         lay.label(text='Pick a fighter animation in the Action Editor', icon='INFO')
@@ -2230,7 +2359,7 @@ def vs_show(scene, view):
     for ob in bpy.data.objects:
         if ob.get('n64_vs_hud'):
             ob.hide_viewport = ob.hide_render = ob['n64_vs_hud'] != view
-    arm = next((o for o in scene.objects if o.type == 'ARMATURE'), None)
+    arm = next((o for o in scene.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
     act = vs_pose_action(VS_POSES[view])
     if arm is None or act is None:
         return act is not None
@@ -2256,7 +2385,7 @@ def _sync_vs_screen(scene):
             vs_show(scene, view)
         return
     scene['n64_vs_on'] = on
-    arm = next((o for o in scene.objects if o.type == 'ARMATURE'), None)
+    arm = next((o for o in scene.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
     ad = arm.animation_data if arm is not None else None
     if on:
         scene['n64_vs_saved'] = {
@@ -3537,7 +3666,7 @@ CLASSES = (N64_OT_vs_view, N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_
            N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene, N64_PT_gamedata,
            N64_OT_hurtbox_add, N64_OT_hurtbox_remove, N64_OT_hurtbox_select, N64_PT_bone_hurtboxes,
            N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools,
-           N64_PT_motion_flags)
+           N64_PT_motion_flags, N64_OT_anim_load_bin, N64_OT_anim_save_bin)
 
 
 def _collapse_visible_outliners():

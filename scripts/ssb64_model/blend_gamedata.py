@@ -271,7 +271,7 @@ def build_stage(sc):
 
 
 def build(man):
-    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE'), None)
+    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
     if man.get('hurtboxes'):
         build_hurtboxes(man['hurtboxes'], arm)
     if man.get('stage_collision'):
@@ -289,7 +289,7 @@ def collect_hurtboxes():
     obs = _objs('hurtbox')
     if not obs:
         return []
-    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE'), None)
+    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
     pose = arm.data.pose_position if arm else None
     if arm:                                     # the boxes on the joints' rest pose
         arm.data.pose_position = 'REST'

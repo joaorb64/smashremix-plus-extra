@@ -771,10 +771,26 @@ class Exporter:
                     for mi, ix in prims]
             self.manifest['objects'][mesh_name] = obj_info
 
+    def save_fighter_files(self):
+        """The fighter's main.bin / character.bin as loaded, next to the export (fighter/), and how
+        to load them (manifest fighter_files): the .blend reads animation files with them
+        (n64_panel.py: Load Animation .bin)."""
+        f = self.f
+        la = getattr(f, 'load_args', None)
+        if la is None:
+            return
+        d = os.path.join(self.out, 'fighter')
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, 'main.bin'), 'wb').write(bytes(f.main))
+        open(os.path.join(d, 'character.bin'), 'wb').write(bytes(f.char))     # (ROM: + its external files)
+        self.manifest['fighter_files'] = dict(main='fighter/main.bin', char='fighter/character.bin', **la)
+
     def run(self):
         f = self.f
         if (getattr(f, 'object', None) or {}).get('kind') == 'stage':
             return self.run_stage()
+        if not getattr(f, 'object', None):
+            self.save_fighter_files()
         hi = f.details['hi']
         self.script_of = {}
         for d in f.details.values():
@@ -921,6 +937,9 @@ def main(argv=None):
     ap.add_argument('--costumes', type=int)
     ap.add_argument('--no-preview', action='store_true', help="don't render previews/*.png")
     ap.add_argument('--no-animations', action='store_true', help="fighters: don't export their animations")
+    ap.add_argument('--no-reference', action='store_true',
+                    help="fighters: don't export the reference items (Ray Gun, Beam Sword, Hammer, Crate, "
+                         "Barrel) and opponent (Mario, his grabbed / thrown animations) for the .blend")
     # items / projectiles (one model described by ITAttributes / WPAttributes)
     ap.add_argument('--object', metavar='NAME',
                     help="CHAR_DIR's (a character or stage folder) item / projectile NAME: config.yaml "
@@ -1086,6 +1105,14 @@ def main(argv=None):
         import preview
         for p in preview.save_sheets(out_dir):
             print(f'preview: {p}')
+    if not a.no_reference:          # items in his hands, an opponent to throw (model.blend: 'Reference')
+        import reference
+        reference.export(f, out_dir, a.rom or reference.DEFAULT_ROM, animations=not a.no_animations)
+    hat_bin = os.path.join(char_dir, 'kirby_hat', 'kirby_hat.bin') if char_dir and not (a.rom or a.main or a.char) else None
+    if hat_bin and os.path.exists(hat_bin):      # its Kirby copy-ability hat: Kirby wearing it, OUT_DIR/kirby_hat
+        import kirby_hat
+        kirby_hat.export(hat_bin, os.path.join(out_dir, 'kirby_hat'), animations=not a.no_animations,
+                         preview=not a.no_preview)
 
 
 def animation_name(parts, suffix=''):
@@ -1392,30 +1419,36 @@ def load_rom_stage(rom, name, ap):
     return f
 
 
+def load_rom_item(rom, item):
+    """A vanilla common item (VANILLA_ITEMS name) from the ROM -> MF.load_object fighter-like model."""
+    entries = SSBtbl.fromROM(N64(open(rom, 'rb').read()))
+    entry = entries[ITCOMMON_FILE]
+    off = VANILLA_ITEMS[item]
+    # the attributes point (external chain) into the item model file; which file each
+    # external pointer goes to: the entry's ID list, in chain order
+    attr = entry.extract('data')
+    ids = [int.from_bytes(entry.idx[i:i + 2], 'big') for i in range(0, len(entry.idx or b''), 2)]
+    links = list(MF.chain(attr, entry.res).keys()) if entry.res is not None else []
+    if off not in links:
+        raise SystemExit(f'{item}: no model pointer at 0x{off:X}')
+    model_id = ids[links.index(off)]
+    model_data, model_ext = rom_external_data(entries, entries[model_id])
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ap_, mp_ = os.path.join(temp_dir, 'attr.bin'), os.path.join(temp_dir, 'model.bin')
+        open(ap_, 'wb').write(attr)
+        open(mp_, 'wb').write(model_data)
+        f = MF.load_object(ap_, mp_, entry.tbl, entry.res, entries[model_id].tbl, off, model_ext)
+    f.object.update(kind='item', rom_file=ITCOMMON_FILE, model_file=model_id, name=item)
+    f.item_attr = attr[off:off + 0x48]                  # (ITAttributes: its weight bit, ...)
+    return f
+
+
 def load_object_args(a, ap, cfg, char_dir, out_dir):
     """MF.load_object from --object / --attr [--model] / --rom --item."""
     if a.item:
         if not a.rom:
             ap.error('--item requires --rom')
-        entries = SSBtbl.fromROM(N64(open(a.rom, 'rb').read()))
-        entry = entries[ITCOMMON_FILE]
-        off = VANILLA_ITEMS[a.item]
-        # the attributes point (external chain) into the item model file; which file each
-        # external pointer goes to: the entry's ID list, in chain order
-        attr = entry.extract('data')
-        ids = [int.from_bytes(entry.idx[i:i + 2], 'big') for i in range(0, len(entry.idx or b''), 2)]
-        links = list(MF.chain(attr, entry.res).keys()) if entry.res is not None else []
-        if off not in links:
-            raise SystemExit(f'{a.item}: no model pointer at 0x{off:X}')
-        model_id = ids[links.index(off)]
-        model_data, model_ext = rom_external_data(entries, entries[model_id])
-        with tempfile.TemporaryDirectory() as temp_dir:
-            ap_, mp_ = os.path.join(temp_dir, 'attr.bin'), os.path.join(temp_dir, 'model.bin')
-            open(ap_, 'wb').write(attr)
-            open(mp_, 'wb').write(model_data)
-            f = MF.load_object(ap_, mp_, entry.tbl, entry.res, entries[model_id].tbl, off, model_ext)
-        f.object.update(kind='item', rom_file=ITCOMMON_FILE, model_file=model_id, name=a.item)
-        return f
+        return load_rom_item(a.rom, a.item)
     if a.object:
         if not char_dir:
             ap.error('--object needs CHAR_DIR (CHAR_DIR OUT_DIR)')

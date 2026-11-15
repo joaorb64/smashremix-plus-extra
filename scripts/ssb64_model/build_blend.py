@@ -15,6 +15,10 @@ Layout of the .blend:
                      ('part<variant>_<hi|lo>_j<joint>'), hidden
   Electric skeleton  the shocked-skeleton model ('skel<id>_j<joint>'), hidden
   Armature           one skeleton (bones joint_00..), shared by everything
+  Reference          items held in the hold joints (Ray Gun, Beam Sword, Hammer, Crate, Barrel)
+                     and an opponent (Mario: grabbed / thrown animations) on the heavy item
+                     joint, for checking item / throw animations (blend_reference.py); hidden,
+                     never imported back
   Stages             a type/layer collection with a Room collection per DObj joint
 Every image / palette list entry (facial expressions, extra palettes) is loaded
 as an image (<mat>_img<i>, <mat>_pal<p>) to paint in the Image Editor.
@@ -268,7 +272,7 @@ def tidy_bones(arm):
 
 
 IS_STAGE = (man.get('object') or {}).get('kind') == 'stage'
-arm = next((o for o in scene.objects if o.type == 'ARMATURE'), None)
+arm = next((o for o in scene.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
 c_arm = coll('Armature')
 for a in [o for o in scene.objects if o.type == 'ARMATURE']:     # (stages: the glTF import merges
     move(a, c_arm)                                                 # the layers' skins into one)
@@ -352,8 +356,6 @@ if FIGHTER_ANIMS and arm is not None:
         act['n64_loop'] = bool(info.get('loop'))          # its scripts start over at the end
         # what it was exported as (blend_to_gltf.py writes back the actions that changed)
         act['n64_export'] = dict(name=name, flags=info['flags'], loop=bool(info.get('loop')))
-    arm['n64_hidden_parts'] = list(man.get('hidden_parts') or [])
-    arm['n64_hidden_part_parents'] = list(man.get('hidden_part_parents') or [])
     print(f"fighter animations: {len(FIGHTER_ANIMS)}, keys {n_b} -> {n_a} (Blender's curves are at "
           f"most {worst:.2f} deg from the game's)")
     for name in FIGHTER_ANIMS:                            # (after every curve is final)
@@ -367,6 +369,10 @@ if FIGHTER_ANIMS and arm is not None:
         ad.action = None
     for pb in arm.pose.bones:
         pb.location, pb.rotation_quaternion, pb.scale = (0, 0, 0), (1, 0, 0, 0), (1, 1, 1)
+if arm is not None and not IS_STAGE and not man.get('object'):
+    # (fighters, with or without animations: the N64 Animation panel, Load Animation .bin)
+    arm['n64_hidden_parts'] = list(man.get('hidden_parts') or [])
+    arm['n64_hidden_part_parents'] = list(man.get('hidden_part_parents') or [])
 SHIELD = man.get('shield')
 if SHIELD and arm is not None:
     # The shield pose (shieldpose.py): actions 'Shield' (frame = stick angle in degrees: 0
@@ -547,6 +553,7 @@ except (TypeError, AttributeError):
 if man.get('object'):                         # items / projectiles: see n64_panel build_combiner
     scene['n64_default_env'] = '00000000'  # ambient = shadow color (hex RGB)
 scene['n64_export_dir'] = '//'
+scene['n64_tools_dir'] = os.path.dirname(os.path.abspath(__file__))     # (n64_panel.py: anim_load.py...)
 scene['n64_collapse_outliner'] = True        # the panel script collapses the outliner on the first open          # where manifest.json + textures/ are (relative to the .blend)
 
 # ---- the game's camera (gmcamera.c): 38 degrees vertical field of view, 320 x 240, tilted down
@@ -747,6 +754,36 @@ for idb in list(bpy.data.materials) + [scene]:
                 idb.id_properties_ui(k).update(description=desc)
             except (TypeError, AttributeError):
                 pass
+
+# fighters: reference items in the hold joints and an opponent to throw (reference.py; hidden)
+if os.path.exists(os.path.join(DIR, 'reference', 'reference.json')) and arm is not None:
+    import blend_reference  # noqa: E402
+    blend_reference.build(DIR, arm)
+
+# Kirby wearing a character's copy-ability hat (kirby_hat.py export): the hat / item parts shown
+# instead of his plain body (the hat part draws the body too), the other parts hidden
+KH_INFO = man.get('kirby_hat')
+if KH_INFO:
+    keep = {f"part{KH_INFO['hat_variant']}_hi_j{KH_INFO['joint']:02d}"}
+    if 'item_variant' in KH_INFO:
+        keep.add(f"part{KH_INFO['item_variant']}_hi_j{KH_INFO['item_joint']:02d}")
+    lc = bpy.context.view_layer.layer_collection.children.get('Model parts')
+    if lc is not None:
+        lc.hide_viewport = False
+        bpy.data.collections['Model parts'].hide_render = False
+        for ob in bpy.data.collections['Model parts'].objects:
+            try:
+                ob.hide_set(ob.name not in keep)
+            except RuntimeError:
+                pass
+            ob.hide_render = ob.name not in keep
+    for ob in scene.objects:
+        if ob.type == 'MESH' and re.match(rf"hi_j{KH_INFO['joint']:02d}(_c\d+)?$", ob.name):
+            try:
+                ob.hide_set(True)
+            except RuntimeError:
+                pass
+            ob.hide_render = True
 
 # fighters: the 1P mode VS screen's cameras, in a collection that's off until enabled
 # (n64_panel make_vs_screen / _sync_vs_screen)

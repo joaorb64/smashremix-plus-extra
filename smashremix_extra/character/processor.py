@@ -26,6 +26,7 @@ from smashremix_extra.file_manager import FileManager
 from smashremix_extra.character.hurtbox import Hurtbox
 from smashremix_extra.character import hud_icons, series_logo
 from smashremix_extra.smashremix.kirbyshared import kirby_shared, KirbyJumpConfig
+from smashremix_extra.character.kirby_hat import kirby_hats
 from smashremix_extra.logger import logger
 from smashremix_extra import hex_util, asm_util
 
@@ -375,6 +376,10 @@ class CharacterProcessor:
             dirs_exist_ok=True
         )
 
+        # Kirby copy ability: kirby_hat/ (compiled to its own file) and kirby.asm
+        has_kirby_hat = kirby_hats.process_character(
+            character_folder, original_path, output_path)
+
         filename_to_id = {}
 
         # trim before the merge below reads the _hitbox footers it repoints
@@ -396,7 +401,8 @@ class CharacterProcessor:
             internal_file_resource_offset=config["offsets"]["main"][1],
             reqlist_path=f"{output_path}/main_reqlist.txt",
             compression_level=2,
-            extend_reqlist=config.get("extend_main_reqlist", 0)
+            # (+ the Kirby hat file: kirby_hats added it to the req list, its pointer comes last)
+            extend_reqlist=config.get("extend_main_reqlist", 0) + (1 if has_kirby_hat else 0)
         )
 
         character_file = FileManager.add_file(
@@ -742,7 +748,7 @@ class CharacterProcessor:
             # jab3, inhale copy
             f"OS.TRUE, "
             # inhale copy
-            f"OS.{config.get("definitions", {}).get("kirby_hat", "FALSE")}, "
+            f"OS.{'TRUE' if has_kirby_hat else config.get("definitions", {}).get("kirby_hat", "FALSE")}, "
             # btt_stage_id
             f"Stages.id.BTT_{config.get("definitions", {}).get("break_the_targets", "STG1")}, "
             # btp_stage_id
@@ -829,7 +835,7 @@ class CharacterProcessor:
 
         # Create the binary file and write the hex digits
         with open(f'{output_path}/MODEL_REQ.req', 'wb') as binary_file:
-            for _ in range(req_list_count):
+            for _ in range(req_list_count + (1 if has_kirby_hat else 0)):    # (+ the Kirby hat's)
                 binary_file.write(char_hex_id_bytes)
 
         character_sound_add_list = {}
@@ -2195,8 +2201,10 @@ class CharacterProcessor:
                 # Found end of list
                 print(f"Last entry in the External file list: {pos:X}")
 
-                # Calculate how many new entries we need
-                num_new_entries = config.get("extend_main_reqlist", 0)
+                # Calculate how many new entries we need (+ the Kirby hat file's, last)
+                num_new_entries = config.get("extend_main_reqlist", 0) + (1 if has_kirby_hat else 0)
+                if has_kirby_hat:
+                    kirby_hats.main_slot(character_folder, len(data) + 4 * (num_new_entries - 1))
 
                 if num_new_entries == 0:
                     break
@@ -2287,10 +2295,20 @@ class CharacterProcessor:
                     f"Invalid SFX ID 0x{sfx_id} in config['sounds']. SFX IDs greater than or equal to 0x8000 are not allowed, as the highest bit is used in command D8 to indicate whether to play the original sound along with the new one instead of overriding it."
                 )
 
-        for moveset_file in moveset_files:
-            print(f"Compiling moveset file: {moveset_file}")
+        # Kirby's movesets for his copy of the character's neutral special (kirby_hat/moveset/*.bin,
+        # inserted as kirby_<name>): compiled like the character's own
+        kirby_moveset_dir = f"{original_path}/kirby_hat/moveset"
+        kirby_moveset_files = sorted(
+            mf for mf in (os.listdir(kirby_moveset_dir) if os.path.isdir(kirby_moveset_dir) else [])
+            if mf.lower().endswith(".bin"))
+        if kirby_moveset_files:
+            os.makedirs(f"{output_path}/kirby_hat/moveset", exist_ok=True)
 
-            with open(f"{original_path}/moveset/{moveset_file}", 'rb') as binary_file:
+        for moveset_folder, moveset_file in [("moveset", m) for m in moveset_files] + \
+                [("kirby_hat/moveset", m) for m in kirby_moveset_files]:
+            print(f"Compiling moveset file: {moveset_folder}/{moveset_file}")
+
+            with open(f"{original_path}/{moveset_folder}/{moveset_file}", 'rb') as binary_file:
                 data = bytearray(binary_file.read())
 
             pos = 0
@@ -2315,7 +2333,7 @@ class CharacterProcessor:
 
                         if sfx_int > self.LAST_REMIX_SFX_ID and command != "D8":
                             logger.error(
-                                f"Invalid SFX ID 0x{sfx} in {original_path}/moveset/{moveset_file}. "
+                                f"Invalid SFX ID 0x{sfx} in {original_path}/{moveset_folder}/{moveset_file}. "
                                 f"SFX IDs greater than the last Remix SFX ID (0x{self.LAST_REMIX_SFX_ID:04X}) must be mapped through config['sounds']. "
                                 f"Otherwise, a different character order would cause the SFX ID to point to a different sound than intended."
                             )
@@ -2332,7 +2350,7 @@ class CharacterProcessor:
                             trail} -> {character_sword_trail_add_list[trail]}")
                 pos += command_size
 
-            with open(f"{output_path}/moveset/{moveset_file}", 'wb') as binary_file:
+            with open(f"{output_path}/{moveset_folder}/{moveset_file}", 'wb') as binary_file:
                 binary_file.write(data)
 
         # Check main asm syntax
@@ -2367,6 +2385,10 @@ class CharacterProcessor:
                         )
                         main_compiled_file.write(
                             f'\tinsert {moveset_file},"moveset/{moveset_file}.bin"\n')
+                    for moveset_file in kirby_moveset_files:
+                        moveset_file = moveset_file.split(".")[0]
+                        main_compiled_file.write(
+                            f'\tinsert kirby_{moveset_file},"kirby_hat/moveset/{moveset_file}.bin"\n')
                     main_compiled_file.write("\n")
 
                     if len(config.get('sounds', {})) > 0:
