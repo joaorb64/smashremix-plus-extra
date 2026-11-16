@@ -48,6 +48,16 @@ class _GameSpace:
                 j_rest = (self.A @ node_world(self.by_name[b.name]) @ self.Ai).to_3x3().normalized()
                 self.corr[b.name] = (j_rest.inverted() @ b.matrix_local.to_3x3().normalized()).to_4x4()
         self.bones = [b for b in self.corr if re.match(r'joint_\d+$|TransN$|XRotN$|YRotN$', b)]
+        # A game joint scales only along its own axes; the bones' axes needn't be those (the armature's
+        # bones point at their children: bone_heuristic TEMPERANCE). A non-uniform bone scale is stored
+        # along the game axes nearest to the bone axes it was keyed on (sample), not as the oblique
+        # squash (shear) the game can't play. snap[b][k] = the bone axis that game axis k takes the
+        # scale of (Blender-converted joint axes); aligned[b] = how well they line up (1 = exactly).
+        self.snap, self.aligned, self.snapped = {}, {}, set()
+        for b in self.bones:
+            ci = self.corr[b].to_3x3().inverted()           # column k: joint axis k in bone axes
+            self.snap[b] = [max(range(3), key=lambda i: abs(ci[i][k])) for k in range(3)]
+            self.aligned[b] = min(abs(ci[self.snap[b][k]][k]) for k in range(3))
         self.ad = arm.animation_data or arm.animation_data_create()
 
     def use(self, act):
@@ -66,6 +76,21 @@ class _GameSpace:
             pi = self.parent.get(self.by_name[b])
             pname = self.nodes[pi].get('name') if pi is not None else None
             out[b] = np.array(G[pname].inverted() @ G[b] if pname in G else G[b])
+        from mathutils import Matrix
+        for b in self.bones:
+            s = pb[b].scale
+            if max(s) - min(s) < 1e-6 or min(abs(c) for c in s) < 1e-9:
+                continue                                    # uniform: the same along any axes
+            d = [s[i] for i in self.snap[b]]
+            if all(abs(d[k] - s[k]) < 1e-9 for k in range(3)) and self.aligned[b] > 0.9999:
+                continue                                    # bone axes = joint axes: already exact
+            # local = Ai corr_p rest T R S corr_b^-1 A  ->  Ai corr_p rest T R corr_b^-1 D A
+            C = corr[b]
+            fix = Ai @ C @ Matrix.Diagonal((1 / s[0], 1 / s[1], 1 / s[2], 1.0)) @ C.inverted() @ \
+                Matrix.Diagonal((*d, 1.0)) @ A
+            out[b] = out[b] @ np.array(fix)
+            if self.aligned[b] < 0.999:
+                self.snapped.add(b)
         return out
 
     def keep(self):

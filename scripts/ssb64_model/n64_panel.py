@@ -2053,6 +2053,8 @@ class N64_OT_anim_save_bin(bpy.types.Operator):
             return {'CANCELLED'}
         self.report({'INFO'}, f'{os.path.basename(path)}: {frames} frames, {size} bytes; play it with '
                     f'flags 0x{written:08X}' + (' (0x8 cleared: 16-bit format)' if written != flags else ''))
+        for w in getattr(anim_save, 'LAST_WARNINGS', []):
+            self.report({'WARNING'}, f'{os.path.basename(path)}: {w}')
         return {'FINISHED'}
 
 

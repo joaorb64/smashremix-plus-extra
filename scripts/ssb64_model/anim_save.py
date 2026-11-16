@@ -28,4 +28,35 @@ def save_bin(act, path, export_dir, flags, loop=False):
     data = FT.encode_animation(f, written, vals, frames, loops=loops, candidates=keys)
     with open(path, 'wb') as fh:
         fh.write(data)
+    LAST_WARNINGS[:] = warnings(f, gs, written, vals)
+    for w in LAST_WARNINGS:
+        print('Save Animation .bin:', w)
     return written, frames, len(data)
+
+
+LAST_WARNINGS = []      # of the last save_bin (the panel reports them)
+
+
+def warnings(f, gs, flags, vals):
+    """What the saved file can't play as posed in Blender."""
+    import jointanim as JA
+    import shieldpose as SP
+    out = []
+    if gs.snapped:
+        out.append('scaled on axes that aren\'t the game joint\'s (the bone points elsewhere): stored along '
+                   'the nearest game axes: ' + ', '.join(sorted(gs.snapped)))
+    in_file = {SP.joint_name(g) for g in FT.joint_order(f, flags)}
+    joints = {f'joint_{j.index:02d}': j for j in f.details['hi']['joints']}
+    dropped = []
+    for b, v in vals.items():
+        if b in in_file:
+            continue
+        rest = JA.rest_values(joints[b]) if b in joints else dict(rx=0.0, ry=0.0, rz=0.0, tx=0.0, ty=0.0,
+                                                                     tz=0.0, sx=1.0, sy=1.0, sz=1.0)
+        tol = {'r': 1e-3, 't': 0.05, 's': 1e-3}
+        if any(abs(x - rest[k]) > tol[k[0]] for k, xs in v.items() if k in rest for x in xs):
+            dropped.append(b)
+    if dropped:
+        out.append(f'not in this animation (flags 0x{flags:08X} leave them out of its joints): '
+                   + ', '.join(sorted(dropped)) + ' - their animation is dropped')
+    return out
