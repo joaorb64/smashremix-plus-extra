@@ -215,9 +215,16 @@ def wrap_mode(cm, extent, size):
 GL_WRAP = {'repeat': REPEAT, 'mirror': MIRRORED_REPEAT, 'clamp': CLAMP_TO_EDGE}
 
 
+# Textures are written upside down from the game's row order (the N64's t grows the other way,
+# so they look upright to edit), with V flipped to match (v = 1 - t / h; Blender: t / h). Recorded
+# as manifest 'tex_flip_v': the import flips them back (exports without it: the game's order).
+TEX_FLIP_V = True
+
+
 class Exporter:
     def __init__(self, f, out_dir, costumes):
         self.f, self.out, self.costumes = f, out_dir, costumes
+        self.flip_v = TEX_FLIP_V
         os.makedirs(os.path.join(out_dir, 'textures'), exist_ok=True)
         self.gl = {'asset': {'version': '2.0', 'generator': 'smashremix-extra ssb64_model/export_model.py'},
                    'scene': 0, 'scenes': [{'nodes': []}], 'nodes': [], 'meshes': [], 'materials': [],
@@ -228,7 +235,8 @@ class Exporter:
         self.sampler_index = {(REPEAT, REPEAT): 0}
         self.manifest = dict(costumes=costumes, joints=[], materials={}, objects={}, model_parts=[],
                              expressions=[], attributes_offset=f.attr,
-                             character_sha1=hashlib.sha1(bytes(f.char)).hexdigest())
+                             character_sha1=hashlib.sha1(bytes(f.char)).hexdigest(),
+                             tex_flip_v=self.flip_v)
         self.mat_index = {}
         self.mat_sig = {}
         self.mobj_name = {}
@@ -558,6 +566,25 @@ class Exporter:
             return f'{w1 >> 8:06X}' == lights.get('shadow')
         return False
 
+    def expression_mobjs(self):
+        """The MObjSubs texture parts switch the image of (facial expressions): the joint's
+        MObj at the part's index, in the hi / lo models and the joint's model part variants."""
+        f, out = self.f, set()
+        for tp in f.textureparts or []:
+            j = tp['joint']
+            for detail, key in (('hi', 'mobj_hi'), ('lo', 'mobj_lo')):
+                lst = ((f.details.get(detail) or {}).get('mobjs') or {}).get(j) or []
+                if tp.get(key) is not None and tp[key] < len(lst):
+                    out.add(lst[tp[key]])
+            for pair in (f.modelparts or {}).get(j, []):
+                for part, key in zip(pair, ('mobj_hi', 'mobj_lo')):
+                    if part is None or part.get('mobjsubs') is None:
+                        continue
+                    lst = MF.pointer_run(f.char_int, part['mobjsubs'])
+                    if tp.get(key) is not None and tp[key] < len(lst):
+                        out.add(lst[tp[key]])
+        return out
+
     def mobj_order(self, mobjs):
         """Material names in a joint's MObj list order (None: an MObj its DL never uses).
         The order matters: texture parts (facial expressions) and code address MObjs by index."""
@@ -604,7 +631,7 @@ class Exporter:
                                 for k, v in state if not self.model_light(v)])
             if key[0] == 'mobj':
                 mobj = key[1]
-                info = MF.mobj_textures(f, mobj, (w, h))
+                info = MF.mobj_textures(f, mobj, (w, h), gaps=mobj in self.expr_mobjs)
                 flags = info['flags']
                 imgs = self.real_entries(info['images'] if flags & 0x11 else [], MF.row_bytes(w, siz) * h, name, 'image')
                 # palette size: what's loaded (the DL's TLUT load, or the MObj's: 256 if sub.siz is 8b)
@@ -696,6 +723,8 @@ class Exporter:
         if fill:
             rgba = MF.clamp_fill(rgba, *fill)
         rel = f'textures/{name}_{suffix}.png'
+        if self.flip_v:
+            rgba = np.ascontiguousarray(rgba[::-1])
         Image.fromarray(rgba, 'RGBA').save(os.path.join(self.out, rel))
         return rel
 
@@ -732,7 +761,8 @@ class Exporter:
                         # glTF colors are linear; Blender stores them as sRGB bytes: written as
                         # sRGB -> linear, Blender holds (and shows) the game's exact byte values
                         col.append(tuple(MF.srgb_to_linear(x / 255) for x in rgba[:3]) + (rgba[3] / 255,))
-                    uv.append(((st[0] - t.tile_ul[0]) / w, (st[1] - t.tile_ul[1]) / h))
+                    v = (st[1] - t.tile_ul[1]) / h
+                    uv.append(((st[0] - t.tile_ul[0]) / w, 1 - v if self.flip_v else v))
                     jnt.append(src)
                     idx.append(len(pos) - 1)
                 if preserve_order:
@@ -824,6 +854,7 @@ class Exporter:
             self.manifest['hidden_part_parents'] = [SP.joint_name(h[1]) if h[1] else 'TopN' for h in SP.hidden_parts(f)]
         self.manifest['lights'] = MF.model_lights(f)       # light / shadow (ambient) colors
         self.manifest['expressions'] = f.textureparts      # (texture-index switches: joint + material index)
+        self.expr_mobjs = self.expression_mobjs()
         for detail in ('hi', 'lo'):
             d = f.details.get(detail)
             if not d:

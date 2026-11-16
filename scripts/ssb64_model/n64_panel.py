@@ -316,15 +316,24 @@ def _offset_exprs(m):
     cs, ct = (int(x) for x in info.get('size0', (w, h)))
     a = int(info.get('unk0a', 0))
     # the RDP subtracts the tile's upper-left from s, t: u - uls / w; Blender's v is 1 - t / h,
-    # so v + ult / h
+    # so v + ult / h (textures flipped upright, scene n64_tex_flip_v: v = t / h, so v - ult / h)
     if int(info.get('mode', 0)) == 2:
         ex = f'-(max(0.0, {cs}*tu/su) if abs(su) > 1.5e-5 else 0.0)/{w}'
         ey = f'(max(0.0, {ct}*tv/sv) if abs(sv) > 1.5e-5 else 0.0)/{h}'
     else:
         ex = f'-(({cs}*tu+{a})/su if abs(su) > 1.5e-5 else 0.0)/{w}'
         ey = f'(((1.0-sv-tv)*{ct}+{a})/sv if abs(sv) > 1.5e-5 else 0.0)/{h}'
+    if tex_flip_v():
+        ey = f'-({ey})'
     v = {'tu': '["n64_offset_x"]', 'tv': '["n64_offset_y"]', 'su': '["n64_scale_x"]', 'sv': '["n64_scale_y"]'}
     return ex, ey, v
+
+
+def tex_flip_v(scene=None):
+    """The export's textures are upside down from the game's rows (upright to edit) and V
+    matches: Blender's v = the N64's t / h (else 1 - t / h, the glTF import's flip)."""
+    scene = scene or bpy.context.scene
+    return bool(scene is not None and scene.get('n64_tex_flip_v'))
 
 
 def update_view(m, context=None):
@@ -361,7 +370,12 @@ def update_view(m, context=None):
                 src = off.outputs[0]
             elif nt.nodes.get(f'N64 Offset {axis}') is not None:
                 nt.nodes.remove(nt.nodes[f'N64 Offset {axis}'])
-            if axis == 'Y':
+            flip = axis == 'Y' and not tex_flip_v()
+            if axis == 'Y' and not flip:       # v = t / h already
+                for k in ('N64 Flip In Y', 'N64 Flip Out Y'):
+                    if nt.nodes.get(k) is not None:
+                        nt.nodes.remove(nt.nodes[k])
+            if flip:
                 # glTF import flips V (v = 1 - t): wrap / clamp in the N64's t, flip back after.
                 # (Clamping at a tile extent isn't symmetric, so this matters: DK's fur.)
                 fin = _node(nt, 'N64 Flip In Y', 'ShaderNodeMath', x - 820, y - 120)
@@ -403,7 +417,7 @@ def update_view(m, context=None):
             if edge is not None:
                 nt.links.new(res, edge.inputs[0])
                 res = edge.outputs[0]
-            if axis == 'Y':
+            if flip:
                 fout = _node(nt, 'N64 Flip Out Y', 'ShaderNodeMath', x - 320, y - 120)
                 fout.operation, fout.inputs[0].default_value = 'SUBTRACT', 1.0
                 nt.links.new(res, fout.inputs[1])
@@ -1922,7 +1936,7 @@ class N64_OT_anim_load_bin(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
     filter_glob: bpy.props.StringProperty(default='*.bin', options={'HIDDEN'})
-    flags: bpy.props.StringProperty(name='Flags 0x', default='',
+    flags: bpy.props.StringProperty(name='Flags 0x', default='', options={'SKIP_SAVE'},
                                     description='The motion flags to read it with (hex); empty: guessed '
                                                 'from the file\'s joint count')
 
@@ -1976,10 +1990,10 @@ class N64_OT_anim_save_bin(bpy.types.Operator):
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
     filter_glob: bpy.props.StringProperty(default='*.bin', options={'HIDDEN'})
     check_existing: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
-    flags: bpy.props.StringProperty(name='Flags 0x', default='',
+    flags: bpy.props.StringProperty(name='Flags 0x', default='', options={'SKIP_SAVE'},
                                     description='The motion flags to write it for (hex); empty: the '
                                                 'action\'s (N64 Animation panel), else 0')
-    loop: bpy.props.BoolProperty(name='Loop', default=False,
+    loop: bpy.props.BoolProperty(name='Loop', default=False, options={'SKIP_SAVE'},
                                  description='Scripts that loop (the action\'s Loop setting by default)')
 
     @staticmethod
@@ -1994,6 +2008,8 @@ class N64_OT_anim_save_bin(bpy.types.Operator):
         if act is None:
             self.report({'ERROR'}, 'Pick the fighter animation to save in the Action Editor')
             return {'CANCELLED'}
+        # (SKIP_SAVE: never the last save's flags; a file written for other flags plays its joints
+        # shifted: TransN 0x40000000 adds an entry at the start)
         if not self.flags:
             self.flags = f'{_action_flags(act):08X}'
         self.loop = bool(act.get('n64_loop', False))

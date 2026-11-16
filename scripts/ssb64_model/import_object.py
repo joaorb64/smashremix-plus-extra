@@ -132,7 +132,8 @@ class ModelWriter:
     def ptr_list(self, targets):
         lst = self.blob.add(b'\0' * (4 * len(targets)), 4)
         for i, t in enumerate(targets):
-            self.blob.ptr(lst + 4 * i, t)
+            if t is not None:                      # (None: an empty slot, stays 0)
+                self.blob.ptr(lst + 4 * i, t)
         return lst
 
     def mobjsub(self, name):
@@ -140,7 +141,7 @@ class ModelWriter:
         if name in self.mobj_of:
             return self.mobj_of[name]
         f, t = self.f, self.textures.get(name)
-        imgs = tuple(self.store(x) for x in t.images) if t.image_source == 'list' else ()
+        imgs = tuple(self.store(x) if x is not None else None for x in t.images) if t.image_source == 'list' else ()
         pals = tuple(self.store(p) for p in t.palettes) if t.palette_source == 'list' else ()
         # a new material: a copy of one of the model's MObjs, or (animated, or none to copy) a
         # clean one: no offset, scale 1, white colors

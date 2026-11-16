@@ -157,6 +157,15 @@ def first_seen(rgba, n):
     return rank[inv.ravel()], pal, reduced
 
 
+# Set by the import (import_fighter.Materials) from the export manifest's 'tex_flip_v': its PNGs
+# are upside down from the game's row order (upright to edit). Every PNG read is flipped back.
+FLIP_V = False
+
+
+def _rows(a):
+    return np.ascontiguousarray(a[::-1]) if FLIP_V else a
+
+
 class Indexed(np.ndarray):
     """An RGBA image read from a paletted PNG, keeping its indices (.index) and palette (.pal)."""
 
@@ -164,10 +173,10 @@ class Indexed(np.ndarray):
 def load_indexed(path):
     """RGBA array of the PNG; a paletted PNG's also carries .index (h x w) and .pal (n x 4)."""
     pim = Image.open(path)
-    rgba = np.asarray(pim.convert('RGBA'))
+    rgba = _rows(np.asarray(pim.convert('RGBA')))
     if pim.mode != 'P':
         return rgba
-    idx = np.asarray(pim, np.uint8)
+    idx = _rows(np.asarray(pim, np.uint8))
     raw = pim.getpalette('RGB') or []
     n = len(raw) // 3
     alpha = pim.info.get('transparency', b'')
@@ -183,7 +192,7 @@ def load_indexed(path):
 def load_png(path):
     if not path or not os.path.exists(path):
         return None
-    return np.asarray(Image.open(path).convert('RGBA'))
+    return _rows(np.asarray(Image.open(path).convert('RGBA')))
 
 
 def resize(im, w, h):
@@ -288,7 +297,7 @@ class Material:
             p = os.path.join(root, rel) if rel else None
             if not p or not os.path.exists(p):
                 return None
-            return resize(np.asarray(Image.open(p).convert('RGBA')), w, h)
+            return resize(_rows(np.asarray(Image.open(p).convert('RGBA'))), w, h)
 
         self.costume_map = [list(m) for m in e.get('costume_map') or [[0, 0]]]
         while len(self.costume_map) < costumes:
@@ -296,17 +305,17 @@ class Material:
         self.costume_map = self.costume_map[:costumes]
         img_addrs = list(e.get('image_addrs') or [])
         pal_addrs = list(e.get('palette_addrs') or []) if self.ci else []
-        img_raw = [bytes(base[a:a + nbytes]) for a in img_addrs]
+        img_raw = [bytes(base[a:a + nbytes]) if a is not None else None for a in img_addrs]   # None: empty slot
         pal_raw = [bytes(base[a:a + 2 * n_pal]) for a in pal_addrs]
         # current state: CI -> index arrays + palettes; others -> RGBA arrays
         if self.ci:
             pals = [decode_pal(r) for r in pal_raw]
-            imgs = [unpack(self.unpad(r), bpp, w * h) for r in img_raw]
+            imgs = [unpack(self.unpad(r), bpp, w * h) if r is not None else None for r in img_raw]
         else:
             pals = []
-            imgs = [self._decode(r) for r in img_raw]
+            imgs = [self._decode(r) if r is not None else None for r in img_raw]
         self.orig_transparent = self._uses_transparency(img_raw, pal_raw)
-        orig_imgs = [x.copy() for x in imgs]
+        orig_imgs = [x.copy() if x is not None else None for x in imgs]
         orig_pals = [x.copy() for x in pals]
         ref_i, ref_p = self.costume_map[0][0], (self.costume_map[0][1] if self.ci else 0)
         # palette PNGs (drawn with the reference image)
@@ -316,7 +325,7 @@ class Material:
                 pals[p] = self._palette_from(im, imgs[ref_i], pals[p], f'palette {p}')
         # image PNGs (drawn with the reference palette)
         for i, rel in enumerate((e.get('images') or [])[:len(imgs)]):
-            im = png(rel)
+            im = png(rel) if imgs[i] is not None else None
             if im is not None:
                 imgs[i] = self._image_from(im, imgs[i], pals[ref_p] if self.ci else None, f'image {i}')
         # costume images from Blender: override the entries each costume uses
@@ -355,11 +364,14 @@ class Material:
             self.warnings.append(f'image {i} added to the list')
         # encode (unchanged entries keep their exact bytes)
         if self.ci:
-            self.images = [self.pad(pack(ix, bpp)) for ix in imgs]
+            self.images = [self.pad(pack(ix, bpp)) if ix is not None else None for ix in imgs]
             self.palettes = [r if np.array_equal(decode_pal(r), p) else encode_pal(p) for r, p in zip(pal_raw, pals)]
         else:
             self.images = []
             for r, im in zip(img_raw, imgs):
+                if im is None:
+                    self.images.append(None)
+                    continue
                 enc = self.pad(encode_direct(im, self.fmt, self.siz))
                 self.images.append(r if r and enc == self.pad(encode_direct(self._decode(r), self.fmt, self.siz))
                                    else enc)

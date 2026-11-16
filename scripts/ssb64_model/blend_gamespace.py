@@ -80,6 +80,28 @@ class _GameSpace:
         return restore
 
 
+def key_range(act):
+    """(first, last) frame the animation plays: its keyframes' extent (from 0, or the first key if
+    negative), not the action's manual frame range (set at import: it doesn't follow edited keys).
+    The manual range is updated to it, so the timeline shows what's exported. A single pose (keys
+    on one frame only) keeps its manual range."""
+    import keyreduce as KR
+    xs = [kp.co.x for fc in KR.action_fcurves(act) for kp in fc.keyframe_points]
+    if not xs or round(min(xs)) == round(max(xs)):
+        # no keys / a single pose: only the manual range gives its length (menu poses, Shield Neutral)
+        return min(int(act.frame_range[0]), 0), int(act.frame_range[1])
+    else:
+        f0, f1 = int(round(min(xs))), int(round(max(xs)))
+    f0 = min(f0, 0)
+    f1 = max(f1, f0 + 1)
+    try:
+        if getattr(act, 'use_frame_range', False) and (int(act.frame_start), int(act.frame_end)) != (f0, f1):
+            act.frame_start, act.frame_end = f0, f1
+    except (AttributeError, RuntimeError):
+        pass
+    return f0, f1
+
+
 def sample_action(gs, act):
     """-> (frames, values {bone: {track: per frame}}, keys {bone: [frames with Blender keys]}):
     every joint's local transform in the game's space as the game's tracks (jointanim.decompose:
@@ -87,8 +109,7 @@ def sample_action(gs, act):
     import jointanim as JA
     import keyreduce as KR
     gs.use(act)
-    f0, f1 = (int(act.frame_range[0]), int(act.frame_range[1]))
-    f0 = 0 if f0 > 0 else f0
+    f0, f1 = key_range(act)
     keys = {}
     for fc in KR.action_fcurves(act):
         bone, _ = KR._bone_of(fc)

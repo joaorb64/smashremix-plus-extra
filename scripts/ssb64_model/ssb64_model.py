@@ -5,6 +5,7 @@
     ssb64_model.py import OUT_DIR [TARGET]           edited model.blend -> game files
     ssb64_model.py blend OUT_DIR                     (re)build only the .blend of an export
     ssb64_model.py preview OUT_DIR                   (re)render only OUT_DIR/previews/
+    ssb64_model.py flip-textures OUT_DIR             an older export's textures -> upright (flip_textures.py)
 
 SOURCE is a folder or a ROM:
   extra_characters/<Name>            the fighter (main.bin + character.bin)
@@ -237,6 +238,12 @@ def main(argv=None):
     p.add_argument('out_dir', metavar='OUT_DIR')
     p.add_argument('--blender', metavar='CMD')
 
+    p = sub.add_parser('flip-textures', help="an export made before textures were upright: flip its PNGs, "
+                                             "UVs and .blend (once)")
+    p.add_argument('out_dir', metavar='OUT_DIR')
+    p.add_argument('--blend', help='the .blend (default: OUT_DIR/model.blend)')
+    p.add_argument('--blender', metavar='CMD')
+
     p = sub.add_parser('preview', help='(re)render OUT_DIR/previews/')
     p.add_argument('out_dir', metavar='OUT_DIR')
     p.add_argument('--size', type=int, default=200)
@@ -255,6 +262,11 @@ def main(argv=None):
         cmd_export(a, extra)
     elif a.cmd == 'import':
         cmd_import(a, extra)
+    elif a.cmd == 'flip-textures':
+        import flip_textures
+        blend = a.blend or find_blend(a.out_dir)
+        flip_textures.convert_files(a.out_dir)
+        run_blender(blender_cmd(a.blender), 'flip_textures.py', a.out_dir, blend)
     elif a.cmd == 'blend':
         run_blender(blender_cmd(a.blender), 'build_blend.py', a.out_dir)
     else:

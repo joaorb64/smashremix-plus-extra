@@ -83,7 +83,9 @@ class Model:
             return None, np.array(e.get('color', [200, 200, 200, 255])[:3], float), None, blend, shading
         p = pngs[min(costume, len(pngs) - 1)]
         if p not in self.tex_cache:
-            self.tex_cache[p] = np.asarray(Image.open(os.path.join(self.dir, p)).convert('RGBA')).astype(float)
+            im = np.asarray(Image.open(os.path.join(self.dir, p)).convert('RGBA')).astype(float)
+            # exports flipped upright to edit (manifest tex_flip_v): back to the game's rows
+            self.tex_cache[p] = im[::-1] if self.man.get('tex_flip_v') else im
         return self.tex_cache[p], None, e.get('wrap'), blend, shading
 
     def tris(self, prefix, costume, override=None):
@@ -97,6 +99,8 @@ class Model:
                 VC = (self.acc(pr['attributes']['COLOR_0']).astype(float) if 'COLOR_0' in pr['attributes']
                       else np.ones((len(P), 4)))
                 UV = self.acc(pr['attributes']['TEXCOORD_0']).astype(float)
+                if self.man.get('tex_flip_v'):        # v = 1 - t / h: back to t / h
+                    UV = np.column_stack([UV[:, 0], 1 - UV[:, 1]])
                 e = self.man['materials'].get(self.mats[pr['material']], {})
                 cull = next((int(b, 16) & 0x600 for a, b in e.get('state') or [] if a.startswith('D9')), 0x400)
                 # render mode depth bits: Z compare 0x10, Z update 0x20 (no render mode: the game's, both)
@@ -374,7 +378,7 @@ def expressions_sheet(md, size):
     rows = []
     for name, e in md.man['materials'].items():
         imgs = e.get('images') or []
-        if len(imgs) < 2:
+        if len([x for x in imgs if x]) < 2:
             continue
         users = [m['name'] for m in md.gl['meshes'] if m['name'].startswith(('hi_', 'L'))
                  and any(md.mats[pr['material']] == name for pr in m['primitives'])]
@@ -383,11 +387,14 @@ def expressions_sheet(md, size):
         frame = [t for u in users for t in md.tris(u, 0)]
         tiles = []
         for i, rel in enumerate(imgs):
+            if not rel:                               # an empty slot (expression numbers it skips)
+                continue
             tex = np.asarray(Image.open(os.path.join(md.dir, rel)).convert('RGBA')).astype(float)
+            tex = tex[::-1] if md.man.get('tex_flip_v') else tex
             tris = [t for u in users for t in md.tris(u, 0, override={name: tex})]
             tiles.append(label(render(tris, 0.0, size, bounds_of(frame, 0.0, 0.0)), f'{i}'))
         per = max(1, (6 * (size + 6)) // (tiles[0].width + 6))
-        rows.append(header(f'{name}: {len(imgs)} images on {", ".join(users)} (costume 0 palette)',
+        rows.append(header(f'{name}: {len([x for x in imgs if x])} images on {", ".join(users)} (costume 0 palette)',
                            6 * (size + 6)))
         rows += [hstack(tiles[k:k + per]) for k in range(0, len(tiles), per)]
     return vstack(rows) if rows else None

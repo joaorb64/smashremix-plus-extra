@@ -839,13 +839,36 @@ def decode_script(d, addr, limit=200):
     return frames
 
 
-def mobj_textures(f, mobj, size, n_entries=8):
-    """Image and palette pointer arrays of an MObjSub (None where absent)."""
+def pointer_run_gaps(ptrs, data, start, limit=32):
+    """pointer_run that goes on past empty (0) entries: a texture part's image list is indexed
+    by the expression number, unused numbers are empty (Kirby: [face 0, 0, 0, 0, 0, faces 5..10]).
+    None for the empty ones; trailing ones dropped."""
+    pointer_run(ptrs, start, 1)                   # (caches the targets)
+    targets = _TARGETS[id(ptrs)]
+    out = []
+    while start is not None and len(out) < limit:
+        o = start + 4 * len(out)
+        if out and o in targets:
+            break
+        if o in ptrs:
+            out.append(ptrs[o])
+        elif o + 4 <= len(data) and data[o:o + 4] == b'\0\0\0\0':
+            out.append(None)
+        else:
+            break
+    while out and out[-1] is None:
+        out.pop()
+    return out
+
+
+def mobj_textures(f, mobj, size, n_entries=8, gaps=False):
+    """Image and palette pointer arrays of an MObjSub (None where absent). gaps: its image list
+    may have empty entries (a texture part's MObj: facial expressions by number)."""
     d, ptrs = f.char, f.char_int
     fmt, siz = d[mobj + 2], d[mobj + 3]
     sprites = ptrs.get(mobj + 4)
     palettes = ptrs.get(mobj + 0x2C)
-    imgs = pointer_run(ptrs, sprites)
+    imgs = pointer_run_gaps(ptrs, d, sprites) if gaps else pointer_run(ptrs, sprites)
     pals = pointer_run(ptrs, palettes)
     return dict(fmt=fmt, siz=siz, flags=u16(d, mobj + 0x30), images=imgs, palettes=pals,
                 prim=tuple(d[mobj + 0x50:mobj + 0x54]))

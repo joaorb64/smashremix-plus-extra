@@ -42,6 +42,9 @@ N = man['costumes']
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 scene = bpy.context.scene
+# textures upside down from the game's rows (upright to edit), V to match: Blender's v = t / h
+# (n64_panel.update_view wraps / offsets in it directly)
+scene['n64_tex_flip_v'] = bool(man.get('tex_flip_v'))
 scene.render.fps = 60          # the game's frame rate; before the glTF import, which turns the
                                # animations' seconds into frames at the scene's rate
 try:     # bone tails toward the child joints (the default keeps each joint's own axes: bones

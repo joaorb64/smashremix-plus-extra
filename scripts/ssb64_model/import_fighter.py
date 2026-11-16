@@ -141,6 +141,9 @@ class Materials:
             print('  warning: no export manifest found: every material is rebuilt as a new CI4 material')
             self.manifest, self.root = {'materials': {}}, None
         self.costumes, self.base = costumes, base_char
+        # textures exported upside down to edit (export_model.TEX_FLIP_V): PNGs and V flipped back
+        self.flip_v = bool(self.manifest.get('tex_flip_v'))
+        MAT.FLIP_V = self.flip_v
         self.anims = getattr(self, 'anims', None)
         self.cloak_safe = True
         self.lights = getattr(self, 'lights', {})
@@ -252,7 +255,8 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
                 lp = (Winv[j] @ np.append(o['pos'][v], 1))[:3]
                 ln = Winv[j][:3, :3] @ o['nrm'][v]
                 ln /= np.linalg.norm(ln) or 1
-                st = (o['uv'][v][0] * tex.w, o['uv'][v][1] * tex.h)
+                tv = o['uv'][v][1]
+                st = (o['uv'][v][0] * tex.w, (1 - tv if getattr(textures, 'flip_v', False) else tv) * tex.h)
                 k = (o['name'], int(v), name)
                 # unlit materials (lighting off): the vertex carries a color instead of a normal
                 rgba = None if tex.lit else o['col'][v]
@@ -494,7 +498,8 @@ def main(argv=None):
         def ptr_list(targets):
             lst = blob.add(b'\0' * (4 * len(targets)), 4)
             for i, t in enumerate(targets):
-                blob.ptr(lst + 4 * i, t)
+                if t is not None:                  # (None: an empty slot, stays 0)
+                    blob.ptr(lst + 4 * i, t)
             return lst
 
         def mobjsub(name):
@@ -508,7 +513,7 @@ def main(argv=None):
                 mobj_of[None], script_of[None] = blob.add(bytes(ms), 8), None
                 return mobj_of[None]
             t = textures.get(name)
-            imgs = tuple(store(x) for x in t.images) if t.image_source == 'list' else ()
+            imgs = tuple(store(x) if x is not None else None for x in t.images) if t.image_source == 'list' else ()
             pals = tuple(store(p) for p in t.palettes) if t.palette_source == 'list' else ()
             src = t.mobj if t.mobj is not None else template_ms
             if src is None:
