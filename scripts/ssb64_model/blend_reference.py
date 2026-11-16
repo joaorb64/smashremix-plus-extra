@@ -15,15 +15,16 @@ its TransN joint on it (its animations' TransN moves are dropped, as the game ca
 """
 import json
 import os
+import re
 import sys
 
 import bpy
-import bmesh
 import mathutils
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kirby_hat_gltf as KG  # noqa: E402
+import blend_matprops as BM  # noqa: E402
 
 C = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], float)      # glTF (Y up) -> Blender (Z up)
 
@@ -58,7 +59,17 @@ def _brighten(m, strength=0.6):
         bsdf.inputs['Emission Strength'].default_value = strength
 
 
-def _material(name, entry, folder):
+def _view(m):
+    """The N64 look (n64_panel: combiner, game lighting, wrap / clamp, cut-out / blending), like the
+    model's own materials; Blender's plain look with N64_NO_VIEW."""
+    if os.environ.get('N64_NO_VIEW'):
+        _brighten(m)
+        return
+    import n64_panel as PANEL
+    PANEL.update_view(m)
+
+
+def _material(name, entry, folder, lights=None):
     m = bpy.data.materials.new(name)
     m.use_nodes = True
     m['n64_helper'] = True                          # (blend_to_gltf.py: not one of the model's materials)
@@ -90,8 +101,37 @@ def _material(name, entry, folder):
         m.diffuse_color = (*lin, 1.0)
     if bsdf is not None and 'Metallic' in bsdf.inputs:
         bsdf.inputs['Metallic'].default_value = 0.0
-    _brighten(m)
+    BM.apply(m, entry)
+    _own_lights(m, lights)
+    _item_state(m, entry)
+    _view(m)
     return m
+
+
+def _own_lights(m, lights):
+    """The reference model's own light colors (its display list sets them: the Beam Sword's are dark
+    red), not the fighter's scene lights; a material's own (DB0A in its state, MObj costume lights) win."""
+    if 'n64_costume_light' in m or 'n64_costume_shadow' in m:
+        return                              # its MObj's own (Mario's shoes: white, lit by a brown light)
+    for key in ('light', 'shadow'):
+        if (lights or {}).get(key) and f'n64_{key}_color' not in m:
+            m[f'n64_{key}_color'] = lights[key]
+
+
+XLU_MODE = 'E200001C 00504DD8'          # translucent surface (AA, z compare, no z update)
+
+
+def _item_state(m, entry):
+    """What the game's item drawing supplies around an item's display lists (they set neither): env
+    00000000 (the combiners lerp to env by env alpha: the white flash before an item disappears), and
+    for the translucent list (DObjDLLink 1, e.g. the Beam Sword's blade) a blending render mode.
+    Reference helpers only: they're never imported back."""
+    state = [c.strip() for c in str(m.get('n64_state', '')).split(';') if c.strip()]
+    if not any(c.startswith('FB') for c in state):
+        state.append('FB000000 00000000')
+    if entry.get('dl_link') == 1 and not any(c.startswith('E200001C') for c in state):
+        state.insert(0, XLU_MODE)
+    m['n64_state'] = '; '.join(state)
 
 
 def _mesh(name, m, mats, coll):
@@ -108,13 +148,21 @@ def _mesh(name, m, mats, coll):
         for li in poly.loop_indices:
             v = me.loops[li].vertex_index
             uv.data[li].uv = (UV[v][0], 1.0 - UV[v][1])
-    bm = bmesh.new()
-    bm.from_mesh(me)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.01)
-    bm.to_mesh(me)
-    bm.free()
+    if m.get('col') is not None:            # vertex colors (unlit materials shade with them: Beam Sword blade)
+        COL = np.asarray(m['col'], float)
+        vc = me.color_attributes.new('Color', 'BYTE_COLOR', 'CORNER')
+        for poly in me.polygons:
+            for li in poly.loop_indices:
+                vc.data[li].color_srgb = tuple(COL[me.loops[li].vertex_index])
+        me.color_attributes.active_color = vc
+        me.color_attributes.default_color_name = vc.name
+    # the model's own vertex normals (lit materials are shaded by them: N . L), corners kept apart
+    # (merging let Blender smooth across hard edges: the Beam Sword's hilt)
     for p in me.polygons:
         p.use_smooth = True
+    if m.get('nrm') is not None:
+        NRM = np.asarray(m['nrm'], float) @ C.T
+        me.normals_split_custom_set([tuple(NRM[lp.vertex_index]) for lp in me.loops])
     me.update()
     ob = bpy.data.objects.new(name, me)
     coll.objects.link(ob)
@@ -200,7 +248,8 @@ def build(export_dir, arm):
         for mesh in meshes.values():
             for mat, _ in mesh['tris']:
                 if mat not in mats:
-                    mats[mat] = _material(f"ref_{it['name'].lower()}_{mat}", man['materials'].get(mat) or {}, folder)
+                    mats[mat] = _material(f"ref_{it['name'].lower()}_{mat}", man['materials'].get(mat) or {}, folder,
+                                          man.get('lights'))
         parent = holds.get(it['hold'])
         for mname, mesh in meshes.items():
             ob = _mesh(f"{it['label']} {mname}" if len(meshes) > 1 else it['label'], mesh, mats, c)
@@ -238,7 +287,10 @@ def _opponent(folder, op, hold, coll):
     new_obs = [o for o in bpy.data.objects if o not in before_obs]
     new_acts = [a for a in bpy.data.actions if a not in before_acts]
     for m in [m for m in bpy.data.materials if m not in before_mats]:
-        entry = man['materials'].get(m.name) or {}
+        # (Blender renames them mat_000.001...: the fighter's own materials have the same names)
+        entry = man['materials'].get(re.sub(r'\.\d+$', '', m.name)) or {}
+        BM.apply(m, entry)
+        _own_lights(m, man.get('lights'))
         m.name = f'ref_opponent_{m.name}'
         m['n64_helper'] = True
         cc = (entry.get('costume_colors') or [{}])[0]
@@ -246,7 +298,7 @@ def _opponent(folder, op, hold, coll):
             for n in m.node_tree.nodes:
                 if n.type == 'BSDF_PRINCIPLED':
                     n.inputs['Base Color'].default_value = (*_lin([int(cc['prim'][i:i + 2], 16) for i in (0, 2, 4)]), 1.0)
-        _brighten(m)
+        _view(m)
     arm = next((o for o in new_obs if o.type == 'ARMATURE'), None)
     for o in new_obs:
         for c in list(o.users_collection):

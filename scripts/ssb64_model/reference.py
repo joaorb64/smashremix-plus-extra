@@ -106,8 +106,7 @@ def build_models(rom, folder, animations=True):
         ex = EX.Exporter(op, d, 1)
         ex.fighter_anims = [a for a in EX.rom_animations(entries, op, OPPONENT)
                             if any(k in a['name'] for k in OPPONENT_ANIMS)] if animations else []
-        ex.run()
-        flatten_textures(d)
+        ex.run()                                                 # (textured: the N64 look in Blender)
         models['opponent'] = dict(name=OPPONENT.title(), dir=os.path.relpath(d, folder), size=fighter_size(op),
                                   animations=[a['name'] for a in ex.fighter_anims])
     except (SystemExit, Exception) as e:                         # noqa: BLE001
@@ -116,37 +115,3 @@ def build_models(rom, folder, animations=True):
           + (f", opponent {models['opponent']['name']} ({len(models['opponent']['animations'])} animations)"
              if models['opponent'] else '') + f' -> {folder}')
     return models
-
-
-def flatten_textures(folder):
-    """An export's glTF without textures: each textured material gets its image's average color
-    (alpha-weighted, linear) as its base color; textures/ is removed."""
-    from PIL import Image
-    path = os.path.join(folder, 'model.gltf')
-    gl = json.load(open(path))
-    images = gl.get('images') or []
-    textures = gl.get('textures') or []
-    for m in gl.get('materials', []):
-        pbr = m.get('pbrMetallicRoughness') or {}
-        tex = pbr.pop('baseColorTexture', None)
-        if tex is None:
-            continue
-        uri = images[textures[tex['index']]['source']]['uri']
-        px = np.asarray(Image.open(os.path.join(folder, uri)).convert('RGBA'), float).reshape(-1, 4) / 255
-        w = px[:, 3:4]
-        rgb = (px[:, :3] * w).sum(0) / max(w.sum(), 1e-6)
-        lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
-        pbr['baseColorFactor'] = [float(x) for x in lin] + [1.0]
-        m['pbrMetallicRoughness'] = pbr
-        m.pop('alphaMode', None)
-    for k in ('images', 'textures'):
-        gl.pop(k, None)
-    json.dump(gl, open(path, 'w'), indent=1)
-    shutil.rmtree(os.path.join(folder, 'textures'), ignore_errors=True)
-    # (the manifest's materials point at the PNGs: flat colors now)
-    mp = os.path.join(folder, 'manifest.json')
-    man = json.load(open(mp))
-    for e in (man.get('materials') or {}).values():
-        for k in ('costumes', 'images', 'palettes'):
-            e.pop(k, None)
-    json.dump(man, open(mp, 'w'), indent=1)
