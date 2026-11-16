@@ -52,16 +52,29 @@ def blender_cmd(opt=None):
                      '--no-blend skips the Blender step.')
 
 
-def run_blender(cmd, script, folder, blend=None):
-    """Run SCRIPT in background Blender: `blender -b [BLEND] --python SCRIPT -- FOLDER`."""
+def blender_argv(cmd, script, folder, blend=None):
+    """`blender -b [BLEND] --python SCRIPT -- FOLDER` (printed)."""
     folder = os.path.abspath(folder)
     if 'flatpak' in cmd[0] and os.path.realpath(folder).startswith('/tmp/'):
         print(f'  warning: Flatpak Blender can\'t see /tmp ({folder}): use a folder elsewhere')
     argv = cmd + ['-b', '--factory-startup'] + ([os.path.abspath(blend)] if blend else []) + \
         ['--python-exit-code', '1', '--python', os.path.join(HERE, script), '--', folder]
     print('$', ' '.join(shlex.quote(x) for x in argv))
-    if subprocess.run(argv).returncode:
+    return argv
+
+
+def run_blender(cmd, script, folder, blend=None):
+    """Run SCRIPT in background Blender: `blender -b [BLEND] --python SCRIPT -- FOLDER`."""
+    if subprocess.run(blender_argv(cmd, script, folder, blend)).returncode:
         raise SystemExit(f'Blender failed running {script}')
+
+
+def run_blenders(cmd, script, folders):
+    """run_blender for several folders at once (one Blender each, side by side)."""
+    procs = [(f, subprocess.Popen(blender_argv(cmd, script, f))) for f in folders]
+    failed = [f for f, p in procs if p.wait()]
+    if failed:
+        raise SystemExit(f'Blender failed running {script} for {", ".join(failed)}')
 
 
 def find_blend(out_dir):
@@ -133,11 +146,12 @@ def cmd_export(a, extra):
     print(f'exporting {kind}: {" ".join(shlex.quote(x) for x in argv + extra)}')
     EX.main(argv + extra)
     if not a.no_blend:
-        run_blender(blender_cmd(a.blender), 'build_blend.py', a.out_dir)
-        print(f'-> {os.path.join(a.out_dir, "model.blend")}')
         kh = os.path.join(a.out_dir, 'kirby_hat')
-        if os.path.exists(os.path.join(kh, 'manifest.json')):      # Kirby wearing its copy-ability hat
-            run_blender(blender_cmd(a.blender), 'build_blend.py', kh)
+        has_kh = os.path.exists(os.path.join(kh, 'manifest.json'))  # Kirby wearing its copy-ability hat
+        # (the two .blends don't depend on each other: built side by side)
+        run_blenders(blender_cmd(a.blender), 'build_blend.py', [a.out_dir] + ([kh] if has_kh else []))
+        print(f'-> {os.path.join(a.out_dir, "model.blend")}')
+        if has_kh:
             print(f'-> {os.path.join(kh, "model.blend")} (Kirby with the hat)')
 
 

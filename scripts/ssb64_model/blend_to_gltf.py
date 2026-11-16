@@ -344,7 +344,7 @@ def shield_pose():
 
 
 # hurtboxes / stage collision (gamedata.py applies them)
-json.dump(GDB.collect(), open(os.path.join(OUT, 'gamedata.json'), 'w'), indent=1)
+open(os.path.join(OUT, 'gamedata.json'), 'w').write(json.dumps(GDB.collect(), indent=1))
 json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims,
                joint_anims=joint_anims(), fighter_anims=fighter_anims(),
                shield_pose=shield_pose()),

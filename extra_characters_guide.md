@@ -79,6 +79,9 @@ special shows its "gun": the model part on his hand (joint 0x11) that Fox's / Wo
 blaster uses (moveset event A0880000 shows it, A08FFFFF hides it). With a kirby_hat.bin,
 Kirby copies the character (definitions.kirby_hat is implied) and wears that hat; without
 one, definitions.kirby_hat: TRUE still gives him the parent's hat and power.
+A character can wear another one's hat instead of having its own kirby_hat.bin: config.yaml
+`kirby_hat_from: <character folder>` (e.g. Knuckles' variants: `kirby_hat_from: Knuckles`). The
+ROM gets one hat file, listed in every sharer's main.bin req list (loaded once in a match).
 
 Making / editing it (appender/scripts/ssb64_model):
 - `kirby_hat.py new extra_characters/<Name>/kirby_hat`: a kirby_hat.bin with no hat yet

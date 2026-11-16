@@ -460,8 +460,8 @@ class Exporter:
             self.animation('Stage', anims)
         self.gl['buffers'].append({'uri': 'model.bin', 'byteLength': len(self.blob)})
         open(os.path.join(self.out, 'model.bin'), 'wb').write(self.blob)
-        json.dump(self.gl, open(os.path.join(self.out, 'model.gltf'), 'w'), indent=1)
-        json.dump(self.manifest, open(os.path.join(self.out, 'manifest.json'), 'w'), indent=1, default=int)
+        open(os.path.join(self.out, 'model.gltf'), 'w').write(json.dumps(self.gl, indent=1))
+        open(os.path.join(self.out, 'manifest.json'), 'w').write(json.dumps(self.manifest, indent=1, default=int))
 
     # ---- materials
     FMT = {(0, 2): 'RGBA16', (0, 3): 'RGBA32', (2, 0): 'CI4', (2, 1): 'CI8', (3, 0): 'IA4', (3, 1): 'IA8',
@@ -909,8 +909,8 @@ class Exporter:
                                                                       mobj_slots=slots))
         self.gl['buffers'].append({'uri': 'model.bin', 'byteLength': len(self.blob)})
         open(os.path.join(self.out, 'model.bin'), 'wb').write(self.blob)
-        json.dump(self.gl, open(os.path.join(self.out, 'model.gltf'), 'w'), indent=1)
-        json.dump(self.manifest, open(os.path.join(self.out, 'manifest.json'), 'w'), indent=1, default=int)
+        open(os.path.join(self.out, 'model.gltf'), 'w').write(json.dumps(self.gl, indent=1))
+        open(os.path.join(self.out, 'manifest.json'), 'w').write(json.dumps(self.manifest, indent=1, default=int))
 
 
 def costumes_in_scripts(f):

@@ -148,4 +148,4 @@ def write_gltf(path, meshes, material_colors=None):
               buffers=[dict(uri=os.path.splitext(os.path.basename(path))[0] + '.bin', byteLength=len(buf))],
               bufferViews=views, accessors=accs)
     open(os.path.splitext(path)[0] + '.bin', 'wb').write(buf)
-    json.dump(gl, open(path, 'w'), indent=1)
+    open(path, 'w').write(json.dumps(gl, indent=1))

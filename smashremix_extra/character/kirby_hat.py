@@ -28,6 +28,8 @@ import os
 import re
 import struct
 
+import yaml
+
 import lineinfile
 
 from smashremix_extra.constants import SMASHREMIX_PATH
@@ -127,6 +129,7 @@ class KirbyHats:
         self.extra_jkirby_actions = 0
         self.kirby_action_names = []    # [(action id constant, training mode string)], assembly order
         self.counts = {}                # {character folder: count_kirby_actions()}
+        self.files = {}                 # {hat owner's folder: its hat file} (shared: kirby_hat_from)
 
     # ---------------------------------------------------------------- per character
     def process_character(self, char_folder, original_path, output_path):
@@ -162,18 +165,32 @@ class KirbyHats:
                                  internal_file_table_offset=zeros * 4, internal_file_resource_offset=0x3FFFC,
                                  compression_level=0)
 
+        # config.yaml kirby_hat_from: <character folder>: wear that character's hat (one hat file in
+        # the ROM, in every sharer's req list; each still gets its own hat id and main.bin pointer)
         path = os.path.join(output_path, "kirby_hat", "kirby_hat.bin")
-        if not os.path.exists(path):
+        owner = char_folder
+        config = yaml.safe_load(open(os.path.join(original_path, "config.yaml"), encoding="utf-8")) or {}
+        share = config.get("kirby_hat_from")
+        if share:
+            if os.path.exists(path):
+                raise SystemExit(f"{char_folder}: kirby_hat_from: {share}, but it has its own kirby_hat/kirby_hat.bin")
+            owner = share
+            path = os.path.join(os.path.dirname(os.path.normpath(original_path)), share, "kirby_hat", "kirby_hat.bin")
+            if not os.path.exists(path):
+                raise SystemExit(f"{char_folder}: kirby_hat_from: {share}, but there is no {path}")
+        elif not os.path.exists(path):
             return False
         data = open(path, "rb").read()
         offsets, head = hat_file_offsets(data)
-        f = FileManager.add_file(
-            path=path,
-            name=f"{char_folder}_kirby_hat",
-            internal_file_table_offset=head,
-            internal_file_resource_offset=0x3FFFC,
-            compression_level=0,
-        )
+        f = self.files.get(owner)
+        if f is None:
+            f = self.files[owner] = FileManager.add_file(
+                path=path,
+                name=f"{owner}_kirby_hat",
+                internal_file_table_offset=head,
+                internal_file_resource_offset=0x3FFFC,
+                compression_level=0,
+            )
         # its main file's req list: the hat file last (the processor adds its external pointer last
         # to main.bin's chain: main_slot()); after the template's entries, before append_files'
         req = os.path.join(output_path, "main_reqlist.txt")
@@ -184,7 +201,8 @@ class KirbyHats:
         lines.insert(end, f"{f.id:04X} {f.name}\n")
         open(req, "w", encoding="utf-8").writelines(lines)
         self.hats.append(dict(char=char_folder, file=f, offsets=offsets, size=len(data), slot=None))
-        print(f"Kirby hat: {char_folder} -> {len(data)} bytes, offsets "
+        print(f"Kirby hat: {char_folder} -> {len(data)} bytes" + (f" ({owner}'s, shared)" if owner != char_folder else "")
+              + ", offsets "
               + ", ".join(f"{k} 0x{v:X}" if v >= 0 else f"{k} -" for k, v in offsets.items() if k != "extras")
               + (f", {len(offsets['extras'])} extra hat(s)" if offsets["extras"] else ""))
         return True

@@ -59,7 +59,7 @@ def flip_gltf(path):
             open(bpath, 'wb').write(data)
             if 'min' in acc and 'max' in acc:
                 acc['min'][1], acc['max'][1] = 1.0 - acc['max'][1], 1.0 - acc['min'][1]
-    json.dump(gl, open(path, 'w'), indent=1)
+    open(path, 'w').write(json.dumps(gl, indent=1))
     return len(done)
 
 
@@ -71,7 +71,7 @@ def convert_files(folder):
     n = flip_pngs(folder)
     k = flip_gltf(os.path.join(folder, 'model.gltf'))
     man['tex_flip_v'] = True
-    json.dump(man, open(mp, 'w'), indent=1)
+    open(mp, 'w').write(json.dumps(man, indent=1))
     print(f'  flipped {n} PNGs, {k} UV sets in model.gltf; manifest tex_flip_v')
 
 

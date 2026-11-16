@@ -67,7 +67,7 @@ def export(f, out_dir, rom=DEFAULT_ROM, animations=True):
     if os.path.exists(ref):
         shutil.rmtree(ref)
     models = build_models(rom, ref, animations)
-    json.dump(dict(hold=hold_joints(f), size=fighter_size(f), **models), open(os.path.join(ref, 'reference.json'), 'w'), indent=1)
+    open(os.path.join(ref, 'reference.json'), 'w').write(json.dumps(dict(hold=hold_joints(f), size=fighter_size(f), **models), indent=1))
     return ref
 
 

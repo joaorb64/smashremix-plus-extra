@@ -48,11 +48,12 @@ def u16(d, o):
     return struct.unpack_from('>H', d, o)[0]
 
 
-def simulate16(d, script, frames, keys=None, info=None):
+def simulate16(d, script, frames, keys=None, info=None, stop=False):
     """ftAnimParseDObjFigatree + gcPlayDObjAnimJoint for `frames` frames: [{track: value}] per
     frame, and the frame the script first loops back or ends (None: it runs longer). keys gets
     {track: set of frames} where the script sets each track's value; info gets looped=True when
-    the script loops (a Loop command)."""
+    the script loops (a Loop command). stop: return at that frame (its values included) instead
+    of running all `frames` (a looping script would otherwise be played for the full length)."""
     tracks, out = {}, []
     wait, frame, ptr, seen, loop_at = 'changed', 0.0, script, {script}, None
     ended = False
@@ -153,6 +154,8 @@ def simulate16(d, script, frames, keys=None, info=None):
                 if i != 3:
                     vals[i] = MF._anim_value(a)
         out.append(vals)
+        if stop and loop_at is not None:
+            break
     return out, loop_at
 
 
@@ -164,7 +167,7 @@ def play(d, ptrs, script, rest, anim_joint=False, max_frames=3600):
     if anim_joint:
         out, end = MF.simulate_anim(d, ptrs, script, max_frames + 1, keys)
     else:
-        out, end = simulate16(d, script, max_frames + 1, keys, info)
+        out, end = simulate16(d, script, max_frames + 1, keys, info, stop=True)
     n = end if end is not None else max_frames
     samples = {}
     for name in JA.EDITABLE:

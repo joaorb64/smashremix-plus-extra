@@ -109,11 +109,17 @@ def _samples(fc):
     """The curve's value on every whole frame from its first key to its last (keys come
     back from the glTF import at 499.99997...; between keys: evaluated)."""
     pts = fc.keyframe_points
-    if not len(pts):
+    n = len(pts)
+    if not n:
         return None, None
-    f0 = int(round(pts[0].co.x))
-    f1 = int(round(pts[-1].co.x))
-    at = {int(round(kp.co.x)): kp.co.y for kp in pts}
+    co = np.empty(2 * n, np.float32)
+    pts.foreach_get('co', co)                   # (one call: the curves have a key per frame)
+    fr = [int(round(x)) for x in co[0::2].tolist()]
+    ys = co[1::2].astype(float)
+    f0, f1 = fr[0], fr[-1]
+    if f1 - f0 + 1 == n and fr == list(range(f0, f1 + 1)):
+        return f0, ys                           # a key on every frame
+    at = dict(zip(fr, ys.tolist()))
     return f0, np.array([at[f] if f in at else fc.evaluate(f) for f in range(f0, f1 + 1)])
 
 
@@ -294,12 +300,22 @@ def rebase_actions(arm, old_rest, actions):
             npts = len(curves[0].keyframe_points)
             if any(len(fc.keyframe_points) != npts for fc in curves):
                 continue                  # (components keyed apart: left as they are)
-            for k in range(npts):
-                v = [fc.keyframe_points[k].co.y for fc in curves]
-                for i, fc in enumerate(curves):
-                    kp = fc.keyframe_points[k]
-                    kp.co.y = sum(M[i][j] * v[j] for j in range(n))
+            cos = []
             for fc in curves:
+                co = np.empty(2 * npts, np.float32)
+                fc.keyframe_points.foreach_get('co', co)
+                cos.append(co)
+            v = [co[1::2].astype(float) for co in cos]
+            # (summed in the same order as Python's sum(): the same values to the bit)
+            new = []
+            for i in range(n):
+                acc = 0.0
+                for j in range(n):
+                    acc = acc + M[i][j] * v[j]
+                new.append(acc)
+            for fc, co, y in zip(curves, cos, new):
+                co[1::2] = y
+                fc.keyframe_points.foreach_set('co', co)
                 for kp in fc.keyframe_points:
                     kp.handle_left_type = kp.handle_right_type = 'AUTO_CLAMPED'
                 fc.update()
