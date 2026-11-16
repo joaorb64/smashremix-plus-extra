@@ -150,7 +150,10 @@ class CharacterAppender:
         STAGE_<FOLDER> naming StageProcessor generates for them)."""
         stage_ids = set()
 
-        stages_asm_path = "src/Stages.asm"
+        # Read Remix's pristine source, not ./src: that's the previous
+        # build's patched copy (only refreshed later in this run), which
+        # still lists whatever extra stages that build included.
+        stages_asm_path = os.path.join(smashremix_path, "src/Stages.asm")
         if os.path.exists(stages_asm_path):
             with open(stages_asm_path, encoding="utf-8") as f:
                 content = f.read()
