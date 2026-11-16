@@ -14,6 +14,10 @@ Per entry:
                               keep working with every palette it's used with)
   * costume PNG (Blender)   -> a recolor updates that costume's palette; a
                               repaint updates its image (palette colors only)
+  * costume PNGs saved as paletted (mode P) PNGs, every costume -> exact: the PNG's
+                              indices are the texels, its palette (+ tRNS alpha) is that
+                              costume's palette. For palette tricks: colors that are the
+                              same in one costume and different in another.
 Non-CI formats (IA4/8/16, I4/8, RGBA16) are re-encoded from the PNG.
 Materials that aren't in the manifest (made in Blender) become CI4 from their
 costume images (16 colors).
@@ -153,6 +157,29 @@ def first_seen(rgba, n):
     return rank[inv.ravel()], pal, reduced
 
 
+class Indexed(np.ndarray):
+    """An RGBA image read from a paletted PNG, keeping its indices (.index) and palette (.pal)."""
+
+
+def load_indexed(path):
+    """RGBA array of the PNG; a paletted PNG's also carries .index (h x w) and .pal (n x 4)."""
+    pim = Image.open(path)
+    rgba = np.asarray(pim.convert('RGBA'))
+    if pim.mode != 'P':
+        return rgba
+    idx = np.asarray(pim, np.uint8)
+    raw = pim.getpalette('RGB') or []
+    n = len(raw) // 3
+    alpha = pim.info.get('transparency', b'')
+    if isinstance(alpha, int):
+        alpha = bytes(255 if k != alpha else 0 for k in range(n))
+    pal = np.array([[raw[3 * k], raw[3 * k + 1], raw[3 * k + 2], alpha[k] if k < len(alpha) else 255]
+                    for k in range(n)], np.uint8).reshape(-1, 4)
+    out = rgba.view(Indexed)
+    out.index, out.pal = idx, pal
+    return out
+
+
 def load_png(path):
     if not path or not os.path.exists(path):
         return None
@@ -237,6 +264,11 @@ class Material:
             self.warnings.append(f"format changed {e.get('format')} -> {fmt_name}: rebuilt from the costume images")
             self.new = True
         self.orig_transparent = False
+        if self.ci and costume_imgs and all(getattr(im, 'index', None) is not None and im.index.shape == (h, w)
+                                            for im in costume_imgs[:costumes]):
+            self._build_indexed(costume_imgs, costumes, n_pal)
+            self._finish()
+            return
         if self.new:
             if len(self.frames) > 1:
                 self._build_frames(costumes, n_pal)
@@ -472,6 +504,32 @@ class Material:
         # the same in every costume: loaded inline (no MObj); else from the MObj's lists
         self.image_source = 'list' if len(self.images) > 1 else 'inline'
         self.palette_source = ('list' if len(self.palettes) > 1 else 'inline') if self.ci else None
+        self.flags = (0x01 if self.image_source == 'list' else 0) | (0x04 if self.palette_source == 'list' else 0)
+
+    def _build_indexed(self, costume_imgs, costumes, n_pal):
+        """Every costume a paletted PNG: its indices and palette as they are (deduplicated)."""
+        bpp = BPP[self.siz]
+        if self.siz == 1:                    # CI8: the TLUT load reads the colors the PNGs use (x16)
+            used = max(int(im.index.max()) + 1 for im in costume_imgs[:costumes])
+            n_pal = self.n_pal = min(256, -(-used // 16) * 16)
+        img_at, pal_at = {}, {}
+        self.images, self.palettes, self.costume_map = [], [], []
+        for c in range(costumes):
+            im = costume_imgs[min(c, len(costume_imgs) - 1)]
+            if im.index.max() >= n_pal:
+                raise SystemExit(f'{self.name}: costume {c}: index {im.index.max()} past the {n_pal} colors')
+            pal = np.zeros((n_pal, 4), np.uint8)
+            pal[:min(n_pal, len(im.pal))] = im.pal[:n_pal]
+            data, pdata = self.pad(pack(im.index.ravel(), bpp)), encode_pal(pal)
+            ti = img_at.setdefault(data, len(img_at))
+            if ti == len(self.images):
+                self.images.append(data)
+            pi = pal_at.setdefault(pdata, len(pal_at))
+            if pi == len(self.palettes):
+                self.palettes.append(pdata)
+            self.costume_map.append([ti, pi])
+        self.image_source = 'list' if len(self.images) > 1 else 'inline'
+        self.palette_source = 'list' if len(self.palettes) > 1 else 'inline'
         self.flags = (0x01 if self.image_source == 'list' else 0) | (0x04 if self.palette_source == 'list' else 0)
 
     def _finish(self):

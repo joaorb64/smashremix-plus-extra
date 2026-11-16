@@ -150,7 +150,7 @@ class Materials:
         if info is None:
             return None
         if info.get('image') and os.path.exists(info['image']):
-            return np.asarray(Image.open(info['image']).convert('RGBA'))
+            return MAT.load_indexed(info['image'])
         if textured:                     # a flat color on an originally textured material: keep the texture
             return None
         c = np.clip(np.array(info.get('color') or [0.8, 0.8, 0.8]), 0, 1)
@@ -173,7 +173,13 @@ class Materials:
             raise SystemExit(f'material {name}: not in costumes.json')
         first = per.get('0') or (next(iter(per.values())) if per else None)
         textured = bool(entry) and not entry.get('untextured')    # untextured: Blender's colors count
-        imgs = [self.image(per.get(str(c), first), textured) for c in range(self.costumes)]
+        def costume_info(c):
+            if str(c) in per:
+                return per[str(c)]
+            # a costume Blender has no material for: the costume-0 image's sibling <mat>_c<c>.png
+            sib = re.sub(r'_c0\.png$', f'_c{c}.png', (first or {}).get('image') or '')
+            return dict(first, image=sib) if sib and os.path.exists(sib) else first
+        imgs = [self.image(costume_info(c), textured) for c in range(self.costumes)]
         if not entry and imgs[0] is None:
             raise SystemExit(f'material {name}: no image or color')
         m = MAT.Material(name, entry, self.base, self.root, imgs, self.props.get(name, {}), self.costumes,
@@ -327,7 +333,13 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
         for m in used:
             t = textures.get(m)
             if t.uses_mobj() and m not in mi and t.mobj is not None and t.mobj in by_mobj:
-                mi[m] = by_mobj[t.mobj]
+                o = textures.get(hint[by_mobj[t.mobj]])
+                # only when it still is the same MObj (two materials that shared one in the
+                # original may have their own palettes / images now)
+                if (t.palettes, t.images, t.palette_source, t.image_source, t.mobj_flags()) == \
+                        (o.palettes, o.images, o.palette_source, o.image_source, o.mobj_flags()) or \
+                        (t.palette_source != 'list' and t.image_source != 'list'):
+                    mi[m] = by_mobj[t.mobj]
         mi.update(slots or {})                    # given MObj slots (skeleton: the body's)
         mobj_mats = hint + [m for m in used if textures.get(m).uses_mobj() and m not in mi]
         for i, m in enumerate(mobj_mats):
@@ -468,6 +480,9 @@ def main(argv=None):
                     break
             if template_ms:
                 break
+        if template_ms is None:                # no image+palette list MObj: any image or palette list one
+            template_ms = next((ms for lst in f.details['hi']['mobjs'].values() for ms in lst
+                                if MF.u16(f.char, ms + 0x30) & 0x0005), None)
         mobj_of, script_of = {}, {}
         data_at, mobj_at = {}, {}                          # dedup: identical bytes / materials stored once
 
