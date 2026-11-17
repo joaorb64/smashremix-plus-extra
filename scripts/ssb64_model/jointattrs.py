@@ -83,9 +83,10 @@ def joint_attrs(f):
         d = f.main if ts[0] == 'main' else f.char
         tscales = [list(struct.unpack_from('>3f', d, ts[1] + 12 * i)) for i in range(JOINT_MAX)]
     tp = f.ptr_main(a + A_TEXPARTS)
-    texparts = None
-    if tp is not None and tp[0] == 'main':
-        texparts = [list(m[tp[1] + 3 * k:tp[1] + 3 * k + 3]) for k in range(2)]
+    texparts = [[0, 0, 0], [0, 0, 0]]        # (none: the import makes a container when one is set)
+    if tp is not None:
+        d = m if tp[0] == 'main' else f.char
+        texparts = [list(d[tp[1] + 3 * k:tp[1] + 3 * k + 3]) for k in range(2)]
     ap = f.ptr_main(a + A_ACCESS)
     access = s32(f.main if ap[0] == 'main' else f.char, ap[1]) if ap else None
     return dict(
@@ -121,9 +122,10 @@ class Plan:
     notes    [str]"""
     def __init__(self):
         self.writes, self.unlink, self.new, self.notes = [], [], {}, []
+        self.config_texture_forms = None    # config.yaml attributes.texture_forms: [..] new, [] removed
 
     def __bool__(self):
-        return bool(self.writes or self.unlink or self.new)
+        return bool(self.writes or self.unlink or self.new or self.config_texture_forms is not None)
 
 
 def plan(f, new, orig):
@@ -204,12 +206,42 @@ def plan(f, new, orig):
                 f'joint {g} {tuple(round(x, 4) for x in v)}' for g, v in enumerate(nts) if v != base[g]))
     if new.get('texture_parts') is not None and orig.get('texture_parts') is not None \
             and new['texture_parts'] != orig['texture_parts']:
-        p = f.ptr_main(a + A_TEXPARTS)
-        for k, (g, hi, lo) in enumerate(new['texture_parts']):
+        tps = new['texture_parts']
+        for k, (g, hi, lo) in enumerate(tps):
             if not (0 <= g < 256 and 0 <= hi < 256 and 0 <= lo < 256):
                 raise SystemExit(f'texture part {k}: values out of range')
-            P.writes.append((p[1] + 3 * k, bytes((g, hi, lo))))
-        P.notes.append(f"texture parts: {orig['texture_parts']} -> {new['texture_parts']}")
+        P.notes.append(f"texture parts: {orig['texture_parts']} -> {tps}")
+        used = [t for t in tps if t[0] >= 4]
+        to_main = True
+        if orig.get('texture_parts_source') == 'config':
+            # config.yaml texture_forms: game joints; a joint's n-th entry switches its material n
+            seen, ok = {}, True
+            for g, hi, lo in used:
+                ok &= hi == lo == seen.get(g, 0)
+                seen[g] = seen.get(g, 0) + 1
+            if ok and used:
+                P.config_texture_forms = [f'0x{g:02X}' for g, _, _ in used]
+                to_main = False
+            else:
+                P.config_texture_forms = []      # (can't say it: removed, main.bin's container instead)
+                P.notes.append('config.yaml texture_forms can\'t say these material indices (a joint\'s n-th '
+                               'entry = its material n): removed; the files hold them')
+        if to_main:
+            if len(used) > 2:
+                raise SystemExit(f'{len(used)} texture parts: the game has 2')
+            # in place only over the entries the container has (vanilla ones often hold one entry: the
+            # next bytes are other data); more: a new 2-entry container in character.bin
+            p = f.ptr_main(a + A_TEXPARTS)
+            have = 0
+            if p is not None:
+                d = f.main if p[0] == 'main' else f.char
+                while have < 2 and d[p[1] + 3 * have] >= 4:
+                    have += 1
+            full = b''.join(bytes(t) for t in (used + [[0, 0, 0]] * 2)[:2]) + b'\0\0'
+            if p is not None and len(used) <= have:
+                array(A_TEXPARTS, full[:3 * have], 'texture parts', old_len=3 * have)
+            else:
+                array(A_TEXPARTS, full, 'texture parts', in_place_ok=False)
     if new.get('access_joint') is not None and orig.get('access_joint') is not None \
             and new['access_joint'] != orig['access_joint']:
         valid(new['access_joint'], 'accessory part')

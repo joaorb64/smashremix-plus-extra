@@ -857,6 +857,11 @@ class Exporter:
             # the attributes that name joints (Blender: Bone > N64 Joint, Armature > N64 Fighter Joints)
             import jointattrs as JAT
             self.manifest['joint_attrs'] = JAT.joint_attrs(f)
+            if any(tp.get('source') == 'config.yaml texture_forms' for tp in f.textureparts or []):
+                # (the build writes config.yaml's texture_forms over main.bin's: they're what plays)
+                tps = [[tp['joint'] + MF.JOINT_COMMON_START, tp['mobj_hi'], tp['mobj_lo']] for tp in f.textureparts]
+                self.manifest['joint_attrs']['texture_parts'] = (tps + [[0, 0, 0]] * 2)[:max(2, len(tps))]
+                self.manifest['joint_attrs']['texture_parts_source'] = 'config'
         self.manifest['lights'] = MF.model_lights(f)       # light / shadow (ambient) colors
         self.manifest['expressions'] = f.textureparts      # (texture-index switches: joint + material index)
         self.expr_mobjs = self.expression_mobjs()

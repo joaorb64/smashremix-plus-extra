@@ -234,10 +234,11 @@ def load(main_path, char_path, main_int_head=0x2CC, main_ext_head=0x0, char_int_
                 f.skeletons[sid] = ents
     # ---- texture parts (expressions)
     tp = f.ptr_main(f.attr + A_TEXTUREPARTS)
-    if tp is not None and tp[0] == 'main':
+    if tp is not None:
+        tpd = main if tp[0] == 'main' else char          # (character.bin: a container the import grew)
         for k in range(2):
             o = tp[1] + 3 * k
-            game_joint, d0, d1 = main[o], main[o + 1], main[o + 2]
+            game_joint, d0, d1 = tpd[o], tpd[o + 1], tpd[o + 2]
             joint = game_joint - JOINT_COMMON_START                 # our joint index (DObjDesc entry)
             hi_lst = f.details['hi']['mobjs'].get(joint, [])
             if game_joint < JOINT_COMMON_START or d0 >= len(hi_lst):  # unused slot

@@ -513,6 +513,15 @@ if man.get('object'):                         # items / projectiles: see n64_pan
     scene['n64_default_env'] = '00000000'  # ambient = shadow color (hex RGB)
 scene['n64_export_dir'] = '//'
 scene['n64_tools_dir'] = os.path.dirname(os.path.abspath(__file__))     # (n64_panel.py: anim_load.py...)
+# the 3D Views' sidebar (N) shown, on the N64 tab (the panel script picks the tab on the first open:
+# Blender only lets it once the sidebar is drawn)
+for scr in bpy.data.screens:
+    for area in scr.areas:
+        if area.type == 'VIEW_3D':
+            for sp in area.spaces:
+                if sp.type == 'VIEW_3D':
+                    sp.show_region_ui = True
+scene['n64_sidebar_tab'] = 'N64'
 scene['n64_collapse_outliner'] = True        # the panel script collapses the outliner on the first open          # where manifest.json + textures/ are (relative to the .blend)
 
 # ---- the game's camera (gmcamera.c): 38 degrees vertical field of view, 320 x 240, tilted down

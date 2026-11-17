@@ -4161,6 +4161,8 @@ class N64_PT_bone_joint(bpy.types.Panel):
             hb.operator('n64.hidden_part_remove', icon='X')
         elif g >= 1:
             hb.operator('n64.hidden_part_add', icon='HIDE_OFF')
+        if g >= 4:
+            draw_joint_materials(lay, context, arm, g - 4)
         if g >= 4 and bpy.data.collections.get('Model parts') is not None:
             draw_part_variants(lay, context.scene, g - 4)
 
@@ -4694,6 +4696,35 @@ class N64_OT_alt_texture_add(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class N64_OT_alt_texture_slot(bpy.types.Operator):
+    bl_idname = 'n64.alt_texture_slot'
+    bl_label = 'Make Alternate Texture'
+    bl_description = ('This material becomes an alternate texture (a texture part: a free one of the game\'s 2): '
+                      'moveset event 0x2B then picks its image; add images in the 3D View > N64 sidebar')
+    bl_options = {'UNDO'}
+    joint: bpy.props.IntProperty()
+    mobj: bpy.props.IntProperty()
+
+    def execute(self, context):
+        arm = next((o for o in context.scene.objects if _has_joint_attrs(o)), None)
+        if arm is None:
+            return {'CANCELLED'}
+        ad = arm.data
+        k = next((k for k in range(2) if not ad.get(f'n64_texpart_{k}_joint')), None)
+        if k is None:
+            self.report({'ERROR'}, 'The game has 2 alternate textures and both are used (Armature > N64 Fighter '
+                                   'Joints: clear one\'s joint first)')
+            return {'CANCELLED'}
+        man = _manifest(context.scene)
+        lo = ((man.get('mobj_order') or {}).get('lo') or {}).get(str(self.joint)) or []
+        ad[f'n64_texpart_{k}_joint'] = f'joint_{self.joint:02d}'
+        ad[f'n64_texpart_{k}_hi'] = self.mobj
+        ad[f'n64_texpart_{k}_lo'] = self.mobj if self.mobj < len(lo) else 0
+        self.report({'INFO'}, f'Alternate texture {k + 1}: joint_{self.joint:02d} material {self.mobj} '
+                              f'(moveset event 0x2B part {k}); add images in the N64 sidebar')
+        return {'FINISHED'}
+
+
 class N64_OT_alt_texture_remove(bpy.types.Operator):
     bl_idname = 'n64.alt_texture_remove'
     bl_label = 'Remove Alternate Texture'
@@ -4726,6 +4757,30 @@ class N64_OT_alt_texture_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def draw_joint_materials(lay, context, arm, j):
+    """The joint's materials (its MObj list order: what texture parts index) and which are alternate
+    textures."""
+    man = _manifest(context.scene)
+    names = ((man.get('mobj_order') or {}).get('hi') or {}).get(str(j)) or []
+    if not names:
+        return
+    ad = arm.data
+    slots = {(ad.get(f'n64_texpart_{k}_joint'), int(ad.get(f'n64_texpart_{k}_hi', 0))): k for k in range(2)
+             if ad.get(f'n64_texpart_{k}_joint')}
+    box = lay.box()
+    box.label(text='Materials (alternate textures)', icon='MATERIAL')
+    for i, n in enumerate(names):
+        r = box.row(align=True)
+        cnt = len(list_images(man, n)) if n else 0
+        r.label(text=f'{i}: {n or "(unused)"}' + (f'  {cnt} images' if cnt > 1 else ''))
+        k = slots.get((f'joint_{j:02d}', i))
+        if k is not None:
+            r.label(text=f'Alternate texture {k + 1}', icon='IMAGE_DATA')
+        elif n:
+            op = r.operator('n64.alt_texture_slot', text='Make Alternate Texture', icon='ADD')
+            op.joint, op.mobj = j, i
+
+
 def draw_part_variants(lay, scene, j):
     """The joint's model part variants: show (body / nothing / each), select, add, remove."""
     have = part_objects(j)
@@ -4749,6 +4804,215 @@ def draw_part_variants(lay, scene, j):
     if have:
         op = r.operator('n64.part_add', text=f'Add (copy {max(have)})', icon='DUPLICATE')
         op.joint, op.source = j, max(have)
+
+
+# -- reference items / opponent (blend_reference.py): show, pick the opponent's animation, hold joints
+
+HOLD_LABELS = {'light': 'Light item joint', 'heavy': 'Heavy item joint'}
+
+
+def _ref_items():
+    """[(label, collection)] under Reference > Items."""
+    c = bpy.data.collections.get('Items')
+    return [(ch.name, ch) for ch in c.children] if c is not None else []
+
+
+def _lc(name):
+    return _find_layer_collection(bpy.context.view_layer.layer_collection, name)
+
+
+def _ref_shown():
+    """(shown item label or None, opponent shown)."""
+    ref, items, opp = _lc('Reference'), _lc('Items'), _lc('Opponent')
+    if ref is None or ref.hide_viewport:
+        return None, False
+    item = None
+    if items is not None and not items.hide_viewport:
+        item = next((lab for lab, _ in _ref_items() if _lc(lab) is not None and not _lc(lab).hide_viewport), None)
+    return item, opp is not None and not opp.hide_viewport
+
+
+def apply_reference(item, opponent):
+    """Show one reference item (None: none) and / or the opponent; the Reference collection only
+    while something is shown."""
+    for lab, _ in _ref_items():
+        lc = _lc(lab)
+        if lc is not None:
+            lc.hide_viewport = lab != item
+    for name, on in (('Items', item is not None), ('Opponent', opponent)):
+        lc = _lc(name)
+        if lc is not None:
+            lc.hide_viewport = not on
+    ref = _lc('Reference')
+    if ref is not None:
+        ref.hide_viewport = not (item is not None or opponent)
+
+
+def _hold_empty(key):
+    lab = HOLD_LABELS[key]
+    return next((o for o in bpy.data.objects if o.type == 'EMPTY' and o.name.startswith(lab)), None)
+
+
+def _hold_bone(e):
+    c = next((c for c in e.constraints if c.type == 'CHILD_OF'), None) if e is not None else None
+    return c.subtarget if c is not None else None
+
+
+def _opponent_arm():
+    return bpy.data.objects.get('Opponent')
+
+
+def _opp_actions(self=None, context=None):
+    acts = sorted(a.name for a in bpy.data.actions if a.name.startswith('Opponent: '))
+    _opp_actions.items = [(a, a.split(': ', 1)[1], f'The opponent plays {a.split(": ", 1)[1]}') for a in acts] \
+        or [('NONE', '(none)', '')]
+    return _opp_actions.items
+
+
+def _opp_action_get(self):
+    arm = _opponent_arm()
+    act = arm.animation_data.action if arm is not None and arm.animation_data else None
+    names = [x[0] for x in _opp_actions()]
+    return names.index(act.name) if act is not None and act.name in names else 0
+
+
+def _opp_action_set(self, i):
+    arm = _opponent_arm()
+    items = _opp_actions()
+    act = bpy.data.actions.get(items[i][0]) if 0 <= i < len(items) else None
+    if arm is None or act is None:
+        return
+    ad = arm.animation_data or arm.animation_data_create()
+    ad.action = act
+    if hasattr(ad, 'action_slot') and ad.action_slot is None and getattr(act, 'slots', None):
+        ad.action_slot = act.slots[0]
+
+
+class N64_OT_ref_item_show(bpy.types.Operator):
+    bl_idname = 'n64.ref_item_show'
+    bl_label = 'Show Reference Item'
+    bl_description = 'Show this item held by the fighter (on its hold joint, following the animation); again: hide it'
+    bl_options = {'UNDO'}
+    item: bpy.props.StringProperty()
+
+    def execute(self, context):
+        cur, opp = _ref_shown()
+        apply_reference(None if (not self.item or self.item == cur) else self.item, opp)
+        return {'FINISHED'}
+
+
+class N64_OT_ref_opponent_toggle(bpy.types.Operator):
+    bl_idname = 'n64.ref_opponent_toggle'
+    bl_label = 'Show Grabbed Opponent'
+    bl_description = 'Show / hide the grabbed opponent (on the heavy item joint, playing the picked thrown animation)'
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        cur, opp = _ref_shown()
+        apply_reference(cur, not opp)
+        return {'FINISHED'}
+
+
+class N64_OT_ref_select_hold(bpy.types.Operator):
+    bl_idname = 'n64.ref_select_hold'
+    bl_label = 'Select Hold Joint'
+    bl_description = 'Select the bone this item joint is (Pose Mode)'
+    bl_options = {'UNDO'}
+    bone: bpy.props.StringProperty()
+
+    def execute(self, context):
+        arm = next((o for o in context.scene.objects if _has_joint_attrs(o)), None)
+        if arm is None or self.bone not in arm.data.bones:
+            return {'CANCELLED'}
+        if context.object is not None and context.object.mode != 'OBJECT' and context.object != arm:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        for o in context.view_layer.objects:
+            o.select_set(False)
+        arm.hide_set(False)
+        arm.select_set(True)
+        context.view_layer.objects.active = arm
+        bpy.ops.object.mode_set(mode='POSE')
+        for pb in arm.pose.bones:
+            on = pb.name == self.bone
+            try:
+                pb.bone.select = on
+            except AttributeError:                   # Blender 5: selection is the pose bone's
+                pb.select = on
+        b = arm.data.bones[self.bone]
+        b.hide = False
+        arm.data.bones.active = b
+        return {'FINISHED'}
+
+
+class N64_OT_ref_hold_sync(bpy.types.Operator):
+    bl_idname = 'n64.ref_hold_sync'
+    bl_label = 'Move Reference to Item Joint'
+    bl_description = ('Put the reference item / opponent on the item joint Armature > N64 Fighter Joints has now '
+                      '(its frame: the game joint\'s rest, without scale)')
+    bl_options = {'UNDO'}
+    key: bpy.props.StringProperty()
+
+    def execute(self, context):
+        import sys
+        from mathutils import Matrix
+        arm = next((o for o in context.scene.objects if _has_joint_attrs(o)), None)
+        e = _hold_empty(self.key)
+        bone = arm.data.get(f'n64_item_{self.key}') if arm is not None else None
+        c = next((c for c in e.constraints if c.type == 'CHILD_OF'), None) if e is not None else None
+        if c is None or not bone or bone not in arm.data.bones:
+            return {'CANCELLED'}
+        d = context.scene.get('n64_tools_dir') or os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import blend_gamespace as BGS
+        gs = BGS._GameSpace.make(os.path.normpath(bpy.path.abspath(context.scene.get('n64_export_dir', '//'))))
+        if gs is None or bone not in gs.corr:
+            self.report({'ERROR'}, 'Needs the export\'s model.gltf (the joints\' own axes)')
+            return {'CANCELLED'}
+        b = arm.data.bones[bone]
+        A = arm.matrix_world.copy()
+        j_rot = (b.matrix_local.to_3x3().normalized() @ gs.corr[bone].to_3x3().inverted()).normalized()
+        G = Matrix.LocRotScale(b.head_local, j_rot.to_quaternion(), None)      # the joint's rest frame
+        s = e.matrix_basis.to_scale()                                           # (1 / size, as built)
+        R = (A @ b.matrix_local).normalized()
+        R = Matrix.LocRotScale(R.to_translation(), R.to_quaternion(), None)
+        c.subtarget = bone
+        c.inverse_matrix = R.inverted()
+        e.matrix_basis = A @ G @ Matrix.Diagonal((*s, 1.0))
+        e.name = f'{HOLD_LABELS[self.key]} ({bone})'
+        self.report({'INFO'}, f'{HOLD_LABELS[self.key]}: now on {bone}')
+        return {'FINISHED'}
+
+
+def draw_reference(lay, context):
+    if bpy.data.collections.get('Reference') is None:
+        return
+    item, opp = _ref_shown()
+    arm = next((o for o in context.scene.objects if _has_joint_attrs(o)), None)
+    lay.label(text='Reference (not imported)', icon='GHOST_ENABLED')
+    holds = {}
+    for key in ('light', 'heavy'):
+        e = _hold_empty(key)
+        holds[key] = (e, _hold_bone(e), arm.data.get(f'n64_item_{key}') if arm is not None else None)
+    col = lay.column(align=True)
+    for lab, c in _ref_items():
+        key = 'heavy' if lab in ('Crate', 'Barrel') else 'light'
+        row = col.row(align=True)
+        row.operator('n64.ref_item_show', text=lab, depress=lab == item,
+                     icon='HIDE_OFF' if lab == item else 'HIDE_ON').item = lab
+        bone = holds[key][1]
+        if bone:
+            row.operator('n64.ref_select_hold', text=bone, icon='BONE_DATA').bone = bone
+    row = lay.row(align=True)
+    row.operator('n64.ref_opponent_toggle', text='Grabbed Opponent', depress=opp,
+                 icon='HIDE_OFF' if opp else 'HIDE_ON')
+    if _opponent_arm() is not None:
+        row.prop(context.scene, 'n64ui_opponent_action', text='')
+    for key, (e, bone, want) in holds.items():
+        if e is not None and want and bone and want != bone:
+            r = lay.row()
+            r.label(text=f'{key.capitalize()} item joint is {want} now', icon='ERROR')
+            r.operator('n64.ref_hold_sync', text=f'Move to {want}').key = key
 
 
 class N64_PT_fighter_view(bpy.types.Panel):
@@ -4792,9 +5056,12 @@ class N64_PT_fighter_view(bpy.types.Panel):
                 if any(len(frame_nodes(bpy.data.materials[b])) > len((man['materials'].get(b) or {}).get('images') or [])
                        for b in mats if b in bpy.data.materials):
                     r.operator('n64.alt_texture_remove', text='Remove Last Added', icon='X').part = tp['index']
-                if n_img <= 1:
-                    # the part points at a material without an image list: nothing to switch (in the
-                    # game either); point out the joint's materials that have one
+                if n_img == 1:
+                    lay.label(text='One image: Add makes more (the import gives the material an image list)',
+                              icon='INFO')
+                elif n_img < 1:
+                    # the part points at a material without an image: nothing to switch (in the game
+                    # either); point out the joint's materials that have a list
                     others = [x for x in joint_image_lists(man, tp['joint'])
                               if x[0] not in {t['mobj_hi'] for t in tps if t['joint'] == tp['joint']}]
                     box = lay.box()
@@ -4814,6 +5081,202 @@ class N64_PT_fighter_view(bpy.types.Panel):
                 for v, text in [(-2, 'Body'), (-1, 'None')] + [(v, str(v)) for v in sorted(part_objects(j))]:
                     op = row.operator('n64.part_show', text=text, depress=cur_v == v)
                     op.joint, op.variant = j, v
+        draw_reference(lay, context)
+
+
+# ---- write the game files from Blender: ssb64_model.py import into a folder to copy -------------
+# Runs with Blender's own Python (sandboxed Blender, e.g. the Flatpak, can't run the system's) and
+# the Pillow / PyYAML the tools need, installed once into Blender's user scripts folder.
+
+_BUILD = {'proc': None, 'log': None, 'out': None, 'status': '', 'files': []}
+BUILD_MARKER = '.n64_game_files'
+
+
+def _deps_dir():
+    return bpy.utils.user_resource('SCRIPTS', path='ssb64_model_libs', create=True)
+
+
+def _deps_ok():
+    d = _deps_dir()
+    return os.path.isdir(os.path.join(d, 'PIL')) and os.path.isdir(os.path.join(d, 'yaml'))
+
+
+def _tools_dir(scene):
+    return scene.get('n64_tools_dir') or os.path.dirname(os.path.abspath(__file__))
+
+
+def _build_out(scene):
+    return os.path.normpath(bpy.path.abspath(scene.get('n64_build_dir', '//to_project')))
+
+
+def _build_dir_get(self):
+    return self.get('n64_build_dir', '//to_project')
+
+
+def _build_dir_set(self, v):
+    self['n64_build_dir'] = v
+
+
+class N64_OT_install_tools(bpy.types.Operator):
+    bl_idname = 'n64.install_tools'
+    bl_label = 'Install Tools'
+    bl_description = ('Install Pillow and PyYAML (what the import needs) for Blender\'s Python, with pip, into '
+                      'Blender\'s user scripts folder (ssb64_model_libs); needs the internet once')
+
+    def execute(self, context):
+        import subprocess
+        import sys
+        cmd = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--upgrade',
+               '--target', _deps_dir(), 'pillow', 'pyyaml']
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not _deps_ok():
+            self.report({'ERROR'}, 'pip failed: ' + (r.stderr or r.stdout).strip().splitlines()[-1:][0]
+                        if (r.stderr or r.stdout).strip() else 'pip failed')
+            return {'CANCELLED'}
+        self.report({'INFO'}, f'Installed into {_deps_dir()}')
+        return {'FINISHED'}
+
+
+def _build_poll():
+    b = _BUILD
+    p = b['proc']
+    if p is None:
+        return None
+    if p.poll() is None:
+        b['status'] = 'running'
+        _redraw_n64()
+        return 0.5
+    b['log_fh'].close()
+    out = b['out']
+    if p.returncode == 0:
+        b['files'] = sorted(os.path.relpath(os.path.join(r, f), out) for r, _, fs in os.walk(out) for f in fs
+                            if f not in (BUILD_MARKER, 'import_log.txt'))
+        b['status'] = 'done'
+    else:
+        b['status'] = 'failed'
+        try:
+            tail = [ln for ln in open(b['log'], encoding='utf-8', errors='replace').read().splitlines() if ln.strip()]
+            b['error'] = tail[-1] if tail else f'exit code {p.returncode}'
+        except OSError:
+            b['error'] = f'exit code {p.returncode}'
+    b['proc'] = None
+    _redraw_n64()
+    return None
+
+
+def _redraw_n64():
+    for win in bpy.context.window_manager.windows:
+        for area in win.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+class N64_OT_write_game_files(bpy.types.Operator):
+    bl_idname = 'n64.write_game_files'
+    bl_label = 'Write Game Files'
+    bl_description = ('Save, then run the import (ssb64_model.py import) into the folder below: every file to copy '
+                      'into the character / stage folder (main.bin, character.bin, main_reqlist.txt, config.yaml '
+                      'when it changed, the edited animations, shield pose, Kirby hat...)')
+    everything: bpy.props.BoolProperty(
+        name='Everything', options={'SKIP_SAVE'},
+        description='Also every animation with its own file (re-encoded from Blender, edited or not), the shield '
+                    'pose file and config.yaml even when unchanged (import --all)')
+
+    @classmethod
+    def description(cls, context, props):
+        if props.everything:
+            return ('Save, then write a full set of files into the folder below: main.bin, character.bin, '
+                    'main_reqlist.txt, config.yaml, every animation with its own file (animations/*.bin, '
+                    're-encoded from Blender), shield_pose.bin, Kirby hat... (import --all)')
+        return cls.bl_description
+
+    @classmethod
+    def poll(cls, context):
+        return _BUILD['proc'] is None and bool(bpy.data.filepath)
+
+    def execute(self, context):
+        import shutil
+        import subprocess
+        import sys
+        sc = context.scene
+        if not _deps_ok():
+            self.report({'ERROR'}, 'Install the tools first (Pillow, PyYAML for Blender\'s Python)')
+            return {'CANCELLED'}
+        out = _build_out(sc)
+        if os.path.isdir(out) and os.listdir(out):
+            if not os.path.exists(os.path.join(out, BUILD_MARKER)):
+                self.report({'ERROR'}, f'{out} has other files: pick an empty folder (or one this button made)')
+                return {'CANCELLED'}
+            shutil.rmtree(out)                  # (this button's: the last run's files go)
+        os.makedirs(out, exist_ok=True)
+        open(os.path.join(out, BUILD_MARKER), 'w').write('written by Blender > N64 > Write Game Files\n')
+        for img in bpy.data.images:             # (painted, not saved yet: the import reads the files)
+            if img.is_dirty and img.filepath:
+                img.save()
+        bpy.ops.wm.save_mainfile()
+        export_dir = os.path.normpath(bpy.path.abspath(sc.get('n64_export_dir', '//')))
+        env = dict(os.environ)
+        env['PYTHONPATH'] = os.pathsep.join([_deps_dir()] + ([env['PYTHONPATH']] if env.get('PYTHONPATH') else []))
+        env['BLENDER'] = bpy.app.binary_path
+        cmd = [sys.executable, os.path.join(_tools_dir(sc), 'ssb64_model.py'), 'import', export_dir, '--out', out] \
+            + (['--all'] if self.everything else [])
+        log = os.path.join(out, 'import_log.txt')
+        fh = open(log, 'w', encoding='utf-8')
+        fh.write(' '.join(cmd) + '\n\n')
+        fh.flush()
+        _BUILD.update(proc=subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env), log=log,
+                      log_fh=fh, out=out, status='running', files=[], error='')
+        bpy.app.timers.register(_build_poll, first_interval=0.5)
+        return {'FINISHED'}
+
+
+class N64_OT_open_path(bpy.types.Operator):
+    bl_idname = 'n64.open_path'
+    bl_label = 'Open'
+    bl_description = 'Open it with the system\'s file manager / editor'
+    path: bpy.props.StringProperty()
+
+    def execute(self, context):
+        bpy.ops.wm.path_open(filepath=self.path)
+        return {'FINISHED'}
+
+
+class N64_PT_game_files(bpy.types.Panel):
+    bl_label = 'N64 Game Files'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'N64'
+
+    @classmethod
+    def poll(cls, context):
+        return 'n64_export_dir' in context.scene.keys()
+
+    def draw(self, context):
+        lay = self.layout
+        sc = context.scene
+        if not _deps_ok():
+            lay.label(text='Blender\'s Python needs Pillow + PyYAML', icon='ERROR')
+            lay.operator('n64.install_tools', icon='IMPORT')
+        lay.prop(sc, 'n64ui_build_dir', text='Folder')
+        col = lay.column(align=True)
+        col.operator('n64.write_game_files', icon='EXPORT').everything = False
+        col.operator('n64.write_game_files', text='Write All (Every Animation)', icon='PACKAGE').everything = True
+        b = _BUILD
+        if b['status'] == 'running':
+            lay.label(text='Writing... (Blender reads the saved .blend)', icon='SORTTIME')
+        elif b['status'] == 'done':
+            box = lay.box()
+            box.label(text=f'{len(b["files"])} files to copy into the character / stage folder:', icon='CHECKMARK')
+            for f in b['files'][:20]:
+                box.label(text=f)
+            if len(b['files']) > 20:
+                box.label(text=f'... {len(b["files"]) - 20} more')
+        elif b['status'] == 'failed':
+            lay.label(text='Failed: ' + b.get('error', ''), icon='ERROR')
+        if b['status'] in ('done', 'failed') and b.get('out'):
+            r = lay.row(align=True)
+            r.operator('n64.open_path', text='Open Folder', icon='FILE_FOLDER').path = b['out']
+            r.operator('n64.open_path', text='Log', icon='TEXT').path = b['log']
 
 
 CLASSES = (N64_OT_vs_view, N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
@@ -4823,7 +5286,10 @@ CLASSES = (N64_OT_vs_view, N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_
            N64_PT_motion_flags, N64_OT_anim_load_bin, N64_OT_anim_save_bin,
            N64_OT_hidden_part_add, N64_OT_hidden_part_remove, N64_PT_bone_joint, N64_PT_fighter_joints,
            N64_OT_part_show, N64_OT_part_select, N64_OT_part_add, N64_OT_part_remove, N64_OT_costume_show,
-           N64_OT_expression_show, N64_OT_alt_texture_add, N64_OT_alt_texture_remove, N64_PT_fighter_view)
+           N64_OT_expression_show, N64_OT_alt_texture_add, N64_OT_alt_texture_remove, N64_OT_alt_texture_slot,
+           N64_OT_ref_item_show,
+           N64_OT_ref_opponent_toggle, N64_OT_ref_select_hold, N64_OT_ref_hold_sync, N64_PT_fighter_view,
+           N64_OT_install_tools, N64_OT_write_game_files, N64_OT_open_path, N64_PT_game_files)
 
 
 def _collapse_visible_outliners():
@@ -4870,9 +5336,49 @@ def _collapse_outliner():
     return 0.75 if _collapse_outliner.tries < 3 else None
 
 
+def _sidebar_tabs():
+    """The shown 3D Views' sidebars on the scene's n64_sidebar_tab (the N64 tab), once per screen
+    (scene n64_sidebar_screens: a tab picked later stays). Needs the sidebar drawn first: retried."""
+    scene = bpy.context.scene
+    tab = scene.get('n64_sidebar_tab') if scene is not None else None
+    if not tab:
+        return True
+    done = set(scene.get('n64_sidebar_screens') or [])
+    pending = False
+    for win in bpy.context.window_manager.windows:
+        scr = win.screen
+        if scr is None or scr.name in done:
+            continue
+        ok = False
+        for area in scr.areas:
+            if area.type != 'VIEW_3D':
+                continue
+            for r in area.regions:
+                if r.type != 'UI' or r.width <= 1:
+                    continue
+                try:
+                    if r.active_panel_category != tab:
+                        r.active_panel_category = tab
+                    ok = True
+                    area.tag_redraw()
+                except (AttributeError, TypeError, ValueError):
+                    pending = True             # (not drawn yet, or the tab isn't there yet)
+        if ok:
+            done.add(scr.name)
+    scene['n64_sidebar_screens'] = sorted(done)
+    return not pending
+
+
+def _sidebar_tab_timer():
+    _sidebar_tab_timer.tries = getattr(_sidebar_tab_timer, 'tries', 0) + 1
+    return None if _sidebar_tabs() or _sidebar_tab_timer.tries >= 10 else 0.5
+
+
 def _workspace_changed(*_):
-    """A workspace shown for the first time: its outliner collapsed."""
+    """A workspace shown for the first time: its outliner collapsed, its sidebar on the N64 tab."""
     bpy.app.timers.register(_collapse_visible_outliners_once, first_interval=0.1)
+    _sidebar_tab_timer.tries = 0
+    bpy.app.timers.register(_sidebar_tab_timer, first_interval=0.2)
 
 
 def _collapse_visible_outliners_once():
@@ -4929,6 +5435,12 @@ def register():
         setattr(bpy.types.Scene, name, prop)
     for name, prop in JOINT_BONE_PROPS.items():
         setattr(bpy.types.Bone, name, prop)
+    bpy.types.Scene.n64ui_build_dir = bpy.props.StringProperty(
+        name='Game Files Folder', subtype='DIR_PATH', get=_build_dir_get, set=_build_dir_set,
+        description='Where Write Game Files puts the files to copy (relative to the .blend: //to_project)')
+    bpy.types.Scene.n64ui_opponent_action = bpy.props.EnumProperty(
+        name='Opponent Animation', items=_opp_actions, get=_opp_action_get, set=_opp_action_set,
+        description='The grabbed opponent\'s animation (its grabbed / thrown animations)')
     for name, prop in ARMATURE_PROPS.items():
         setattr(bpy.types.Armature, name, prop)
     bpy.types.Scene.n64ui_vs_stage = bpy.props.EnumProperty(
@@ -4948,6 +5460,8 @@ def register():
     if not bpy.app.background:
         _collapse_outliner.tries = 0
         bpy.app.timers.register(_collapse_outliner, first_interval=0.5)
+        _sidebar_tab_timer.tries = 0
+        bpy.app.timers.register(_sidebar_tab_timer, first_interval=0.6)
         bpy.msgbus.subscribe_rna(key=(bpy.types.Window, 'workspace'), owner=_MSGBUS_OWNER, args=(),
                                  notify=_workspace_changed)
     # picking / opening an image on a texture node refreshes the N64 view
@@ -4969,6 +5483,10 @@ def unregister():
     for name in SCENE_PROPS:
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
+    if hasattr(bpy.types.Scene, 'n64ui_build_dir'):
+        delattr(bpy.types.Scene, 'n64ui_build_dir')
+    if hasattr(bpy.types.Scene, 'n64ui_opponent_action'):
+        delattr(bpy.types.Scene, 'n64ui_opponent_action')
     for t, props in ((bpy.types.Bone, JOINT_BONE_PROPS), (bpy.types.Armature, ARMATURE_PROPS)):
         for name in props:
             if hasattr(t, name):

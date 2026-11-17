@@ -268,6 +268,11 @@ def joint_anims():
     return out
 
 
+# ssb64_model.py import --all: every animation with its own file (animations/*.bin) is written, edited
+# or not (the base character's borrowed ones still only when edited: each would become a new file)
+ALL_ANIMS = os.environ.get('N64_IMPORT_ALL') == '1'
+
+
 def fighter_anims():
     """Fighter animations edited since the export (keys, flags or loop changed: build_blend.py
     stored each one's state in n64_export) -> [dict(name, export_name, flags, loop, frames, keys
@@ -283,8 +288,9 @@ def fighter_anims():
         ex = ex.to_dict() if hasattr(ex, 'to_dict') else dict(ex)
         flags = str(act['n64_flags']).upper()
         loop = bool(act.get('n64_loop', False))
+        own_file = str(act.get('n64_source') or '').startswith('animations/')
         if (KR.action_signature(act) == ex.get('keys') and flags == str(ex.get('flags')).upper()
-                and loop == bool(ex.get('loop'))):
+                and loop == bool(ex.get('loop'))) and not (ALL_ANIMS and own_file):
             continue
         todo.append((act, ex, flags, loop))
     gs = BGS._GameSpace.make(export_dir) if todo else None
@@ -296,7 +302,7 @@ def fighter_anims():
         frames, vals, keys = sample_action(gs, act)
         out.append(dict(name=act.name, export_name=ex.get('name'), flags=flags, loop=loop,
                         flags_before=ex.get('flags'), frames=frames, keys=keys, values=vals))
-        print(f'fighter animation changed: {act.name} ({frames} frames, flags {flags})')
+        print(f'fighter animation {"written" if ALL_ANIMS else "changed"}: {act.name} ({frames} frames, flags {flags})')
     restore()
     return out
 

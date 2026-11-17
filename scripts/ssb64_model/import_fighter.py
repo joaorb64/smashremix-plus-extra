@@ -444,11 +444,23 @@ def main(argv=None):
     ap.add_argument('--keep-render-modes', action='store_true',
                     help="keep cut-out materials' own render modes (default: replaced by alpha compare, "
                          'so the cloaking device fades them like the rest of the fighter)')
+    ap.add_argument('--all', action='store_true', help='a full set: the shield pose file and config.yaml (with '
+                                                       '--out) written even when unchanged')
     ap.add_argument('--preview', metavar='DIR', help='render what was built (body, expressions, parts, skeleton '
                                                     'sheets) into DIR')
     a = ap.parse_args(argv)
     import export_model as EX
     cfg = EX.read_config(a.char_dir)
+    # config.yaml edits: in place; with --out, into a copy there (kept only when something changed:
+    # the folder then holds every file to copy into the character's)
+    a.cfg_out = os.path.join(a.char_dir, 'config.yaml')
+    cfg_orig = None
+    if a.out and os.path.exists(a.cfg_out):
+        import shutil
+        os.makedirs(a.out, exist_ok=True)
+        cfg_orig = open(a.cfg_out, 'rb').read()
+        shutil.copyfile(a.cfg_out, os.path.join(a.out, 'config.yaml'))
+        a.cfg_out = os.path.join(a.out, 'config.yaml')
     off = cfg.get('offsets', {})
     mi_head, me_head = (int(x, 16) for x in off.get('main', ['02CC', '0000']))
     ci_head = int(off.get('character', ['0004'])[0], 16)
@@ -778,13 +790,30 @@ def main(argv=None):
         raise SystemExit(f'character.bin is {len(newc)} bytes: over the 0x3FFFC limit')
     for off_, data_ in ja_plan.writes:
         main[off_:off_ + len(data_)] = data_
+    if ja_plan.config_texture_forms is not None:      # (config.yaml texture_forms: the build writes them)
+        cfg_path = a.cfg_out
+        raw = open(cfg_path, encoding='utf-8', newline='').read()
+        text = raw.replace('\r\n', '\n')
+        blk = GD.yaml_block(text, 'attributes.texture_forms')
+        old_line = text.split('\n')[blk[0]] if blk else ''
+        c_ = re.search(r'\s#.*$', old_line)
+        lines = ([f'texture_forms: [{", ".join(chr(34) + x + chr(34) for x in ja_plan.config_texture_forms)}]'
+                  + (c_.group(0) if c_ else '')] if ja_plan.config_texture_forms else [])
+        if a.cfg_out:
+            nl = '\r\n' if '\r\n' in raw else '\n'
+            open(cfg_path, 'w', encoding='utf-8', newline='').write(
+                GD.set_yaml(text, 'attributes.texture_forms', lines).replace('\n', nl))
+            print('  config.yaml attributes: ' + (lines[0].split(' #')[0] if lines else 'texture_forms removed'))
+        else:
+            print('  config.yaml attributes needs (not updated: --out): '
+                  + (lines[0].split(' #')[0] if lines else 'texture_forms removed'))
     if ja_plan.notes:
         print('  joint attributes: ' + '; '.join(ja_plan.notes))
     elif gd_.get('joint_attrs'):
         print('  joint attributes: unchanged')
     # hurtboxes (the .blend's Hurtboxes): main.bin, and config.yaml's list when it has one
     msg = GD.apply_hurtboxes(f, main, cfg, a.work_dir, getattr(textures, 'manifest', None) or {},
-                             os.path.join(a.char_dir, 'config.yaml'), write_cfg=a.out is None)
+                             a.cfg_out, write_cfg=True)
     if msg:
         print('  ' + msg)
     import legs
@@ -801,8 +830,8 @@ def main(argv=None):
     print(f'wrote {out}/character.bin ({len(newc)} bytes), main.bin, main_reqlist.txt')
     if (mi_head, me_head) != (mi_head_base, me_head_base):   # a chain's first pointer moved away
         line = f'main: ["{mi_head:04X}", "{me_head:04X}"]'
-        path = os.path.join(a.char_dir, 'config.yaml')
-        if a.out is None:
+        path = a.cfg_out
+        if path:
             raw = open(path, encoding='utf-8', newline='').read()
             nl = '\r\n' if '\r\n' in raw else '\n'
             text = GD.set_yaml(raw.replace('\r\n', '\n'), 'offsets.main', [line])
@@ -813,6 +842,11 @@ def main(argv=None):
     if shield is not None:
         open(os.path.join(out, 'shield_pose.bin'), 'wb').write(shield['data'])
         print(f"wrote {out}/shield_pose.bin ({len(shield['data'])} bytes)")
+    if cfg_orig is not None:
+        if open(a.cfg_out, 'rb').read() == cfg_orig and not a.all:
+            os.remove(a.cfg_out)                       # (unchanged: nothing to copy)
+        else:
+            print(f'wrote {a.cfg_out}')
     # fighter animations edited in Blender (blend_to_gltf.py samples the ones that changed)
     try:
         changed = json.load(open(os.path.join(a.work_dir, 'costumes.json'))).get('fighter_anims') or []
@@ -864,9 +898,9 @@ def apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines):
         print(f'  shield size: {old_r:g} -> {r:g}')
         if in_cfg is not None:
             line = f'shield_size: {round(r, 3)}'
-            if a.out is None:
+            if a.cfg_out:
                 import gamedata as GD
-                path = os.path.join(a.char_dir, 'config.yaml')
+                path = a.cfg_out
                 raw = open(path, encoding='utf-8', newline='').read()
                 nl = '\r\n' if '\r\n' in raw else '\n'
                 text = GD.set_yaml(raw.replace('\r\n', '\n'), 'attributes.shield_size', [line])
@@ -880,6 +914,9 @@ def apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines):
         return None
     sp = SP.load(f, *old[:2])
     res = SP.build_file(sp, blend, old[0])
+    if res is None and a.all and old[2] == 'shield_pose.bin':
+        print('  shield pose: unchanged (its file written as it is: --all)')
+        return dict(data=old[0])
     if res is None:
         print('  shield pose: unchanged')
         return None
@@ -900,9 +937,9 @@ def apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines):
     have = cfg.get('shield_pose')
     if not (isinstance(have, list) and [str(x).upper() for x in have] == want):
         line = f'shield_pose: ["{want[0]}", "{want[1]}"]'
-        if a.out is None:
+        if a.cfg_out:
             import gamedata as GD
-            path = os.path.join(a.char_dir, 'config.yaml')
+            path = a.cfg_out
             raw = open(path, encoding='utf-8', newline='').read()
             nl = '\r\n' if '\r\n' in raw else '\n'
             text = GD.set_yaml(raw.replace('\r\n', '\n'), 'shield_pose', [line])

@@ -178,6 +178,8 @@ def cmd_import(a, extra):
         blend = a.blend or find_blend(out_dir)
         if os.path.exists(work):
             shutil.rmtree(work)                         # (no leftovers from an earlier import's layers / parts)
+        if getattr(a, 'all', False):
+            os.environ['N64_IMPORT_ALL'] = '1'          # (blend_to_gltf.py: every own-file animation)
         run_blender(blender_cmd(a.blender), 'blend_to_gltf.py', work, blend)
     elif not os.path.exists(os.path.join(work, 'costumes.json')):
         raise SystemExit(f'--no-blend: {work} has no blend_to_gltf.py output')
@@ -189,7 +191,7 @@ def cmd_import(a, extra):
         return
     if kind == 'fighter':
         import import_fighter
-        import_fighter.main([target, work] + extra)
+        import_fighter.main([target, work] + extra + (['--all'] if a.all else []))
         kh = os.path.join(out_dir, 'kirby_hat')
         if os.path.exists(os.path.join(kh, 'manifest.json')) and os.path.exists(os.path.join(kh, 'model.blend')):
             # its Kirby copy-ability hat (the Kirby .blend beside it) -> kirby_hat/kirby_hat.bin
@@ -241,6 +243,9 @@ def main(argv=None):
     p.add_argument('--no-blend', action='store_true', help="don't run Blender: reuse the work folder")
     p.add_argument('--out', metavar='DIR', help='write the files to DIR instead (TARGET and its config.yaml '
                                                 'are left as they are)')
+    p.add_argument('--all', action='store_true',
+                   help='fighters: write every animation with its own file (not only the edited ones), the '
+                        'shield pose file and config.yaml even when unchanged: a full set of files')
     p.add_argument('--preview', metavar='DIR', help='fighters: render what was built into DIR')
     p.add_argument('--keep-render-modes', action='store_true',
                    help="fighters: keep cut-out materials' own render modes (not cloaking-safe)")

@@ -549,12 +549,15 @@ class Material:
         pal_ids = {m[1] for m in self.costume_map}
         self.tex_varies = len(tex_ids) > 1
         self.pal_varies = self.ci and len(pal_ids) > 1
-        if self.tex_varies or 'tex' in self.animated:                  # per-costume / animated images need
-            self.image_source = 'list'                                 # the MObj's list
+        n_images = len([x for x in (self.images or []) if x is not None])
+        if self.tex_varies or 'tex' in self.animated or n_images > 1:  # per-costume / animated / alternate
+            self.image_source = 'list'                                 # images need the MObj's list
         if self.siz == 1 and self.ci and self.image_source == 'list' and 'tex' not in self.animated:
             # the MObj's own TLUT load is 16 colors when its image SETTIMG is 16b (needed by the load)
             if self.tex_varies:
                 raise SystemExit(f'{self.name}: CI8 images can\'t change per costume (only palettes); use CI4')
+            if n_images > 1:
+                self.warnings.append('CI8: its image list (alternate textures) can\'t be used; use CI4')
             self.image_source = 'inline'
         if self.pal_varies or (self.ci and 'pal' in self.animated):
             self.palette_source = 'list'

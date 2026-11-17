@@ -529,6 +529,24 @@ Blender reads `OUT_DIR/model.blend` into `OUT_DIR/import_work/` (`blend_to_gltf.
 files. TARGET defaults to the folder the export came from; `--out` writes the files to BUILD_DIR
 instead.
 
+### From Blender: Write Game Files
+
+**3D View > N64 > N64 Game Files** > **Write Game Files** saves the .blend (and painted images),
+then runs this import with `--out` into **Folder** (default `//to_project`, next to the .blend),
+in the background: when it's done the panel lists the files to copy into the character / stage
+folder (main.bin, character.bin, main_reqlist.txt, config.yaml when something in it changed,
+animations, shield_pose.bin, kirby_hat/...), with **Open Folder** and the **Log**
+(`import_log.txt`). The folder is emptied on each run (only one this button made).
+**Write All (Every Animation)** is the same with `import --all`: also every animation with its own
+file (`animations/*.bin`, re-encoded from Blender, edited or not; the base character's borrowed
+ones only when edited, as each would become a new file and main.asm lines), the character's own
+shield_pose.bin and config.yaml even when unchanged: a full set (Mega Man: 67 animations, ~30 s).
+
+It runs with Blender's own Python (a sandboxed Blender, like the Flatpak, can't start the system's),
+which needs Pillow and PyYAML: **Install Tools** (shown while they're missing) installs them with pip
+into Blender's user scripts folder (`ssb64_model_libs`), once. With `--out`, config.yaml edits go to
+a copy in the folder (kept only when it changed); without it, into the character's own.
+
 ### Fighters
 
 - The base `main.bin` / `character.bin` (`--main`/`--char`, default the character
@@ -558,7 +576,7 @@ models were duplicate data), Mega Man 107,632 -> 115,360, Snake 180,748 -> 107,8
 #### Fighter animations
 
 Only the animations edited since the export are written (blend_to_gltf.py compares each
-action's keys, flags and Loop with what the export made). For each, every joint is sampled per
+action's keys, flags and Loop with what the export made). `import --all` writes every one that has its own file too. For each, every joint is sampled per
 frame in the game's space and written in the 16-bit format (`figatree.py`): as few keys as play
 it within ~0.23 degrees / 0.5 units, preferring the frames of the Blender keys, each segment
 linear or cubic (whichever is smaller per joint), looping when Loop is on. Then:
@@ -604,6 +622,14 @@ to `shield_size` (attributes + 0x74) when it changed.
   `textures/<mat>_img<n>.png`, as an `N64 Frame <n>` node: the import appends it; moveset event
   0x2B picks it by number); **Remove Last Added**: only images added in Blender. A part that
   points at a material without an image list is flagged, with the joint's materials that have one.
+  **Bone > N64 Joint > Materials** lists the joint's materials in their MObj order (what a texture
+  part's index counts) and which are alternate textures; **Make Alternate Texture** gives one a free
+  slot (the game has 2; a fighter without the table gets one). A one-image material works: the
+  first **Add** gives it a second image, and the import gives the material an image list.
+  When config.yaml has `attributes: texture_forms` (the build writes them over main.bin's), those
+  are the parts; the import writes edits back there when it can say them (a joint's n-th entry
+  switches its material n), else removes the key and writes the files' container (a new 2-entry one
+  in character.bin when main.bin's holds fewer entries: vanilla containers often hold one).
   Costumes should change palettes only (Mega Man): a costume script that picks the image too
   (Cloud's did) fights the alternate textures.
 - **Model parts**: per joint, what it shows: **Body** (the body's piece), **None**, or a variant
@@ -768,6 +794,13 @@ model.blend gets a hidden **Reference** collection, never imported back:
   at his own size relative to the thrower's (Mario's `attr->size` / the fighter's).
   Which thrown animation a throw plays comes from the thrower's `attr->thrown_status`.
 Scripts that look for the fighter's armature skip ones flagged `n64_reference`.
+
+**3D View > N64 > N64 Fighter > Reference**: one button per item (shows it in the hand, again
+hides it; one at a time) with its hold joint (button: selects that bone in Pose Mode),
+**Grabbed Opponent** (show / hide) with his animation (the `Opponent: ...` actions). When
+Armature > N64 Fighter Joints names another light / heavy item joint, **Move to <bone>** puts the
+reference there (the joint's rest frame without scale, from the export's model.gltf axes; the
+opponent follows the heavy one).
 Mario is minimal: high-detail model, flat colors (each texture's average), the thrown animations.
 
 ## Loading animation files in Blender

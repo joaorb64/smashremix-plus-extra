@@ -12,8 +12,11 @@
 # Licence:     <unlicenced>
 #-------------------------------------------------------------------------------
 
-from tkinter import *
-from tkinter import filedialog
+try:
+    from tkinter import *
+    from tkinter import filedialog
+except ImportError:         # (no Tk, e.g. Blender's Python: only the GUI below needs it, not the ROM reader)
+    Frame = object
 
 def_exts = (("All Files","*"),)
 bin_exts = (('Binary File', '*.bin'),)
