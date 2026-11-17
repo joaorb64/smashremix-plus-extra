@@ -224,13 +224,15 @@ def plan(f, new, orig):
 
 def unlink_internal(main, head, fld):
     """Drop main.bin's internal pointer at fld from its relocation chain (head: the chain's
-    first field) and zero the field."""
+    first field) and zero the field. -> the chain's head (the next pointer when fld was the
+    head: config.yaml offsets main[0] must follow; 0x3FFFC: none left)."""
     chain = list(MF.chain(bytes(main), head).keys())
     if fld not in chain:
-        return
-    if fld == chain[0]:
-        raise SystemExit(f'main.bin 0x{fld:X} is the internal chain\'s head: can\'t move its data')
+        return head
     i = chain.index(fld)
-    prev = chain[i - 1]
-    struct.pack_into('>H', main, prev, struct.unpack_from('>H', main, fld)[0])   # prev -> fld's next
+    if i == 0:
+        head = chain[1] if len(chain) > 1 else 0x3FFFC
+    else:
+        struct.pack_into('>H', main, chain[i - 1], struct.unpack_from('>H', main, fld)[0])   # prev -> fld's next
     struct.pack_into('>I', main, fld, 0)
+    return head

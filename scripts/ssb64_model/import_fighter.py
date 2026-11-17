@@ -421,6 +421,11 @@ def prologue_of(f, dl):
         op = d[o]
         if op in (0x01, 0x05, 0x06, 0xD7, 0xF5, 0xFD, 0xF0, 0xF3, 0xDE, 0xDF, 0xE8, 0xE6):
             break
+        if d[o:o + 8] == bytes.fromhex('D9FFFBFF00000000'):
+            # what gbi_writer puts right after the prologue: the rest is a model this import
+            # wrote (its first material's setup), not the prologue - taking it would add it
+            # once more on every import (files imported before keep extra copies until then)
+            break
         out += d[o:o + 8]
         o += 8
     return out
@@ -472,6 +477,23 @@ def main(argv=None):
     gd_ = GD._load_work(a.work_dir) or {}
     orig_ja = (getattr(textures, 'manifest', None) or {}).get('joint_attrs')
     ja_plan = JAT.plan(f, gd_['joint_attrs'], orig_ja) if gd_.get('joint_attrs') and orig_ja else JAT.Plan()
+
+    # model part variants: joints whose variant count changed (or whose list the import already
+    # moved to character.bin) get a new list in character.bin; the others keep theirs, re-pointed
+    part_counts = {}
+    if os.path.exists(os.path.join(a.work_dir, 'parts.gltf')):
+        for nd in json.load(open(os.path.join(a.work_dir, 'parts.gltf'))).get('nodes', []):
+            m_ = re.match(r'part(\d+)_(hi|lo)_j(\d+)$', nd.get('name', ''))
+            if m_ and 'mesh' in nd:
+                part_counts[int(m_.group(3))] = max(part_counts.get(int(m_.group(3)), 0), int(m_.group(1)) + 1)
+    mp_ = f.ptr_main(f.attr + MF.A_MODELPARTS)
+    part_rebuild = {j for j, n in part_counts.items()
+                    if len(f.modelparts.get(j, [])) != n or
+                    any(p['field'] is None for pair in f.modelparts.get(j, []) for p in pair)}
+    if part_rebuild and (mp_ is None or mp_[0] != 'main'):
+        raise SystemExit('model parts: the fighter has no model part container in main.bin; new variants '
+                         f'(joints {sorted(part_rebuild)}) need one')
+    part_unlink = [mp_[1] + 4 * j for j in sorted(part_rebuild) if mp_[1] + 4 * j in f.main_int]
 
     def build(base_len, quiet=False):
         """The new model as data appended at base_len -> (blob, {main.bin field: new target})."""
@@ -591,6 +613,7 @@ def main(argv=None):
 
         # ---- model parts: objects part<variant>_<hi|lo>_j<joint>
         parts_path = os.path.join(a.work_dir, 'parts.gltf')
+        built_parts = {}                                      # (joint, variant, detail) -> (dl, mobjsubs, scripts)
         if os.path.exists(parts_path):
             n_parts = 0
             for o in load_gltf(parts_path):
@@ -600,11 +623,8 @@ def main(argv=None):
                     continue
                 v, detail, joint = int(m.group(1)), m.group(2), int(m.group(3))
                 slots = f.modelparts.get(joint, [])
-                if v >= len(slots):
-                    say(f"  warning: {o['name']}: joint {joint} has {len(slots)} part variants in the base file; "
-                          'adding variants is not supported yet, skipped')
-                    continue
-                fld = slots[v][0 if detail == 'hi' else 1]['field']
+                fld = slots[v][0 if detail == 'hi' else 1]['field'] \
+                    if v < len(slots) and joint not in part_rebuild else None
                 part_info = next((p for p in textures.manifest.get('model_parts', [])
                                   if p['joint'] == joint and p['variant'] == v and p['detail'] == detail), {})
                 dls, mats = build_joints([o], W, textures, blob, prologue, store, only_joint=joint,
@@ -615,13 +635,42 @@ def main(argv=None):
                     blob.ptr(lst + 4 * i, mobjsub(n))
                     if script_of[n] is not None:
                         blob.ptr(an + 4 * i, script_of[n])
-                retarget[fld] = dls[joint]
-                if mats[joint] or fld + 4 in f.main_ext:                 # materials list (none: inline textures only)
-                    retarget[fld + 4] = lst
-                if any(script_of[n] is not None for n in mats[joint]) or fld + 8 in f.main_ext:
-                    retarget[fld + 8] = an                                  # costume scripts, by material index
+                has_scripts = any(script_of[n] is not None for n in mats[joint])
+                built_parts[(joint, v, detail)] = (dls[joint], lst if mats[joint] else None,
+                                                   an if has_scripts else None)
+                if fld is not None:                                         # the base file's variant
+                    retarget[fld] = dls[joint]
+                    if mats[joint] or fld + 4 in f.main_ext:             # materials list (none: inline textures only)
+                        retarget[fld + 4] = lst
+                    if has_scripts or fld + 8 in f.main_ext:
+                        retarget[fld + 8] = an                              # costume scripts, by material index
                 n_parts += 1
             say(f'  model parts: {n_parts} rebuilt')
+            # new variant lists (FTModelPartDesc: [variant][hi, lo] FTModelPart, 0x14 bytes each:
+            # dl, mobjsubs, costume scripts, main matanim (unused), u8 flags), an empty pair after
+            for joint in sorted(part_rebuild):
+                n = part_counts[joint]
+                slots = f.modelparts.get(joint, [])
+                raw = bytearray(MF.MODELPART_SIZE * 2 * (n + 1))
+                for v in range(n):
+                    for k in range(2):
+                        src = slots[v][k] if v < len(slots) else (slots[0][k] if slots else None)
+                        raw[MF.MODELPART_SIZE * (2 * v + k) + 0x10] = src['flags'] if src else 0
+                desc = blob.add(bytes(raw), 4)
+                for v in range(n):
+                    for k, detail in enumerate(('hi', 'lo')):
+                        e = desc + MF.MODELPART_SIZE * (2 * v + k)
+                        got = built_parts.get((joint, v, detail))
+                        if got is None:
+                            say(f'  warning: joint {joint} variant {v}: no {detail} object (part{v}_{detail}_j{joint:02d}): '
+                                f'{"nothing drawn in that detail" if detail == "lo" else "empty"}')
+                            continue
+                        for o_, t_ in zip((0, 4, 8), got):
+                            if t_ is not None:
+                                blob.ptr(e + o_, t_)
+                retarget[mp_[1] + 4 * joint] = desc
+                old_n = len(slots)
+                say(f'  model parts: joint {joint}: {old_n} -> {n} variants (list written to character.bin)')
 
         # ---- electric-shock skeleton: objects skel<id>_j<joint>; drawn with the joint's body MObjs
         skel_path = os.path.join(a.work_dir, 'skeleton.gltf')
@@ -665,8 +714,19 @@ def main(argv=None):
     _, replaced = build(len(f.char), quiet=True)
     main = bytearray(f.main)
     char = bytearray(f.char)
-    for fld_ in ja_plan.unlink:              # joint attribute tables that move to character.bin
-        JAT.unlink_internal(main, mi_head, fld_)       # (f keeps reading the base file's tables)
+    mi_head_base, me_head_base = mi_head, me_head
+    for fld_ in ja_plan.unlink + part_unlink:    # tables that move to character.bin
+        mi_head = JAT.unlink_internal(main, mi_head, fld_)    # (f keeps reading the base file's tables)
+    # the old variant lists of joints whose list moved: their pointers into character.bin leave
+    # main.bin's external chain (and main_reqlist.txt), or what they point at would be kept
+    for fld_ in [p['field'] + o for j in sorted(part_rebuild) for pair in f.modelparts.get(j, []) for p in pair
+                 if p['field'] is not None for o in (0, 4, 8, 0xC) if p['field'] + o in f.main_ext]:
+        ext_ = list(MF.chain(bytes(main), me_head).keys())
+        if fld_ not in ext_:
+            continue
+        lines_ = [i for i, ln in enumerate(reqlist_lines) if not ln.startswith('END OF')]
+        del reqlist_lines[lines_[ext_.index(fld_)]]
+        me_head = JAT.unlink_internal(main, me_head, fld_)
     if not a.no_gc:
         keep = [fld for fld in char_fields_of(main, reqlist_lines) if fld not in replaced]
         res = ge.gc(bytes(char), [0, ci_head] + [f.main_ext[fld] for fld in keep], head=ci_head)
@@ -739,6 +799,17 @@ def main(argv=None):
     open(os.path.join(out, 'main_reqlist.txt'), 'w', encoding='utf-8', newline='').write(
         newline.join(reqlist_lines) + (newline if reqlist_raw.endswith(b'\n') else ''))
     print(f'wrote {out}/character.bin ({len(newc)} bytes), main.bin, main_reqlist.txt')
+    if (mi_head, me_head) != (mi_head_base, me_head_base):   # a chain's first pointer moved away
+        line = f'main: ["{mi_head:04X}", "{me_head:04X}"]'
+        path = os.path.join(a.char_dir, 'config.yaml')
+        if a.out is None:
+            raw = open(path, encoding='utf-8', newline='').read()
+            nl = '\r\n' if '\r\n' in raw else '\n'
+            text = GD.set_yaml(raw.replace('\r\n', '\n'), 'offsets.main', [line])
+            open(path, 'w', encoding='utf-8', newline='').write(text.replace('\n', nl))
+            print(f'  config.yaml offsets: {line} (main.bin\'s pointer chains start elsewhere now)')
+        else:
+            print(f'  config.yaml offsets needs (not updated: --out): {line}')
     if shield is not None:
         open(os.path.join(out, 'shield_pose.bin'), 'wb').write(shield['data'])
         print(f"wrote {out}/shield_pose.bin ({len(shield['data'])} bytes)")

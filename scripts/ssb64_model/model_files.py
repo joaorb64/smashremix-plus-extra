@@ -184,9 +184,31 @@ def load(main_path, char_path, main_int_head=0x2CC, main_ext_head=0x0, char_int_
                     b = off + MODELPART_SIZE * k
                     dl = f.ptr_main(b)
                     ms = f.ptr_main(b + 4)
+                    sc = f.ptr_main(b + 8)
                     pair.append(dict(field=b, dl=dl[1] if dl and dl[0] == 'char' else None,
                                      mobjsubs=ms[1] if ms and ms[0] == 'char' else None,
+                                     scripts=sc[1] if sc and sc[0] == 'char' else None,
                                      flags=main[b + 0x10]))
+                if pair[0]['dl'] is None and pair[1]['dl'] is None:
+                    break
+                variants.append(pair)
+                off += MODELPART_SIZE * 2
+            if variants:
+                f.modelparts[i] = variants
+        # lists the import rebuilt (variants added / removed) live in character.bin: the
+        # container entry is an external pointer, the list ends with an empty pair
+        for i in range(nj):
+            desc = f.main_ext.get(mp[1] + 4 * i)
+            if desc is None:
+                continue
+            variants, off = [], desc
+            while off + MODELPART_SIZE * 2 <= len(char):
+                pair = []
+                for k in range(2):
+                    b = off + MODELPART_SIZE * k
+                    pair.append(dict(field=None, char_field=b, dl=f.char_int.get(b),
+                                     mobjsubs=f.char_int.get(b + 4), scripts=f.char_int.get(b + 8),
+                                     flags=char[b + 0x10]))
                 if pair[0]['dl'] is None and pair[1]['dl'] is None:
                     break
                 variants.append(pair)

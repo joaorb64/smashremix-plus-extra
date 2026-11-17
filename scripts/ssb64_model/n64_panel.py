@@ -3997,7 +3997,7 @@ def _armature_props():
             bpy.props.FloatProperty, f'n64_foot_{s}_len', 0.0, name=f'{side} Shin Point', description='joint_*foot_rotate: how far down the shin the IK moves '
                                                    '(about 0.925 of the knee -> ankle distance)')
     for k in range(2):
-        d[f'n64_texpart_{k}_joint'] = _bone_slot(f'Expression {k + 1} Joint', 'textureparts (attributes + 0x330): '
+        d[f'n64_texpart_{k}_joint'] = _bone_slot(f'Alternate Texture {k + 1} Joint', 'textureparts (attributes + 0x330): '
                                                  'the joint whose material swaps image (empty: unused)',
                                                  f'n64_texpart_{k}_joint')
         d[f'n64_texpart_{k}_hi'] = _idp(bpy.props.IntProperty, f'n64_texpart_{k}_hi', 0, name='Material (hi)',
@@ -4041,7 +4041,7 @@ def joint_roles(arm, name):
             out.append((f'{side} thigh (slope foot IK)', 'CON_KINEMATIC'))
     for k in range(2):
         if ad.get(f'n64_texpart_{k}_joint') == name:
-            out.append((f'Expression {k + 1} (material {ad.get(f"n64_texpart_{k}_hi", 0)})', 'IMAGE_DATA'))
+            out.append((f'Alternate texture {k + 1} (material {ad.get(f"n64_texpart_{k}_hi", 0)})', 'IMAGE_DATA'))
     if ad.get('n64_access_joint') == name and 'n64_access_joint' in ad.keys():
         out.append(('Accessory part', 'MOD_CLOTH'))
     b = ad.bones.get(name)
@@ -4056,10 +4056,10 @@ def joint_roles(arm, name):
     if g is not None and g >= 4:
         j = g - 4
         parts = sorted({m.group(1) for o in bpy.data.objects
-                        if (m := re.match(rf'part(\d+)_(?:hi|lo)_j{j}$', o.name))})
+                        if (m := re.match(rf'part(\d+)_(?:hi|lo)_j0*{j}$', o.name))}, key=int)
         if parts:
             out.append((f'Model parts: variants {", ".join(parts)} (moveset model part events)', 'MESH_DATA'))
-        skel = sorted({m.group(1) for o in bpy.data.objects if (m := re.match(rf'skel(\d+)_j{j}$', o.name))})
+        skel = sorted({m.group(1) for o in bpy.data.objects if (m := re.match(rf'skel(\d+)_j0*{j}$', o.name))})
         if skel:
             out.append((f'Electric skeleton: {", ".join(skel)}', 'OUTLINER_OB_ARMATURE'))
     return out
@@ -4161,6 +4161,8 @@ class N64_PT_bone_joint(bpy.types.Panel):
             hb.operator('n64.hidden_part_remove', icon='X')
         elif g >= 1:
             hb.operator('n64.hidden_part_add', icon='HIDE_OFF')
+        if g >= 4 and bpy.data.collections.get('Model parts') is not None:
+            draw_part_variants(lay, context.scene, g - 4)
 
 
 class N64_PT_fighter_joints(bpy.types.Panel):
@@ -4192,7 +4194,7 @@ class N64_PT_fighter_joints(bpy.types.Panel):
             col.prop_search(ad, f'n64_effect_joint_{i}', ad, 'bones')
         if any(f'n64_texpart_{k}_hi' in ad.keys() for k in range(2)):
             col.separator()
-            col.label(text='Expressions (texture parts)', icon='IMAGE_DATA')
+            col.label(text='Alternate textures (texture parts: expressions...)', icon='IMAGE_DATA')
             for k in range(2):
                 col.prop_search(ad, f'n64_texpart_{k}_joint', ad, 'bones')
                 r = col.row(align=True)
@@ -4212,12 +4214,616 @@ class N64_PT_fighter_joints(bpy.types.Panel):
             lay.label(text='Never created: ' + ', '.join(withheld), icon='ERROR')
 
 
+# ---- fighter view: costume, model part variants, expressions (previews; the import resets them) ----
+
+_MAN_CACHE = {}
+
+
+def _manifest(scene=None):
+    """The export's manifest.json (cached by modification time); {} when there is none."""
+    import json
+    scene = scene or bpy.context.scene
+    d = os.path.normpath(bpy.path.abspath(scene.get('n64_export_dir', scene.get('fighter_export_dir', '//'))))
+    p = os.path.join(d, 'manifest.json')
+    try:
+        t = os.path.getmtime(p)
+    except OSError:
+        return {}
+    if _MAN_CACHE.get('path') != (p, t):
+        try:
+            _MAN_CACHE.update(path=(p, t), man=json.load(open(p)), dir=d)
+        except (OSError, ValueError):
+            return {}
+    return _MAN_CACHE['man']
+
+
+def _export_path(rel):
+    return os.path.join(_MAN_CACHE.get('dir', ''), rel) if rel else None
+
+
+def _costume_count():
+    return len([c for c in bpy.data.collections if re.match(r'Costume \d+$', c.name)])
+
+
+def _costume_shown(scene):
+    return int(scene.get('n64_costume_shown', 0))
+
+
+def _load_image(path):
+    if not path or not os.path.exists(path):
+        return None
+    want = os.path.normpath(path)
+    for img in bpy.data.images:                 # (the .blend's own copy: a relative path)
+        if img.filepath and os.path.normpath(bpy.path.abspath(img.filepath, library=img.library)) == want:
+            return img
+    return bpy.data.images.load(path, check_existing=True)
+
+
+def _costume_mat(base, k):
+    """Costume k's copy of material `base` (the body's `<base>_c<k>`, else a copy with the image's
+    `_c<k>.png` sibling: how the import reads parts' / low detail's costumes)."""
+    if k == 0:
+        return base
+    name = f'{base.name}_c{k}'
+    m = bpy.data.materials.get(name)
+    if m is not None:
+        return m
+    m = base.copy()
+    m.name = name
+    tex = _tex_node(m)
+    if tex is not None and tex.image is not None and tex.image.filepath:
+        p = bpy.path.abspath(tex.image.filepath)
+        sib = re.sub(r'_c0\.png$', f'_c{k}.png', p)
+        img = _load_image(sib) if sib != p else None
+        if img is not None:
+            tex.image = img
+    return m
+
+
+def _view_objects(coll_name):
+    c = bpy.data.collections.get(coll_name)
+    return [o for o in c.all_objects if o.type == 'MESH'] if c is not None else []
+
+
+def apply_costume(scene, k):
+    """Show costume k: its collection (the others hidden), and the parts' / low detail's
+    materials in its colors (object-linked slots; costume 0 = the meshes' own)."""
+    k = max(0, min(int(k), max(_costume_count() - 1, 0)))
+    scene['n64_costume_shown'] = k
+    vl = scene.view_layers[0] if bpy.context.view_layer is None else bpy.context.view_layer
+    for c in bpy.data.collections:
+        m = re.match(r'Costume (\d+)$', c.name)
+        if not m:
+            continue
+        lc = _find_layer_collection(vl.layer_collection, c.name)
+        if lc is not None:
+            lc.hide_viewport = int(m.group(1)) != k
+        c.hide_render = int(m.group(1)) != k
+    for ob in _view_objects('Model parts') + _view_objects('Low detail'):
+        for i, slot in enumerate(ob.material_slots):
+            base = ob.data.materials[i] if i < len(ob.data.materials) else None
+            if base is None:
+                continue
+            if k == 0:
+                slot.link = 'DATA'
+            else:
+                slot.link = 'OBJECT'
+                slot.material = _costume_mat(base, k)
+        if k == 0:
+            ob.pop('n64_costume_preview', None)
+        else:
+            ob['n64_costume_preview'] = k
+    apply_expressions(scene)
+
+
+def _find_layer_collection(lc, name):
+    if lc.collection.name == name:
+        return lc
+    for ch in lc.children:
+        r = _find_layer_collection(ch, name)
+        if r is not None:
+            return r
+    return None
+
+
+# -- expressions (texture parts): which image of the list the face materials draw
+
+def _expr_materials(man, tp):
+    """Material base names texture part tp switches: the joint's MObj at its index (hi / lo body,
+    the joint's model part variants)."""
+    out = []
+    j = tp['joint']
+    for detail, key in (('hi', 'mobj_hi'), ('lo', 'mobj_lo')):
+        idx = tp.get(key)
+        if idx is None:
+            continue
+        names = ((man.get('mobj_order') or {}).get(detail) or {}).get(str(j)) or []
+        if idx < len(names) and names[idx]:
+            out.append(names[idx])
+        for p in man.get('model_parts') or []:
+            if p['joint'] == j and p['detail'] == detail:
+                order = p.get('mobj_order') or []
+                if idx < len(order) and order[idx]:
+                    out.append(order[idx])
+    return list(dict.fromkeys(out))
+
+
+def texture_parts(scene):
+    """The texture parts as the armature has them now (Armature > N64 Fighter Joints: joint +
+    material index per detail), else the export's: [dict(index, joint (DObjDesc), mobj_hi, mobj_lo)]."""
+    arm = next((o for o in scene.objects if _has_joint_attrs(o)), None)
+    if arm is None:
+        return list(_manifest(scene).get('expressions') or [])
+    ad, out = arm.data, []
+    for k in range(2):
+        g = _bone_joint(ad.get(f'n64_texpart_{k}_joint', '') or '')
+        if g is None or g < 4:
+            continue
+        out.append(dict(index=k, joint=g - 4, mobj_hi=int(ad.get(f'n64_texpart_{k}_hi', 0)),
+                        mobj_lo=int(ad.get(f'n64_texpart_{k}_lo', 0))))
+    return out
+
+
+def joint_image_lists(man, j):
+    """The joint's hi MObjs with an image list: [(MObj index, material, images)]."""
+    names = ((man.get('mobj_order') or {}).get('hi') or {}).get(str(j)) or []
+    return [(i, n, len((man['materials'].get(n) or {}).get('images') or [])) for i, n in enumerate(names)
+            if n and len((man['materials'].get(n) or {}).get('images') or []) > 1]
+
+
+def list_images(man, base):
+    """Material `base`'s image list: the export's entries (paths), then the ones added in Blender
+    (its 'N64 Frame <i>' nodes past them: the import appends them to the list)."""
+    out = [_export_path(r) for r in (man['materials'].get(base) or {}).get('images') or []]
+    m = bpy.data.materials.get(base)
+    if m is not None:
+        for i, n in enumerate(frame_nodes(m)):
+            if i >= len(out) and n.image is not None:
+                out.append(os.path.normpath(bpy.path.abspath(n.image.filepath, library=n.image.library)))
+    return out
+
+
+def expression_images(man, tp):
+    """How many images the texture part can pick (its materials' image list)."""
+    return max([len(list_images(man, n)) for n in _expr_materials(man, tp)] or [0])
+
+
+def _set_tex_image(m, img):
+    tex = _tex_node(m)
+    if tex is None:
+        return
+    if img is None:
+        if 'n64_expr_orig' in m.keys():
+            orig = bpy.data.images.get(m['n64_expr_orig'])
+            if orig is None or not orig.filepath:
+                orig = _load_image(bpy.path.abspath(m.get('n64_expr_orig_path', '')))
+            if orig is not None:
+                tex.image = orig
+            for k in ('n64_expr_orig', 'n64_expr_orig_path'):
+                m.pop(k, None)
+        return
+    if 'n64_expr_orig' not in m.keys() and tex.image is not None:
+        m['n64_expr_orig'] = tex.image.name
+        m['n64_expr_orig_path'] = tex.image.filepath
+        tex.image.use_fake_user = True          # (kept in the file while the preview is shown)
+    tex.image = img
+
+
+def apply_expressions(scene):
+    """Each texture part's picked image (scene n64_expr_shown: {part index: image index}; none =
+    the costume's own) on its materials, in the shown costume's palette."""
+    man = _manifest(scene)
+    shown = dict(scene.get('n64_expr_shown') or {})
+    c = _costume_shown(scene)
+    for m in bpy.data.materials:            # (a part that changed material leaves no preview behind)
+        if 'n64_expr_orig' in m.keys():
+            _set_tex_image(m, None)
+    for tp in texture_parts(scene):
+        i = shown.get(str(tp['index']))
+        for base in _expr_materials(man, tp):
+            entry = man['materials'].get(base) or {}
+            mats = [bpy.data.materials.get(base if c == 0 else f'{base}_c{c}')]
+            for m in [m for m in mats if m is not None]:
+                imgs = list_images(man, base)
+                if i is None or i >= len(imgs):
+                    _set_tex_image(m, None)
+                    continue
+                img = _load_image(imgs[i])
+                cmap = entry.get('costume_map') or []
+                pals = entry.get('palettes') or []
+                if img is not None and pals and len(cmap) > c and cmap[c][1] != cmap[0][1] \
+                        and max(cmap[c][1], cmap[0][1]) < len(pals):
+                    p0, pc = _load_image(_export_path(pals[cmap[0][1]])), _load_image(_export_path(pals[cmap[c][1]]))
+                    if p0 is not None and pc is not None:
+                        img = _recolored(img, p0, pc, f'{base} N64 expression{i} costume{c}')
+                _set_tex_image(m, img)
+
+
+def reset_previews():
+    """Back to what the import reads: costume 0's materials on parts / low detail, every
+    material's own image (blend_to_gltf.py calls this first)."""
+    for ob in bpy.data.objects:
+        if 'n64_costume_preview' in ob.keys() and ob.type == 'MESH':
+            for slot in ob.material_slots:
+                slot.link = 'DATA'
+            del ob['n64_costume_preview']
+    for m in bpy.data.materials:
+        if 'n64_expr_orig' in m.keys():
+            _set_tex_image(m, None)
+    for name in ('Costume 0', 'Model parts', 'Low detail'):
+        for o in _view_objects(name):
+            try:
+                o.hide_set(False)
+            except RuntimeError:            # (not in the view layer)
+                pass
+
+
+# -- model parts: variants per joint ('part<v>_<hi|lo>_j<NN>' in Model parts)
+
+def part_objects(j, v=None, detail=None):
+    out = {}
+    for o in _view_objects('Model parts'):
+        m = re.match(r'part(\d+)_(hi|lo)_j(\d+)$', o.name)
+        if m and int(m.group(3)) == j and (v is None or int(m.group(1)) == v) and \
+                (detail is None or m.group(2) == detail):
+            out.setdefault(int(m.group(1)), []).append(o)
+    return out
+
+
+def body_objects(j, detail='hi'):
+    pat = re.compile(rf'{detail}_j{j:02d}(_c\d+)?$')
+    return [o for o in bpy.data.objects if o.type == 'MESH' and pat.match(o.name)]
+
+
+def apply_parts(scene):
+    """Each joint's shown piece (scene n64_parts_shown {joint: -2 body, -1 nothing, v variant}):
+    the body's piece, or the variant's objects in its place (like the game's model part events)."""
+    shown = {int(k): int(v) for k, v in dict(scene.get('n64_parts_shown') or {}).items()}
+    vl = bpy.context.view_layer
+    lc = _find_layer_collection(vl.layer_collection, 'Model parts')
+    if lc is None:
+        return
+    any_part = any(v >= 0 for v in shown.values())
+    if any_part:
+        if lc.hide_viewport:
+            scene['n64_parts_auto'] = True
+        lc.hide_viewport = False
+        for o in _view_objects('Model parts'):
+            m = re.match(r'part(\d+)_hi_j(\d+)$', o.name)
+            o.hide_set(not (m and shown.get(int(m.group(2)), -2) == int(m.group(1))))
+    elif scene.get('n64_parts_auto'):
+        lc.hide_viewport = True
+        for o in _view_objects('Model parts'):
+            o.hide_set(False)
+        del scene['n64_parts_auto']
+    for j in set(shown) | set(int(k) for k in dict(scene.get('n64_parts_seen') or {})):
+        for o in body_objects(j):
+            o.hide_set(shown.get(j, -2) != -2)
+    scene['n64_parts_seen'] = {str(j): 1 for j in shown}
+
+
+class N64_OT_part_show(bpy.types.Operator):
+    bl_idname = 'n64.part_show'
+    bl_label = 'Show Model Part'
+    bl_description = 'Show this piece on the joint (the body\'s, a model part variant, or nothing), like the game\'s model part event'
+    bl_options = {'UNDO'}
+    joint: bpy.props.IntProperty()
+    variant: bpy.props.IntProperty(default=-2)
+
+    def execute(self, context):
+        shown = dict(context.scene.get('n64_parts_shown') or {})
+        if self.variant == -2:
+            shown.pop(str(self.joint), None)
+        else:
+            shown[str(self.joint)] = self.variant
+        context.scene['n64_parts_shown'] = shown
+        apply_parts(context.scene)
+        return {'FINISHED'}
+
+
+class N64_OT_part_select(bpy.types.Operator):
+    bl_idname = 'n64.part_select'
+    bl_label = 'Select Model Part'
+    bl_description = 'Show this variant and select its objects (high detail active) to edit'
+    bl_options = {'UNDO'}
+    joint: bpy.props.IntProperty()
+    variant: bpy.props.IntProperty()
+
+    def execute(self, context):
+        bpy.ops.n64.part_show(joint=self.joint, variant=self.variant)
+        objs = part_objects(self.joint, self.variant).get(self.variant, [])
+        if not objs:
+            return {'CANCELLED'}
+        if context.object is not None and context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        for o in context.view_layer.objects:
+            o.select_set(False)
+        hi = next((o for o in objs if '_hi_' in o.name), objs[0])
+        hi.hide_set(False)
+        hi.select_set(True)
+        context.view_layer.objects.active = hi
+        return {'FINISHED'}
+
+
+class N64_OT_part_add(bpy.types.Operator):
+    bl_idname = 'n64.part_add'
+    bl_label = 'Add Model Part Variant'
+    bl_description = ('A new variant for this joint (the next id: moveset model part events / code pick it), '
+                      'starting as a copy of the body\'s piece or of another variant (high and low detail)')
+    bl_options = {'UNDO'}
+    joint: bpy.props.IntProperty()
+    source: bpy.props.IntProperty(default=-2, description='-2: the body\'s piece; else the variant to copy')
+
+    def execute(self, context):
+        j = self.joint
+        have = part_objects(j)
+        v = max(have) + 1 if have else 0
+        coll = bpy.data.collections.get('Model parts')
+        if coll is None:
+            self.report({'ERROR'}, 'No Model parts collection')
+            return {'CANCELLED'}
+        made = []
+        for detail in ('hi', 'lo'):
+            if self.source == -2:
+                src = next((o for o in body_objects(j, detail) if not re.search(r'_c\d+$', o.name)), None)
+            else:
+                src = next(iter(part_objects(j, self.source, detail).get(self.source, [])), None)
+            if src is None and detail == 'lo' and made:
+                src = made[0]                    # no low detail piece: the high one, edit it down
+            if src is None:
+                continue
+            o = src.copy()
+            o.data = src.data.copy()
+            o.name = f'part{v}_{detail}_j{j:02d}'
+            o.pop('n64_costume_preview', None)
+            for slot in o.material_slots:
+                slot.link = 'DATA'
+            coll.objects.link(o)
+            made.append(o)
+        if not made:
+            self.report({'ERROR'}, f'joint_{j:02d} has no piece to copy: model one as an object named '
+                                   f'part{v}_hi_j{j:02d} in Model parts (vertex group joint_{j:02d}, Armature modifier)')
+            return {'CANCELLED'}
+        if _costume_shown(context.scene):
+            apply_costume(context.scene, _costume_shown(context.scene))
+        bpy.ops.n64.part_select(joint=j, variant=v)
+        self.report({'INFO'}, f'joint_{j:02d}: variant {v} added ({", ".join(o.name for o in made)})')
+        return {'FINISHED'}
+
+
+class N64_OT_part_remove(bpy.types.Operator):
+    bl_idname = 'n64.part_remove'
+    bl_label = 'Remove Model Part Variant'
+    bl_description = ('Delete the joint\'s last variant (only the last: the others keep their ids, which '
+                      'moveset events and code use)')
+    bl_options = {'UNDO'}
+    joint: bpy.props.IntProperty()
+
+    def execute(self, context):
+        have = part_objects(self.joint)
+        if not have:
+            return {'CANCELLED'}
+        v = max(have)
+        for o in have[v]:
+            bpy.data.objects.remove(o)
+        shown = dict(context.scene.get('n64_parts_shown') or {})
+        if shown.get(str(self.joint)) == v:
+            shown.pop(str(self.joint))
+            context.scene['n64_parts_shown'] = shown
+        apply_parts(context.scene)
+        self.report({'INFO'}, f'joint_{self.joint:02d}: variant {v} removed (moveset events using it: change them)')
+        return {'FINISHED'}
+
+
+class N64_OT_costume_show(bpy.types.Operator):
+    bl_idname = 'n64.costume_show'
+    bl_label = 'Show Costume'
+    bl_description = 'Show this costume (its collection; parts and low detail in its colors)'
+    bl_options = {'UNDO'}
+    costume: bpy.props.IntProperty()
+
+    def execute(self, context):
+        apply_costume(context.scene, self.costume)
+        return {'FINISHED'}
+
+
+class N64_OT_expression_show(bpy.types.Operator):
+    bl_idname = 'n64.expression_show'
+    bl_label = 'Show Alternate Texture'
+    bl_description = ('Show this image of the texture part\'s list (costume 0: the list image itself, '
+                      'paint it in the Image Editor; other costumes: recolored preview)')
+    bl_options = {'UNDO'}
+    part: bpy.props.IntProperty()
+    image: bpy.props.IntProperty(default=-1, description='-1: the costume\'s own image')
+
+    def execute(self, context):
+        shown = dict(context.scene.get('n64_expr_shown') or {})
+        if self.image < 0:
+            shown.pop(str(self.part), None)
+        else:
+            shown[str(self.part)] = self.image
+        context.scene['n64_expr_shown'] = shown
+        apply_expressions(context.scene)
+        return {'FINISHED'}
+
+
+class N64_OT_alt_texture_add(bpy.types.Operator):
+    bl_idname = 'n64.alt_texture_add'
+    bl_label = 'Add Alternate Texture'
+    bl_description = ('A new image at the end of the list this texture part switches (every material it switches: '
+                      'high / low detail, model part variants), a copy of the shown one (else image 0) saved as '
+                      'textures/<material>_img<n>.png to paint; moveset events pick it by its number')
+    bl_options = {'UNDO'}
+    part: bpy.props.IntProperty()
+
+    def execute(self, context):
+        import shutil
+        sc = context.scene
+        man = _manifest(sc)
+        tp = next((t for t in texture_parts(sc) if t['index'] == self.part), None)
+        if tp is None:
+            return {'CANCELLED'}
+        src_i = int(dict(sc.get('n64_expr_shown') or {}).get(str(self.part), 0))
+        made, new_i = [], None
+        for base in _expr_materials(man, tp):
+            m = bpy.data.materials.get(base)
+            imgs = list_images(man, base)
+            if m is None or len(imgs) < 1:
+                continue
+            for i, path in enumerate(imgs):            # the list as Frame nodes (the import reads them)
+                n = frame_node(m, 'Frame', i)
+                if n.image is None:
+                    n.image = _load_image(path)
+            i = len(imgs)
+            src = imgs[min(src_i, len(imgs) - 1)]
+            dst = os.path.join(os.path.dirname(src), f'{base}_img{i}.png')
+            k = 1
+            while os.path.exists(dst):                 # (an earlier add's file)
+                dst = os.path.join(os.path.dirname(src), f'{base}_img{i}_{k}.png')
+                k += 1
+            shutil.copyfile(src, dst)
+            img = _load_image(dst)
+            frame_node(m, 'Frame', i).image = img
+            made.append(f'{base} image {i}')
+            new_i = i if new_i is None else min(new_i, i)
+        if not made:
+            self.report({'ERROR'}, 'The texture part\'s materials have no image list to add to')
+            return {'CANCELLED'}
+        bpy.ops.n64.expression_show(part=self.part, image=new_i)
+        self.report({'INFO'}, 'Added: ' + ', '.join(made) + ' (costume 0 shows it: paint it in the Image Editor)')
+        return {'FINISHED'}
+
+
+class N64_OT_alt_texture_remove(bpy.types.Operator):
+    bl_idname = 'n64.alt_texture_remove'
+    bl_label = 'Remove Alternate Texture'
+    bl_description = 'Remove the last image added in Blender (the list\'s exported images stay: moveset events use their numbers)'
+    bl_options = {'UNDO'}
+    part: bpy.props.IntProperty()
+
+    def execute(self, context):
+        sc = context.scene
+        man = _manifest(sc)
+        tp = next((t for t in texture_parts(sc) if t['index'] == self.part), None)
+        done = []
+        for base in _expr_materials(man, tp) if tp else []:
+            m = bpy.data.materials.get(base)
+            n_exp = len((man['materials'].get(base) or {}).get('images') or [])
+            nodes = frame_nodes(m) if m is not None else []
+            if len(nodes) > n_exp:
+                m.node_tree.nodes.remove(nodes[-1])
+                done.append(base)
+                if len(frame_nodes(m)) <= n_exp:        # back to the export's list: no Frame nodes needed
+                    for n in frame_nodes(m):
+                        m.node_tree.nodes.remove(n)
+        if not done:
+            self.report({'ERROR'}, 'Only images added in Blender can be removed')
+            return {'CANCELLED'}
+        shown = dict(sc.get('n64_expr_shown') or {})
+        shown.pop(str(self.part), None)
+        sc['n64_expr_shown'] = shown
+        apply_expressions(sc)
+        return {'FINISHED'}
+
+
+def draw_part_variants(lay, scene, j):
+    """The joint's model part variants: show (body / nothing / each), select, add, remove."""
+    have = part_objects(j)
+    cur = int(dict(scene.get('n64_parts_shown') or {}).get(str(j), -2))
+    box = lay.box()
+    box.label(text=f'Model parts: {len(have)} variant{"s" if len(have) != 1 else ""}', icon='MESH_DATA')
+    row = box.row(align=True)
+    for v, text in [(-2, 'Body'), (-1, 'None')] + [(v, str(v)) for v in sorted(have)]:
+        op = row.operator('n64.part_show', text=text, depress=cur == v)
+        op.joint, op.variant = j, v
+    for v in sorted(have):
+        r = box.row(align=True)
+        r.label(text=f'Variant {v}: ' + ', '.join(o.name for o in have[v]))
+        op = r.operator('n64.part_select', text='', icon='RESTRICT_SELECT_OFF')
+        op.joint, op.variant = j, v
+        if v == max(have):
+            r.operator('n64.part_remove', text='', icon='X').joint = j
+    r = box.row(align=True)
+    op = r.operator('n64.part_add', text='Add (copy body)', icon='ADD')
+    op.joint, op.source = j, -2
+    if have:
+        op = r.operator('n64.part_add', text=f'Add (copy {max(have)})', icon='DUPLICATE')
+        op.joint, op.source = j, max(have)
+
+
+class N64_PT_fighter_view(bpy.types.Panel):
+    bl_label = 'N64 Fighter'
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'N64'
+
+    @classmethod
+    def poll(cls, context):
+        return bpy.data.collections.get('Costume 0') is not None
+
+    def draw(self, context):
+        lay = self.layout
+        sc = context.scene
+        n = _costume_count()
+        cur = _costume_shown(sc)
+        lay.label(text=f'Costume ({n})', icon='MATERIAL')
+        grid = lay.grid_flow(row_major=True, columns=8, align=True)
+        for k in range(n):
+            grid.operator('n64.costume_show', text=str(k), depress=k == cur).costume = k
+        man = _manifest(sc)
+        tps = texture_parts(sc) if man else []
+        if tps:
+            lay.label(text='Alternate textures (texture parts)', icon='IMAGE_DATA')
+            shown = dict(sc.get('n64_expr_shown') or {})
+            for tp in tps:
+                n_img = expression_images(man, tp)
+                mats = _expr_materials(man, tp)
+                row = lay.row(align=True)
+                row.label(text=f'{tp["index"] + 1}: joint_{tp["joint"]:02d} material {tp["mobj_hi"]}'
+                               + (f' ({mats[0]})' if mats else ''))
+                cur_i = int(shown.get(str(tp['index']), -1))
+                op = row.operator('n64.expression_show', text='Own', depress=cur_i < 0)
+                op.part, op.image = tp['index'], -1
+                for i in range(n_img if n_img > 1 else 0):
+                    op = row.operator('n64.expression_show', text=str(i), depress=cur_i == i)
+                    op.part, op.image = tp['index'], i
+                r = lay.row(align=True)
+                r.operator('n64.alt_texture_add', text='Add', icon='ADD').part = tp['index']
+                if any(len(frame_nodes(bpy.data.materials[b])) > len((man['materials'].get(b) or {}).get('images') or [])
+                       for b in mats if b in bpy.data.materials):
+                    r.operator('n64.alt_texture_remove', text='Remove Last Added', icon='X').part = tp['index']
+                if n_img <= 1:
+                    # the part points at a material without an image list: nothing to switch (in the
+                    # game either); point out the joint's materials that have one
+                    others = [x for x in joint_image_lists(man, tp['joint'])
+                              if x[0] not in {t['mobj_hi'] for t in tps if t['joint'] == tp['joint']}]
+                    box = lay.box()
+                    box.label(text='This material has no image list: nothing to switch, in game too', icon='ERROR')
+                    for i, n, cnt in others:
+                        box.label(text=f'Material {i} ({n}) has {cnt} images: set Alternate Texture '
+                                       f'{tp["index"] + 1} to it in Armature > N64 Fighter Joints')
+        joints = sorted({int(m.group(1)) for o in _view_objects('Model parts')
+                         if (m := re.match(r'part\d+_hi_j(\d+)$', o.name))})
+        if joints:
+            lay.label(text='Model parts (select a bone to add / edit)', icon='MESH_DATA')
+            shown = dict(sc.get('n64_parts_shown') or {})
+            for j in joints:
+                row = lay.row(align=True)
+                row.label(text=f'joint_{j:02d}')
+                cur_v = int(shown.get(str(j), -2))
+                for v, text in [(-2, 'Body'), (-1, 'None')] + [(v, str(v)) for v in sorted(part_objects(j))]:
+                    op = row.operator('n64.part_show', text=text, depress=cur_v == v)
+                    op.joint, op.variant = j, v
+
+
 CLASSES = (N64_OT_vs_view, N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
            N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene, N64_PT_gamedata,
            N64_OT_hurtbox_add, N64_OT_hurtbox_remove, N64_OT_hurtbox_select, N64_PT_bone_hurtboxes,
            N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools,
            N64_PT_motion_flags, N64_OT_anim_load_bin, N64_OT_anim_save_bin,
-           N64_OT_hidden_part_add, N64_OT_hidden_part_remove, N64_PT_bone_joint, N64_PT_fighter_joints)
+           N64_OT_hidden_part_add, N64_OT_hidden_part_remove, N64_PT_bone_joint, N64_PT_fighter_joints,
+           N64_OT_part_show, N64_OT_part_select, N64_OT_part_add, N64_OT_part_remove, N64_OT_costume_show,
+           N64_OT_expression_show, N64_OT_alt_texture_add, N64_OT_alt_texture_remove, N64_PT_fighter_view)
 
 
 def _collapse_visible_outliners():

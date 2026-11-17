@@ -835,11 +835,11 @@ class Exporter:
         for joint, variants in f.modelparts.items():
             for pair in variants:
                 for part in pair:
-                    an = f.ptr_main(part['field'] + 8)
+                    an = part.get('scripts')
                     ms_list = MF.pointer_run(f.char_int, part['mobjsubs']) if part['mobjsubs'] is not None else []
-                    if an and an[0] == 'char':
+                    if an is not None:
                         for i, ms in enumerate(ms_list):
-                            sc = f.char_int.get(an[1] + 4 * i)
+                            sc = f.char_int.get(an + 4 * i)
                             if sc is not None:
                                 self.script_of.setdefault(ms, sc)
         self.skeleton(hi['joints'])

@@ -26,6 +26,7 @@ BLEND_DIR = os.path.dirname(bpy.data.filepath)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import matanim as MA  # noqa: E402
 import n64_panel as PANEL  # noqa: E402
+PANEL.reset_previews()      # costume / expression / model part previews: back to what's read
 import blend_gamedata as GDB  # noqa: E402
 from blend_gamespace import sample_action  # noqa: E402
 import blend_gamespace as BGS  # noqa: E402
