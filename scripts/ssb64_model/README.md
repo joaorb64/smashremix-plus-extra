@@ -583,6 +583,39 @@ needed when it used a ROM file), and config.yaml gets `shield_pose: [its interna
 "3FFFC"]` (with `--out`: printed instead). The Shield Bubble's size (display size x scale) goes
 to `shield_size` (attributes + 0x74) when it changed.
 
+#### Joint attributes
+
+The fighter attributes that name joints (`jointattrs.py`, decomp `FTAttributes`) are edited on
+the bones, by bone name (the import turns them into joint ids):
+
+- **Bone > N64 Joint** (any joint bone): what the game uses the joint for (root motion, item
+  joints, foot IK, effect joints, expressions, accessory, hidden part, hurtboxes, model part
+  variants, electric skeleton; a withheld joint nothing creates is flagged), and per joint:
+  - **Created With the Fighter** (`setup_parts`, + 0x29C): off = withheld; it exists only while a
+    hidden part adds it.
+  - **Animation Lock** (`animlock`, + 0x2A0): in every motion without flag 0x1 (the guard
+    animations too) the game freezes the joint as it was and ignores its animation
+    (`ftParamSetAnimLocks`), so in those actions (and Shield / Shield Neutral) its bone is locked
+    in Pose Mode (still shown). Flag 0x1 on: posable.
+  - **Translate Scale** (`translate_scales`, + 0x324, NULL in every Remix fighter): its animated
+    translation is scaled by it; any value other than 1 creates the table (in character.bin).
+  - **Hidden part** (`hiddenparts`, + 0x2D0): **Make Hidden Part** turns the joint into the next
+    one (motion flag bit 31 - index adds it; it stops being created with the fighter), with its
+    parent (TopN: the top joint), placement among the parent's children and init flag. Only the
+    last one can be removed (the parts after another would move to other flag bits). A table
+    that grows moves to character.bin (main.bin's internal pointer becomes an external one;
+    `main_reqlist.txt` gets a `${CHARACTER}` line).
+- **Armature > N64 Fighter Joints**: light / heavy item joint (+ 0x33C / + 0x334), the slope foot
+  IK thighs and shin points (+ 0x2FC..0x308), the 5 effect joints (+ 0x2A4: cycled through for
+  electric / flame hits), expressions (texture parts, + 0x330: joint + material index per
+  detail), the accessory part's joint (+ 0x32C, when the fighter has one), and the hidden parts
+  list.
+
+The N64 Animation panel's hidden-part checkboxes and the bone locks follow the edits right away.
+Load / Save Animation .bin read the joint tree from the export's files: after changing what's
+created or the hidden parts, import, then export again before saving animations with them.
+The import writes only what changed (`joint attributes: unchanged` otherwise).
+
 #### Slope foot IK (legs)
 
 On slopes the game bends each leg with 2-bone IK (`legs.py`; decomp
@@ -662,7 +695,7 @@ collision tools (`stage_collision.py`) read the rebuilt file the same way.
   TopN/TransN/XRotN/YRotN; joints[] starts at 0x8E8 in the player struct).
 
 Not handled yet (passed through untouched): fighter DObjDLLink arrays (and two-DL
-skeleton entries), accessory parts, hidden parts.
+skeleton entries), accessory part models (their joint is editable: see Joint attributes).
 
 ## Kirby copy-ability hats
 
@@ -713,3 +746,11 @@ figatree.encode_animation), for the flags in the dialog (default: the action's, 
 Loop setting. Files are written in the 16-bit format, so the motion playing it needs the flags
 without 0x8 (the report says which). Default path: the file the action was loaded from, else the
 character's `animations/<action>.bin`.
+
+**Lock Bones Not in This Animation** (N64 Animation panel, on by default): the bones the active
+action's file has no script for are locked (transform locks) and hidden - the joints its motion
+flags leave out of the tree (figatree.joint_order: hidden parts whose bit is off, e.g. TransN /
+XRotN / YRotN in an animation without them), or outside XRotN's subtree for the Shield actions.
+Ticking a hidden part's flag unlocks its bone. The tree comes from the manifest's `joint_tree`
+(armature `n64_joint_tree`); .blends built before it read it once from the export's fighter files.
+Only the bones locked this way are unlocked again (your own locks stay).

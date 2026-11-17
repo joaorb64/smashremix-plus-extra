@@ -51,42 +51,51 @@ def hidden_parts(f):
     """attr->hiddenparts: [(root_joint_id, parent_joint_id, partindex, joint_kind)]. The table
     has no stored length: it runs while the entries look like ones."""
     hp = f.ptr_main(f.attr + A_HIDDENPARTS)
-    if hp is None or hp[0] != 'main':
+    if hp is None:
         return []
+    d = f.main if hp[0] == 'main' else f.char        # (character.bin: a table the import grew)
     out = []
     for k in range(HIDDEN_MAX):
         o = hp[1] + 16 * k
-        if o + 16 > len(f.main):
+        if o + 16 > len(d):
             break
-        root, parent, part, kind = struct.unpack_from('>4i', f.main, o)
+        root, parent, part, kind = struct.unpack_from('>4i', d, o)
         if not (0 < root < 40 and 0 <= parent < 40 and 0 <= kind <= 3):
             break
         out.append((root, parent, part, kind))
     return out
 
 
-def guard_tree(f, flags=GUARD_FLAGS):
-    """The fighter's joint tree while it guards: {fp->joints index: [children]} (in order), as
-    ftManagerMakeFighter (lbCommonSetupFighterPartsDObjs: the setup_parts joints, each the last
-    child of the latest joint one level up) and ftMainAddHiddenPartID (the hidden parts whose
-    bit is set in the motion flags) build it."""
+def tree_data(f):
+    """What guard_tree needs, JSON-able (the .blend keeps it on the fighter's armature,
+    n64_joint_tree, for n64_panel's copy of tree_from_data): setup = [[fp->joints index,
+    depth]] of the joints setup_parts creates, in order; hidden = [[root, parent, kind]]; all =
+    [[index, depth]] of every DObjDesc entry."""
     joints = f.details['hi']['joints']
     sp = f.ptr_main(f.attr + A_SETUP_PARTS)
     words = struct.unpack_from('>2I', f.main, sp[1]) if sp and sp[0] == 'main' else (0xFFFFFFFF, 0xFFFFFFFF)
-    kids = {0: []}
-    last_at = {}
+    setup = []
     for i, j in enumerate(joints):
         w = words[0] if i < 32 else words[1]
-        if not (w >> (31 - i % 32)) & 1:
-            continue
-        g = i + MF.JOINT_COMMON_START
-        parent = 0 if j.depth == 0 else last_at.get(j.depth - 1)
+        if (w >> (31 - i % 32)) & 1:
+            setup.append([i + MF.JOINT_COMMON_START, j.depth])
+    hidden = [[root, parent, kind] for root, parent, _, kind in hidden_parts(f)]
+    every = [[i + MF.JOINT_COMMON_START, j.depth] for i, j in enumerate(joints)]   # (setup bits edited)
+    return dict(setup=setup, hidden=hidden, all=every)
+
+
+def tree_from_data(data, flags=GUARD_FLAGS):
+    """guard_tree from tree_data(f) (n64_panel.py has a copy: keep them the same)."""
+    kids = {0: []}
+    last_at = {}
+    for g, depth in data['setup']:
+        parent = 0 if depth == 0 else last_at.get(depth - 1)
         if parent is None:
             continue
         kids.setdefault(parent, []).append(g)
         kids[g] = []
-        last_at[j.depth] = g
-    for i, (root, parent, _, kind) in enumerate(hidden_parts(f)):
+        last_at[depth] = g
+    for i, (root, parent, kind) in enumerate(data['hidden']):
         if i >= 32 or not (flags >> (31 - i)) & 1 or parent not in kids or root in kids:
             continue
         ch = kids[parent]
@@ -103,6 +112,14 @@ def guard_tree(f, flags=GUARD_FLAGS):
             kids[root] = list(ch)
             kids[parent] = [root]
     return kids
+
+
+def guard_tree(f, flags=GUARD_FLAGS):
+    """The fighter's joint tree while it guards: {fp->joints index: [children]} (in order), as
+    ftManagerMakeFighter (lbCommonSetupFighterPartsDObjs: the setup_parts joints, each the last
+    child of the latest joint one level up) and ftMainAddHiddenPartID (the hidden parts whose
+    bit is set in the motion flags) build it."""
+    return tree_from_data(tree_data(f), flags)
 
 
 def walk(kids, root):

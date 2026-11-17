@@ -466,6 +466,13 @@ def main(argv=None):
         raise SystemExit('could not read the base model DL prologue')
     prologue = set_lights(prologue, textures.lights)
 
+    # attributes that name joints (Bone > N64 Joint, Armature > N64 Fighter Joints): what changed
+    import gamedata as GD
+    import jointattrs as JAT
+    gd_ = GD._load_work(a.work_dir) or {}
+    orig_ja = (getattr(textures, 'manifest', None) or {}).get('joint_attrs')
+    ja_plan = JAT.plan(f, gd_['joint_attrs'], orig_ja) if gd_.get('joint_attrs') and orig_ja else JAT.Plan()
+
     def build(base_len, quiet=False):
         """The new model as data appended at base_len -> (blob, {main.bin field: new target})."""
         def say(*x):
@@ -473,6 +480,8 @@ def main(argv=None):
                 print(*x)
         blob = GW.Blob(base_len + (-base_len) % 8)
         retarget = {}                                        # main.bin external field -> new char target
+        for fld_, data_ in ja_plan.new.items():              # joint attribute tables moved / added
+            retarget[fld_] = blob.add(data_, 4)
         body_mats = {}                                       # detail -> {joint: MObj list order}
 
         # ---- materials: MObjSub (original, or a template) + image / palette lists + costume scripts
@@ -656,6 +665,8 @@ def main(argv=None):
     _, replaced = build(len(f.char), quiet=True)
     main = bytearray(f.main)
     char = bytearray(f.char)
+    for fld_ in ja_plan.unlink:              # joint attribute tables that move to character.bin
+        JAT.unlink_internal(main, mi_head, fld_)       # (f keeps reading the base file's tables)
     if not a.no_gc:
         keep = [fld for fld in char_fields_of(main, reqlist_lines) if fld not in replaced]
         res = ge.gc(bytes(char), [0, ci_head] + [f.main_ext[fld] for fld in keep], head=ci_head)
@@ -686,6 +697,10 @@ def main(argv=None):
         struct.pack_into('>H', main, fld + 2, tgt // 4)
     if added:
         print(f'  {added} new pointers into character.bin (main_reqlist.txt gets {added} more lines)')
+    for fld_ in ja_plan.new:              # f stays the base fighter (its tables: the base files')
+        if fld_ in f.main_int or f.ptr_main(fld_) is None or fld_ in ja_plan.unlink or \
+                MF.u32(f.main, fld_) == 0:
+            f.main_ext.pop(fld_, None)
 
     # ---- remove what nothing reaches anymore (roots: main.bin's pointers into character.bin)
     if not a.no_gc:
@@ -701,8 +716,13 @@ def main(argv=None):
         newc = res.data
     if len(newc) > 0x3FFFC:
         raise SystemExit(f'character.bin is {len(newc)} bytes: over the 0x3FFFC limit')
+    for off_, data_ in ja_plan.writes:
+        main[off_:off_ + len(data_)] = data_
+    if ja_plan.notes:
+        print('  joint attributes: ' + '; '.join(ja_plan.notes))
+    elif gd_.get('joint_attrs'):
+        print('  joint attributes: unchanged')
     # hurtboxes (the .blend's Hurtboxes): main.bin, and config.yaml's list when it has one
-    import gamedata as GD
     msg = GD.apply_hurtboxes(f, main, cfg, a.work_dir, getattr(textures, 'manifest', None) or {},
                              os.path.join(a.char_dir, 'config.yaml'), write_cfg=a.out is None)
     if msg:

@@ -489,4 +489,152 @@ def collect():
         out['hurtboxes'] = collect_hurtboxes()
     if bpy.data.collections.get('Collision') or bpy.data.collections.get('Stage objects'):
         out['stage_collision'] = collect_stage()
+    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and not o.get('n64_reference')
+                and 'n64_joint_attrs_orig' in o.data.keys()), None)
+    if arm is not None:
+        out['joint_attrs'] = collect_joint_attrs(arm)
+    return out
+
+
+# ---------------------------------------------------------------------------- joint attributes
+# (jointattrs.py: the FTAttributes fields that name joints; edited on the bones / armature,
+# n64_panel.py: Bone > N64 Joint, Armature > N64 Fighter Joints). Joints are kept by bone name
+# (TopN: not a bone), the ids only in the files.
+
+JOINT_ROOTS = {0: 'TopN', 1: 'TransN', 2: 'XRotN', 3: 'YRotN'}
+EFFECT_SLOTS = 5
+
+
+def bone_of_joint(g):
+    return JOINT_ROOTS.get(g) or f'joint_{g - 4:02d}'
+
+
+def joint_of_bone(name):
+    """Bone name -> game joint id (None: not a joint)."""
+    for g, n in JOINT_ROOTS.items():
+        if n == name:
+            return g
+    m = re.match(r'joint_(\d+)$', name or '')
+    return int(m.group(1)) + 4 if m else None
+
+
+def apply_joint_attrs(arm, ja):
+    """Manifest 'joint_attrs' -> the armature's / bones' properties (n64_*)."""
+    import json
+    ad = arm.data
+    ad['n64_joint_attrs_orig'] = json.dumps(ja)
+    for i in range(EFFECT_SLOTS):
+        ad[f'n64_effect_joint_{i}'] = bone_of_joint(ja['effect'][i])
+    ad['n64_item_heavy'] = bone_of_joint(ja['item_heavy'])
+    ad['n64_item_light'] = bone_of_joint(ja['item_light'])
+    for s in ('r', 'l'):
+        ad[f'n64_foot_{s}'] = bone_of_joint(ja['foot'][s])
+        ad[f'n64_foot_{s}_len'] = float(ja['foot'][f'{s}_len'])
+    for k, (g, hi, lo) in enumerate(ja.get('texture_parts') or []):
+        ad[f'n64_texpart_{k}_joint'] = bone_of_joint(g) if g >= 4 else ''
+        ad[f'n64_texpart_{k}_hi'], ad[f'n64_texpart_{k}_lo'] = hi, lo
+    if ja.get('access_joint') is not None:
+        ad['n64_access_joint'] = bone_of_joint(ja['access_joint'])
+    hidden = {h[0]: (i, h) for i, h in enumerate(ja.get('hidden') or [])}
+    ts = ja.get('translate_scales')
+    for b in ad.bones:
+        g = joint_of_bone(b.name)
+        if g is None:
+            continue
+        if g >= 4:
+            i = g - 4
+            b['n64_setup'] = bool(ja['setup'] and (ja['setup'][i // 32] >> (31 - i % 32)) & 1)
+            if ja.get('animlock'):
+                b['n64_animlock'] = bool((ja['animlock'][i // 32] >> (31 - i % 32)) & 1)
+        b['n64_translate_scale'] = list(ts[g]) if ts and g < len(ts) else [1.0, 1.0, 1.0]
+        if g in hidden:
+            i, (root, parent, init, kind) = hidden[g]
+            b['n64_hidden_index'] = i
+            b['n64_hidden_parent'] = bone_of_joint(parent)
+            b['n64_hidden_kind'] = kind
+            b['n64_hidden_init'] = bool(init)
+        else:
+            b['n64_hidden_index'] = -1
+
+
+def collect_joint_attrs(arm):
+    """The armature's properties -> jointattrs dict (game joint ids), or None (not built with them)."""
+    import json
+    ad = arm.data
+    if 'n64_joint_attrs_orig' not in ad.keys():
+        return None
+    orig = json.loads(ad['n64_joint_attrs_orig'])
+
+    def jid(prop, default):
+        name = ad.get(prop, '')
+        g = joint_of_bone(name)
+        if g is None or (g > 0 and name not in ad.bones):
+            raise SystemExit(f'Armature > N64 Fighter Joints: {prop[4:]} = {name!r} is not a joint bone')
+        return g if name else default
+
+    out = dict(joints=orig.get('joints'))
+    out['effect'] = [jid(f'n64_effect_joint_{i}', orig['effect'][i]) for i in range(EFFECT_SLOTS)]
+    out['item_heavy'] = jid('n64_item_heavy', orig['item_heavy'])
+    out['item_light'] = jid('n64_item_light', orig['item_light'])
+    out['foot'] = {}
+    for s in ('r', 'l'):
+        out['foot'][s] = jid(f'n64_foot_{s}', orig['foot'][s])
+        out['foot'][f'{s}_len'] = float(ad.get(f'n64_foot_{s}_len', orig['foot'][f'{s}_len']))
+    if orig.get('texture_parts') is not None:
+        tps = []
+        for k, o in enumerate(orig['texture_parts']):
+            name = ad.get(f'n64_texpart_{k}_joint', '')
+            if not name:                               # unused slot: as it was
+                tps.append(list(o))
+                continue
+            tps.append([jid(f'n64_texpart_{k}_joint', o[0]), int(ad.get(f'n64_texpart_{k}_hi', o[1])),
+                        int(ad.get(f'n64_texpart_{k}_lo', o[2]))])
+        out['texture_parts'] = tps
+    if orig.get('access_joint') is not None:
+        out['access_joint'] = jid('n64_access_joint', orig['access_joint'])
+    n = orig.get('joints') or 0
+    bits_s, bits_a = [False] * n, [False] * n
+    ts = [list(v) for v in (orig.get('translate_scales') or [[1.0, 1.0, 1.0]] * 37)]
+    hidden = []
+    for b in ad.bones:
+        g = joint_of_bone(b.name)
+        if g is None:
+            continue
+        if 4 <= g < n + 4:
+            bits_s[g - 4] = bool(b.get('n64_setup', False))
+            bits_a[g - 4] = bool(b.get('n64_animlock', False))
+        if g < len(ts):
+            ts[g] = [float(x) for x in b.get('n64_translate_scale', ts[g])]
+        i = int(b.get('n64_hidden_index', -1))
+        if i >= 0:
+            parent = b.get('n64_hidden_parent', 'TopN') or 'TopN'
+            pg = joint_of_bone(parent)
+            if pg is None:
+                raise SystemExit(f'bone {b.name}: hidden part parent {parent!r} is not a joint bone')
+            hidden.append((i, [g, pg, 1 if b.get('n64_hidden_init', True) else 0, int(b.get('n64_hidden_kind', 0))]))
+    hidden.sort()
+    if [i for i, _ in hidden] != list(range(len(hidden))):
+        raise SystemExit('hidden parts: their indices (Bone > N64 Joint) must be 0, 1, 2... without gaps '
+                         f'(they are {[i for i, _ in hidden]})')
+    out['hidden'] = [h for _, h in hidden]
+
+    def words(bits):
+        w = [0, 0]
+        for i, on in enumerate(bits):
+            if on:
+                w[i // 32] |= 1 << (31 - i % 32)
+        return w
+    # bits past the joints (and in a word the fighter's joints don't reach) as they were
+    def merged(bits, o):
+        if o is None:
+            return words(bits) if any(bits) else None
+        w = words(bits)
+        keep = [o[0], o[1]]
+        for i in range(n):
+            keep[i // 32] &= ~(1 << (31 - i % 32))
+        return [w[0] | keep[0], w[1] | keep[1]]
+    out['setup'] = merged(bits_s, orig.get('setup'))
+    out['animlock'] = merged(bits_a, orig.get('animlock'))
+    out['translate_scales'] = ts if (orig.get('translate_scales') is not None or
+                                     any(abs(x - 1.0) > 1e-5 for v in ts for x in v)) else None
     return out

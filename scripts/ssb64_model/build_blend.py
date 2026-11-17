@@ -330,6 +330,8 @@ if arm is not None and not IS_STAGE and not man.get('object'):
     # (fighters, with or without animations: the N64 Animation panel, Load Animation .bin)
     arm['n64_hidden_parts'] = list(man.get('hidden_parts') or [])
     arm['n64_hidden_part_parents'] = list(man.get('hidden_part_parents') or [])
+    if man.get('joint_tree'):              # (n64_panel: lock / hide the bones an animation leaves out)
+        arm['n64_joint_tree'] = json.dumps(man['joint_tree'])
 SHIELD = man.get('shield')
 if SHIELD and arm is not None:
     # The shield pose (shieldpose.py): actions 'Shield' (frame = stick angle in degrees: 0
@@ -688,6 +690,8 @@ if not os.environ.get('N64_NO_VIEW'):
 # hurtboxes (fighters), collision lines / map objects / spawns / bounds (stages): objects to edit
 import blend_gamedata as GDB  # noqa: E402
 GDB.build(man)
+if arm is not None and man.get('joint_attrs') and not IS_STAGE and not man.get('object'):
+    GDB.apply_joint_attrs(arm, man['joint_attrs'])      # (Bone > N64 Joint, Armature > N64 Fighter Joints)
 for ob in bpy.data.objects:
     if ob.get('n64_gamedata') == 'collision_group':
         PANEL._set_collision_group_renderer(ob)

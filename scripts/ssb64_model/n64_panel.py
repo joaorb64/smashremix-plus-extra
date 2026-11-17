@@ -1362,6 +1362,15 @@ PROPS = {
     'n64ui_shadow': hex_color('n64_shadow_color', '808080', name='Shadow Color',
                               description='Color of the side facing away from the light (ambient)'),
 }
+def _lock_toggle_get(self):
+    return bool(self.get('n64_lock_unused_bones', True))
+
+
+def _lock_toggle_set(self, on):
+    self['n64_lock_unused_bones'] = bool(on)
+    _sync_bone_locks(self)
+
+
 SCENE_PROPS = {
     'n64ui_light': hex_color('n64_light_color', 'FFFFFF', name='Light Color',
                              description='The model\'s light color: the lit side of every material '
@@ -1369,6 +1378,12 @@ SCENE_PROPS = {
     'n64ui_shadow': hex_color('n64_shadow_color', '808080', name='Shadow Color',
                               description='The model\'s shadow (ambient) color: the side facing away from '
                                           'the light'),
+    'n64ui_lock_unused_bones': bpy.props.BoolProperty(
+        get=_lock_toggle_get, set=_lock_toggle_set, name='Lock Bones Not in This Animation',
+        description='Lock and hide the bones the active animation\'s file has no script for (its motion '
+                    'flags leave them out of its joint tree: TopN\'s other joints, hidden parts whose bit is '
+                    'off); Save Animation .bin would drop their animation. Also locks (still shown) the '
+                    'animation-locked bones when the flags lack 0x1: the game freezes them'),
 }
 
 
@@ -1773,11 +1788,224 @@ def _follow_action_range(scene):
                 scene.frame_current = scene.frame_start
 
 
+
+# ---- bones an animation can't move: locked and hidden -------------------------------------
+# A fighter animation file has a script per joint of the tree its motion flags build (figatree.
+# joint_order: TopN's first child, depth first; hidden parts only when their bit is on); the
+# shield actions cover XRotN's subtree with the guard flags. The other bones are left out by
+# Save Animation .bin, so they're locked (transform locks) and hidden while that action is on.
+
+_GUARD_FLAGS = 0xA0000000
+_ROOT_NAMES = {1: 'TransN', 2: 'XRotN', 3: 'YRotN'}
+_LOCK_STATE = {}            # armature name -> what its locks were last set for
+_TREE_FAILED = set()        # armatures whose joint tree couldn't be found (older .blends)
+
+
+def _joint_bone(g):
+    return _ROOT_NAMES.get(g) or f'joint_{g - 4:02d}'
+
+
+def _tree_from_data(data, flags):
+    """shieldpose.tree_from_data (a copy: the .blend's embedded panel runs without the tools)."""
+    kids = {0: []}
+    last_at = {}
+    for g, depth in data['setup']:
+        parent = 0 if depth == 0 else last_at.get(depth - 1)
+        if parent is None:
+            continue
+        kids.setdefault(parent, []).append(g)
+        kids[g] = []
+        last_at[depth] = g
+    for i, (root, parent, kind) in enumerate(data['hidden']):
+        if i >= 32 or not (flags >> (31 - i)) & 1 or parent not in kids or root in kids:
+            continue
+        ch = kids[parent]
+        if kind == 0:
+            ch.append(root)
+            kids[root] = []
+        elif kind == 1:
+            ch.insert(0, root)
+            kids[root] = []
+        elif kind == 2:
+            ch.insert(1 if ch else 0, root)
+            kids[root] = []
+        else:
+            kids[root] = list(ch)
+            kids[parent] = [root]
+    return kids
+
+
+def _walk(kids, root):
+    out, stack = [], [root]
+    while stack:
+        n = stack.pop()
+        out.append(n)
+        stack.extend(reversed(kids.get(n, [])))
+    return out
+
+
+def _joint_tree(arm):
+    """The armature's n64_joint_tree; .blends built before it: read once from the export."""
+    import json
+    if 'n64_joint_tree' in arm.keys():
+        try:
+            return json.loads(arm['n64_joint_tree'])
+        except (TypeError, ValueError):
+            return None
+    if arm.name in _TREE_FAILED:
+        return None
+    try:
+        import sys
+        d = bpy.context.scene.get('n64_tools_dir') or os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import anim_load
+        import shieldpose
+        data = shieldpose.tree_data(anim_load.load_fighter(anim_load.export_dir_of(bpy.context.scene)))
+        arm['n64_joint_tree'] = json.dumps(data)
+        return data
+    except Exception as e:                      # noqa: BLE001 (no export / tools: nothing locked)
+        print('N64: bone locks off, no joint tree:', e)
+        _TREE_FAILED.add(arm.name)
+        return None
+
+
+def _bone_joint(name):
+    """Bone name -> game joint id (TopN 0; None: not a joint)."""
+    if name == 'TopN':
+        return 0
+    for g, n in _ROOT_NAMES.items():
+        if n == name:
+            return g
+    m = re.match(r'joint_(\d+)$', name or '')
+    return int(m.group(1)) + 4 if m else None
+
+
+def _has_joint_attrs(arm):
+    return arm is not None and arm.type == 'ARMATURE' and 'n64_joint_attrs_orig' in arm.data.keys()
+
+
+def _hidden_live(arm):
+    """The hidden parts as the bones have them now: [(root bone, parent bone, kind, init)] by index;
+    None: the armature wasn't built with joint attributes."""
+    if not _has_joint_attrs(arm):
+        return None
+    out = sorted((int(b.get('n64_hidden_index', -1)), b.name, b.get('n64_hidden_parent', 'TopN') or 'TopN',
+                  int(b.get('n64_hidden_kind', 0)), bool(b.get('n64_hidden_init', True)))
+                 for b in arm.data.bones if int(b.get('n64_hidden_index', -1)) >= 0)
+    return [x[1:] for x in out]
+
+
+def _hidden_names(ob):
+    """(hidden part root bones, their parents) in motion-flag bit order."""
+    if ob is None:
+        return [], []
+    live = _hidden_live(ob)
+    if live is not None:
+        return [h[0] for h in live], [h[1] for h in live]
+    return list(ob.get('n64_hidden_parts') or []), list(ob.get('n64_hidden_part_parents') or [])
+
+
+def _live_tree(arm, data):
+    """The joint tree data with the bones' edited setup bits / hidden parts."""
+    live = _hidden_live(arm)
+    if live is None or not data.get('all'):
+        return data
+    bones = arm.data.bones
+    setup = [[g, d] for g, d in data['all']
+             if (b := bones.get(_joint_bone(g))) is not None and b.get('n64_setup', False)]
+    hidden = [[_bone_joint(r), _bone_joint(p), k] for r, p, k, _ in live
+              if _bone_joint(r) is not None and _bone_joint(p) is not None]
+    return dict(data, setup=setup, hidden=hidden)
+
+
+def _animated_bones(arm, act):
+    """Bone names act's file can drive; None: no limit (no action, no joint tree)."""
+    if act is None:
+        return None
+    data = _joint_tree(arm)
+    if data is None:
+        return None
+    data = _live_tree(arm, data)
+    # bones that aren't game joints (IK targets / poles, helpers the user added) are never limited
+    joints = {_joint_bone(g) for g, _ in data['setup']} | {_joint_bone(h[0]) for h in data['hidden']}
+    extra = {pb.name for pb in arm.pose.bones if pb.name not in joints}
+    if act.name in ('Shield', 'Shield Neutral'):
+        flags, root = _GUARD_FLAGS, 2
+    else:
+        flags, root = _action_flags(act), None
+    kids = _tree_from_data(data, flags)
+    if root is None:
+        top = kids.get(0) or []
+        if not top:
+            return extra
+        root = top[0]
+    elif root not in kids:
+        return extra
+    return extra | {_joint_bone(g) for g in _walk(kids, root)}
+
+
+def _set_bone_locked(pb, on, hide=None):
+    pb.lock_location = pb.lock_rotation = pb.lock_scale = (on, on, on)
+    pb.lock_rotation_w = on
+    pb.lock_rotations_4d = on
+    pb.bone.hide = on if hide is None else hide
+
+
+def _anim_locked_bones(arm, act):
+    """Bones the game freezes in act (attributes animlock, Bone > N64 Joint > Animation Lock): every
+    motion without flag 0x1 (ftMainSetStatus: ftParamSetAnimLocks; the guard animations too, so the
+    Shield actions) keeps their matrix as it was and ignores their scripts."""
+    if act is None or not _has_joint_attrs(arm):
+        return set()
+    flags = _GUARD_FLAGS if act.name in ('Shield', 'Shield Neutral') else _action_flags(act)
+    if flags & 0x1:
+        return set()
+    return {b.name for b in arm.data.bones if b.get('n64_animlock', False)}
+
+
+def _sync_bone_locks(scene):
+    on = scene.get('n64_lock_unused_bones', True)
+    for arm in scene.objects:
+        if arm.type != 'ARMATURE' or 'n64_hidden_parts' not in arm.keys() or arm.mode == 'EDIT':
+            continue
+        act = arm.animation_data.action if arm.animation_data is not None else None
+        key = (act.name if act is not None else None, _action_flags(act) if act is not None else 0, bool(on),
+               len(arm.pose.bones), str(_hidden_live(arm)),
+               tuple(b.name for b in arm.data.bones if b.get('n64_setup', False)),
+               tuple(b.name for b in arm.data.bones if b.get('n64_animlock', False)))
+        if _LOCK_STATE.get(arm.name) == key:
+            continue
+        _LOCK_STATE[arm.name] = key
+        allowed = _animated_bones(arm, act) if on else None
+        # name -> hidden too: bones the file leaves out are hidden; animation-locked ones stay visible
+        # (the game still draws them, frozen)
+        want = {} if allowed is None else {pb.name: True for pb in arm.pose.bones if pb.name not in allowed}
+        if on:
+            for name in _anim_locked_bones(arm, act):
+                want.setdefault(name, False)
+        had = set(arm.get('n64_locked_bones') or [])
+        had_hidden = set(arm.get('n64_hidden_bones') or had)        # (older files: every locked one hidden)
+        if set(want) == had and {n for n, h in want.items() if h} == had_hidden:
+            continue
+        for name in had - set(want):            # only the bones locked here (not the user's own locks)
+            pb = arm.pose.bones.get(name)
+            if pb is not None:
+                _set_bone_locked(pb, False)
+        for name, hide in want.items():
+            pb = arm.pose.bones.get(name)
+            if pb is not None:
+                _set_bone_locked(pb, True, hide)
+        arm['n64_locked_bones'] = sorted(want)
+        arm['n64_hidden_bones'] = sorted(n for n, h in want.items() if h)
+
+
 def _sync_loops_on_update(scene, depsgraph):
     _sync_vs_screen(scene)
     if depsgraph.id_type_updated('ACTION') or depsgraph.id_type_updated('OBJECT'):
         sync_loops()
         _follow_action_range(scene)
+        _sync_bone_locks(scene)
 
 
 def _last_key(fcurves):
@@ -1873,7 +2101,8 @@ MODE_FLAGS = (
     (0x04, 'No Translate Scales', 'Joint translations aren\'t scaled by the fighter\'s translate_scales '
                                   '(only matters for fighters that have them)'),
     (0x02, 'Shield Pose File', 'The animation is read from the shield-pose file (guard on / off)'),
-    (0x01, 'Animation Locks', 'The fighter\'s locked joints (attributes animlock) are animated too'),
+    (0x01, 'Animation Locks', 'The fighter\'s locked joints (attributes animlock, Bone > N64 Joint) are animated '
+                              'too; off: the game freezes them and Blender locks their bones'),
 )
 HIDDEN_DESC = {
     'TransN': 'Root motion: the game moves the fighter by its translation',
@@ -2067,6 +2296,7 @@ def draw_motion_flags(lay, context):
         lay.label(text='Pick a fighter animation in the Action Editor', icon='INFO')
         return
     lay.label(text=act.name, icon='ACTION')
+    lay.prop(context.scene, 'n64ui_lock_unused_bones')
     if act.get('n64_actions'):
         col = lay.column(align=True)
         col.label(text='Played by:')
@@ -2077,11 +2307,10 @@ def draw_motion_flags(lay, context):
     if act.get('n64_flags_guessed'):
         lay.label(text='Guessed from the file\'s joint count', icon='QUESTION')
     v = _action_flags(act)
-    parts = list(ob.get('n64_hidden_parts') or []) if ob is not None else []
+    parts, parents = _hidden_names(ob)
     box = lay.box()
     box.label(text='Joints added (hidden parts)', icon='BONE_DATA')
     col = box.column(align=True)
-    parents = list(ob.get('n64_hidden_part_parents') or []) if ob is not None else []
     for i, name in enumerate(parts[:27]):
         bit = 31 - i
         r = col.row()
@@ -3680,11 +3909,315 @@ class N64_PT_gamedata(bpy.types.Panel):
             lay.label(text=f'{ob.name}: scale / move its points (Edit Mode)', icon='SELECT_SET')
 
 
+# ---- joint attributes (jointattrs.py): Bone > N64 Joint, Armature > N64 Fighter Joints -------
+
+HIDDEN_KINDS = (('0', 'Last Child', 'Added as its parent\'s last child', 0),
+                ('1', 'First Child', 'Added as its parent\'s first child', 1),
+                ('2', 'After First Child', 'Added right after its parent\'s first child', 2),
+                ('3', 'Between Parent and Children', 'Inserted between its parent and the parent\'s children '
+                                                     '(they hang from it)', 3))
+EFFECT_SLOTS = 5
+
+
+def _joint_attr_changed(self, context):
+    _LOCK_STATE.clear()
+
+
+def _idp(kind, key, default, **kw):
+    """A bpy property kept in the ID's own custom property `key` (what build_blend.py /
+    blend_gamedata.py read and write: Blender 5 keeps bpy.props values apart from custom ones)."""
+    def get(self):
+        v = self.get(key, default)
+        if kind is bpy.props.FloatVectorProperty:
+            return tuple(float(x) for x in v)
+        if kind is bpy.props.EnumProperty:
+            return int(v)
+        if kind is bpy.props.BoolProperty:
+            return bool(v)
+        return v
+
+    def set(self, v):
+        self[key] = list(v) if kind is bpy.props.FloatVectorProperty else v
+        _LOCK_STATE.clear()
+    if kind is not bpy.props.EnumProperty:
+        kw['default'] = default
+    return kind(get=get, set=set, **kw)
+
+
+def _joint_bone_props():
+    return {
+        'n64_setup': _idp(
+            bpy.props.BoolProperty, 'n64_setup', True, name='Created With the Fighter',
+            description='setup_parts (attributes + 0x29C): the joint exists from the start. Off: withheld - it '
+                        'exists only while a hidden part adds it (its motion flag), or never'),
+        'n64_animlock': _idp(
+            bpy.props.BoolProperty, 'n64_animlock', False, name='Animation Lock',
+            description='animlock (attributes + 0x2A0): in motions without flag 0x1 (Animation Locks), the game '
+                        'freezes this joint as it was and ignores its animation; Blender locks the bone in those '
+                        'actions'),
+        'n64_translate_scale': _idp(
+            bpy.props.FloatVectorProperty, 'n64_translate_scale', (1.0, 1.0, 1.0), name='Translate Scale', size=3,
+            subtype='XYZ',
+            description='translate_scales (attributes + 0x324): the joint\'s animated translation is scaled by '
+                        'this (not with motion flag 0x4). Any value other than 1 makes the fighter use the table'),
+        'n64_hidden_index': _idp(
+            bpy.props.IntProperty, 'n64_hidden_index', -1, name='Hidden Part', min=-1, max=31,
+            description='hiddenparts (attributes + 0x2D0): motion flag bit 31 - index adds this joint'),
+        'n64_hidden_parent': _idp(
+            bpy.props.StringProperty, 'n64_hidden_parent', 'TopN', name='Parent',
+            description='The joint it is added under (TopN: the fighter\'s top joint)'),
+        'n64_hidden_kind': _idp(bpy.props.EnumProperty, 'n64_hidden_kind', 0, name='Placement', items=HIDDEN_KINDS,
+                                                  description='Where among the parent\'s children it goes'),
+        'n64_hidden_init': _idp(
+            bpy.props.BoolProperty, 'n64_hidden_init', True, name='Init Transform',
+            description='The hidden part entry\'s third word: nonzero gives the joint transform kind 0x4B '
+                        '(every vanilla part but TransN)'),
+    }
+
+
+def _bone_slot(name, desc, key):
+    return _idp(bpy.props.StringProperty, key, '', name=name, description=desc)
+
+
+def _armature_props():
+    d = {}
+    for i in range(EFFECT_SLOTS):
+        d[f'n64_effect_joint_{i}'] = _bone_slot(
+            f'Effect Joint {i + 1}', 'effect_joint_ids (attributes + 0x2A4): the game cycles through these 5 joints '
+                                     'for some effects (electric / flame hits)', f'n64_effect_joint_{i}')
+    d['n64_item_heavy'] = _bone_slot('Heavy Item', 'joint_itemheavy_id (attributes + 0x334): where crates / barrels '
+                                                   'are carried', 'n64_item_heavy')
+    d['n64_item_light'] = _bone_slot('Light Item', 'joint_itemlight_id (attributes + 0x33C): the hand that holds '
+                                                   'light items (Ray Gun, Beam Sword...)', 'n64_item_light')
+    for s, side in (('r', 'Right'), ('l', 'Left')):
+        d[f'n64_foot_{s}'] = _bone_slot(f'{side} Thigh', f'joint_{s}foot_id: the {side.lower()} leg\'s top joint '
+                                                         'for the slope foot IK (thigh -> hip -> knee -> ankle)',
+                                        f'n64_foot_{s}')
+        d[f'n64_foot_{s}_len'] = _idp(
+            bpy.props.FloatProperty, f'n64_foot_{s}_len', 0.0, name=f'{side} Shin Point', description='joint_*foot_rotate: how far down the shin the IK moves '
+                                                   '(about 0.925 of the knee -> ankle distance)')
+    for k in range(2):
+        d[f'n64_texpart_{k}_joint'] = _bone_slot(f'Expression {k + 1} Joint', 'textureparts (attributes + 0x330): '
+                                                 'the joint whose material swaps image (empty: unused)',
+                                                 f'n64_texpart_{k}_joint')
+        d[f'n64_texpart_{k}_hi'] = _idp(bpy.props.IntProperty, f'n64_texpart_{k}_hi', 0, name='Material (hi)',
+                                        min=0, max=255,
+                                                         description='Index of the swapping material on that joint')
+        d[f'n64_texpart_{k}_lo'] = _idp(bpy.props.IntProperty, f'n64_texpart_{k}_lo', 0, name='Material (lo)',
+                                        min=0, max=255,
+                                                         description='The same, low detail model')
+    d['n64_access_joint'] = _bone_slot('Accessory Joint', 'accesspart (attributes + 0x32C): the joint the '
+                                                          'accessory part is drawn on', 'n64_access_joint')
+    return d
+
+
+JOINT_BONE_PROPS = _joint_bone_props()
+ARMATURE_PROPS = _armature_props()
+
+
+def _fighter_armature(context):
+    ob = context.object
+    if ob is not None and ob.type == 'ARMATURE' and _has_joint_attrs(ob):
+        return ob
+    return next((o for o in context.scene.objects if _has_joint_attrs(o)), None)
+
+
+def joint_roles(arm, name):
+    """What the game uses the joint for: [(text, icon)]."""
+    ad = arm.data
+    g = _bone_joint(name)
+    out = []
+    if name == 'TransN':
+        out.append(('Root motion (the game moves the fighter by its translation)', 'ORIENTATION_GLOBAL'))
+    for i in range(EFFECT_SLOTS):
+        if ad.get(f'n64_effect_joint_{i}') == name:
+            out.append((f'Effect joint {i + 1}', 'SHADERFX'))
+    if ad.get('n64_item_heavy') == name:
+        out.append(('Holds heavy items', 'PACKAGE'))
+    if ad.get('n64_item_light') == name:
+        out.append(('Holds light items', 'TOOL_SETTINGS'))
+    for s, side in (('r', 'Right'), ('l', 'Left')):
+        if ad.get(f'n64_foot_{s}') == name:
+            out.append((f'{side} thigh (slope foot IK)', 'CON_KINEMATIC'))
+    for k in range(2):
+        if ad.get(f'n64_texpart_{k}_joint') == name:
+            out.append((f'Expression {k + 1} (material {ad.get(f"n64_texpart_{k}_hi", 0)})', 'IMAGE_DATA'))
+    if ad.get('n64_access_joint') == name and 'n64_access_joint' in ad.keys():
+        out.append(('Accessory part', 'MOD_CLOTH'))
+    b = ad.bones.get(name)
+    if b is not None and int(b.get('n64_hidden_index', -1)) >= 0:
+        i = int(b['n64_hidden_index'])
+        out.append((f'Hidden part {i} (motion flag {1 << (31 - i):08X})', 'HIDE_OFF'))
+    elif b is not None and g is not None and g >= 4 and not b.get('n64_setup', True):
+        out.append(('Withheld: never created (not set up, no hidden part adds it)', 'ERROR'))
+    nh = len(hurtbox_objects(name))
+    if nh:
+        out.append((f'{nh} hurtbox{"es" if nh > 1 else ""}', 'MESH_CUBE'))
+    if g is not None and g >= 4:
+        j = g - 4
+        parts = sorted({m.group(1) for o in bpy.data.objects
+                        if (m := re.match(rf'part(\d+)_(?:hi|lo)_j{j}$', o.name))})
+        if parts:
+            out.append((f'Model parts: variants {", ".join(parts)} (moveset model part events)', 'MESH_DATA'))
+        skel = sorted({m.group(1) for o in bpy.data.objects if (m := re.match(rf'skel(\d+)_j{j}$', o.name))})
+        if skel:
+            out.append((f'Electric skeleton: {", ".join(skel)}', 'OUTLINER_OB_ARMATURE'))
+    return out
+
+
+class N64_OT_hidden_part_add(bpy.types.Operator):
+    bl_idname = 'n64.hidden_part_add'
+    bl_label = 'Make Hidden Part'
+    bl_description = ('This joint becomes the fighter\'s next hidden part: a motion flag bit adds it (it\'s no '
+                      'longer created with the fighter)')
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        arm = _fighter_armature(context)
+        b = arm.data.bones.get(_context_bone(context).name)
+        live = _hidden_live(arm)
+        if len(live) >= 27:
+            self.report({'ERROR'}, 'No motion flag bit left (27 hidden parts at most: the low 5 bits are modes)')
+            return {'CANCELLED'}
+        b['n64_hidden_index'] = len(live)
+        b['n64_hidden_parent'] = b.parent.name if b.parent is not None else 'TopN'
+        b['n64_hidden_kind'] = 0
+        b['n64_hidden_init'] = True
+        b['n64_setup'] = False
+        _LOCK_STATE.clear()
+        self.report({'INFO'}, f'{b.name}: hidden part {len(live)} (motion flag {1 << (31 - len(live)):08X})')
+        return {'FINISHED'}
+
+
+class N64_OT_hidden_part_remove(bpy.types.Operator):
+    bl_idname = 'n64.hidden_part_remove'
+    bl_label = 'Remove Hidden Part'
+    bl_description = ('This joint stops being a hidden part (only the last one: removing another would move the '
+                      'later parts to other motion flag bits)')
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        arm = _fighter_armature(context)
+        b = arm.data.bones.get(_context_bone(context).name)
+        live = _hidden_live(arm)
+        i = int(b.get('n64_hidden_index', -1))
+        if i != len(live) - 1:
+            self.report({'ERROR'}, f'Only the last hidden part ({live[-1][0]}) can be removed: the parts after '
+                                   'this one would move to other motion flag bits')
+            return {'CANCELLED'}
+        b['n64_hidden_index'] = -1
+        b['n64_setup'] = True
+        _LOCK_STATE.clear()
+        return {'FINISHED'}
+
+
+class N64_PT_bone_joint(bpy.types.Panel):
+    bl_label = 'N64 Joint'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'bone'
+
+    @classmethod
+    def poll(cls, context):
+        bone = _context_bone(context)
+        arm = context.object
+        return bone is not None and _has_joint_attrs(arm) and _bone_joint(bone.name) is not None
+
+    def draw(self, context):
+        lay = self.layout
+        arm = context.object
+        name = _context_bone(context).name
+        b = arm.data.bones[name]
+        g = _bone_joint(name)
+        lay.label(text=f'Game joint {g}' + (f' (DObjDesc {g - 4})' if g >= 4 else ''), icon='BONE_DATA')
+        roles = joint_roles(arm, name)
+        box = lay.box()
+        if roles:
+            for text, icon in roles:
+                box.label(text=text, icon=icon)
+        else:
+            box.label(text='No attribute names this joint', icon='INFO')
+        col = lay.column()
+        col.use_property_split = True
+        if arm.mode == 'EDIT':
+            lay.label(text='Pose or Object Mode to edit these', icon='INFO')
+            col.enabled = False
+        if g >= 4:
+            col.prop(b, 'n64_setup')
+            col.prop(b, 'n64_animlock')
+        col.prop(b, 'n64_translate_scale')
+        hb = lay.box()
+        if int(b.get('n64_hidden_index', -1)) >= 0:
+            hb.label(text=f'Hidden part {b["n64_hidden_index"]}: motion flag '
+                          f'{1 << (31 - int(b["n64_hidden_index"])):08X} adds it', icon='HIDE_OFF')
+            c = hb.column()
+            c.use_property_split = True
+            c.enabled = arm.mode != 'EDIT'
+            c.prop_search(b, 'n64_hidden_parent', arm.data, 'bones')
+            if b.get('n64_hidden_parent', 'TopN') == 'TopN':
+                c.label(text='TopN: the fighter\'s top joint')
+            c.prop(b, 'n64_hidden_kind')
+            c.prop(b, 'n64_hidden_init')
+            hb.operator('n64.hidden_part_remove', icon='X')
+        elif g >= 1:
+            hb.operator('n64.hidden_part_add', icon='HIDE_OFF')
+
+
+class N64_PT_fighter_joints(bpy.types.Panel):
+    bl_label = 'N64 Fighter Joints'
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'data'
+
+    @classmethod
+    def poll(cls, context):
+        return _has_joint_attrs(context.object)
+
+    def draw(self, context):
+        lay = self.layout
+        ad = context.object.data
+        col = lay.column()
+        col.use_property_split = True
+        col.label(text='Items', icon='PACKAGE')
+        col.prop_search(ad, 'n64_item_light', ad, 'bones')
+        col.prop_search(ad, 'n64_item_heavy', ad, 'bones')
+        col.separator()
+        col.label(text='Slope foot IK', icon='CON_KINEMATIC')
+        for s in ('r', 'l'):
+            col.prop_search(ad, f'n64_foot_{s}', ad, 'bones')
+            col.prop(ad, f'n64_foot_{s}_len')
+        col.separator()
+        col.label(text='Effect joints (cycled through)', icon='SHADERFX')
+        for i in range(EFFECT_SLOTS):
+            col.prop_search(ad, f'n64_effect_joint_{i}', ad, 'bones')
+        if any(f'n64_texpart_{k}_hi' in ad.keys() for k in range(2)):
+            col.separator()
+            col.label(text='Expressions (texture parts)', icon='IMAGE_DATA')
+            for k in range(2):
+                col.prop_search(ad, f'n64_texpart_{k}_joint', ad, 'bones')
+                r = col.row(align=True)
+                r.prop(ad, f'n64_texpart_{k}_hi')
+                r.prop(ad, f'n64_texpart_{k}_lo')
+        if 'n64_access_joint' in ad.keys():
+            col.separator()
+            col.prop_search(ad, 'n64_access_joint', ad, 'bones')
+        live = _hidden_live(context.object) or []
+        box = lay.box()
+        box.label(text=f'Hidden parts: {len(live)} (Bone > N64 Joint)', icon='HIDE_OFF')
+        for i, (root, parent, kind, _) in enumerate(live):
+            box.label(text=f'{i}  {1 << (31 - i):08X}  {root}  under {parent}  ({HIDDEN_KINDS[kind][1].lower()})')
+        withheld = [b.name for b in ad.bones if (_bone_joint(b.name) or 0) >= 4 and not b.get('n64_setup', True)
+                    and int(b.get('n64_hidden_index', -1)) < 0]
+        if withheld:
+            lay.label(text='Never created: ' + ', '.join(withheld), icon='ERROR')
+
+
 CLASSES = (N64_OT_vs_view, N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
            N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene, N64_PT_gamedata,
            N64_OT_hurtbox_add, N64_OT_hurtbox_remove, N64_OT_hurtbox_select, N64_PT_bone_hurtboxes,
            N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools,
-           N64_PT_motion_flags, N64_OT_anim_load_bin, N64_OT_anim_save_bin)
+           N64_PT_motion_flags, N64_OT_anim_load_bin, N64_OT_anim_save_bin,
+           N64_OT_hidden_part_add, N64_OT_hidden_part_remove, N64_PT_bone_joint, N64_PT_fighter_joints)
 
 
 def _collapse_visible_outliners():
@@ -3788,6 +4321,10 @@ def register():
     handlers.append(_sync_loops_on_update)
     for name, prop in SCENE_PROPS.items():
         setattr(bpy.types.Scene, name, prop)
+    for name, prop in JOINT_BONE_PROPS.items():
+        setattr(bpy.types.Bone, name, prop)
+    for name, prop in ARMATURE_PROPS.items():
+        setattr(bpy.types.Armature, name, prop)
     bpy.types.Scene.n64ui_vs_stage = bpy.props.EnumProperty(
         items=_vs_stage_items, get=_vs_stage_get, set=_vs_stage_set, name='CPU Stage',
         description='The 1P stage the CPU is met in: its VS screen camera')
@@ -3826,6 +4363,10 @@ def unregister():
     for name in SCENE_PROPS:
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)
+    for t, props in ((bpy.types.Bone, JOINT_BONE_PROPS), (bpy.types.Armature, ARMATURE_PROPS)):
+        for name in props:
+            if hasattr(t, name):
+                delattr(t, name)
     for name in COLLISION_SCENE_PROPS:
         if hasattr(bpy.types.Scene, name):
             delattr(bpy.types.Scene, name)

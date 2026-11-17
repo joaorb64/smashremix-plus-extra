@@ -852,6 +852,11 @@ class Exporter:
             # checkboxes)
             self.manifest['hidden_parts'] = [SP.joint_name(h[0]) for h in SP.hidden_parts(f)]
             self.manifest['hidden_part_parents'] = [SP.joint_name(h[1]) if h[1] else 'TopN' for h in SP.hidden_parts(f)]
+            # the joint tree per motion flags (Blender locks / hides the bones an animation leaves out)
+            self.manifest['joint_tree'] = SP.tree_data(f)
+            # the attributes that name joints (Blender: Bone > N64 Joint, Armature > N64 Fighter Joints)
+            import jointattrs as JAT
+            self.manifest['joint_attrs'] = JAT.joint_attrs(f)
         self.manifest['lights'] = MF.model_lights(f)       # light / shadow (ambient) colors
         self.manifest['expressions'] = f.textureparts      # (texture-index switches: joint + material index)
         self.expr_mobjs = self.expression_mobjs()
