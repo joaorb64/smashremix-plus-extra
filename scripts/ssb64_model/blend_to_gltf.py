@@ -191,6 +191,29 @@ sc = bpy.context.scene
 lights = {k: str(sc[f'n64_{k}_color']) for k in ('light', 'shadow') if f'n64_{k}_color' in sc.keys()}
 
 
+def export_joint_names():
+    """The joint (bone) names the export's model.gltf has (a stage's original joints)."""
+    gl_path = os.path.join(export_dir, 'model.gltf')
+    if not os.path.exists(gl_path):
+        return set()
+    return {n.get('name') for n in json.load(open(gl_path))['nodes']}
+
+
+def new_joints():
+    """Stages: bones L<n>_joint_NN the export didn't have (new joints) -> {layer: {NN: parent NN}}: the
+    parent is the bone's parent when that is a joint of the same layer, else the layer's root (0)."""
+    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
+    have = export_joint_names()
+    out = {}
+    for b in (arm.data.bones if arm else []):
+        m = re.match(r'(L\d+)_joint_(\d+)$', b.name)
+        if not m or b.name in have:
+            continue
+        p = re.match(rf'{m.group(1)}_joint_(\d+)$', b.parent.name) if b.parent else None
+        out.setdefault(m.group(1), {})[m.group(2).lstrip('0') or '0'] = int(p.group(1)) if p else 0
+    return out
+
+
 def joint_anims():
     """Stages: each animated joint's local transform per frame (bones L<n>_joint_NN that have
     a game animation: n64_anim_frames, or keyframes), over its own length -> {layer: {joint:
@@ -226,6 +249,8 @@ def joint_anims():
         if b.name in by_name:
             j_rest = (A @ node_world(by_name[b.name]) @ Ai).to_3x3().normalized()
             corr[b.name] = (j_rest.inverted() @ b.matrix_local.to_3x3().normalized()).to_4x4()
+        elif re.match(r'L\d+_joint_\d+$', b.name):       # a new stage joint: no rest transform
+            corr[b.name] = b.matrix_local.to_3x3().normalized().to_4x4()
     fcs = PANEL.anim_fcurves(arm) or []
     keyed = {m.group(1) for fc in fcs for m in [re.match(r'pose\.bones\["([^"]+)"\]', fc.data_path)] if m}
     todo = {}
@@ -256,8 +281,13 @@ def joint_anims():
             def game(pbone):                 # the joint's world matrix in glTF space this frame
                 return Ai @ pbone.matrix @ corr[pbone.name].inverted() @ A
             N = game(pb)
-            pi = parent.get(by_name[name])
-            pname = nodes[pi].get('name') if pi is not None else None
+            if name in by_name:
+                pi = parent.get(by_name[name])
+                pname = nodes[pi].get('name') if pi is not None else None
+            else:                            # a new stage joint: its parent bone's child (another
+                pb_parent = arm.data.bones[name].parent          # joint), else its layer's root
+                pname = pb_parent.name if pb_parent is not None and re.match(
+                    r'L\d+_joint_\d+$', pb_parent.name) else name.split('_joint_')[0] + '_joint_00'
             if pname in arm.pose.bones and pname in corr:
                 N = game(arm.pose.bones[pname]).inverted() @ N
             t['matrices'].append([v for row in N for v in row])
@@ -347,7 +377,7 @@ def shield_pose():
 # hurtboxes / stage collision (gamedata.py applies them)
 open(os.path.join(OUT, 'gamedata.json'), 'w').write(json.dumps(GDB.collect(), indent=1))
 json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims,
-               joint_anims=joint_anims(), fighter_anims=fighter_anims(),
+               joint_anims=joint_anims(), new_joints=new_joints(), fighter_anims=fighter_anims(),
                shield_pose=shield_pose()),
           open(os.path.join(OUT, 'costumes.json'), 'w'), indent=1)
 

@@ -14,10 +14,13 @@ collision groups and hazard code address its joints by index). header.bin's poin
 updated, and the stage chain head in config.yaml (offsets: stage).
 """
 import argparse
+import json
 import os
 import re
 import struct
 import sys
+
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -39,6 +42,44 @@ def set_stage_head(cfg_path, head):
     if not pat.search(text):
         raise SystemExit(f'{cfg_path}: no offsets: stage: ["HEAD", ...] to update')
     open(cfg_path, 'w', encoding='utf-8').write(pat.sub(lambda m: m.group(1) + f'{head:04X}' + m.group(3), text, 1))
+
+
+def add_new_joints(f, layer_objs, work_dir):
+    """New joints: a layer's meshes skinned to (or animations on, or new bones) L<n>_joint_NN past its
+    last joint add joints up to NN, with no rest transform (identity), children of the layer's root or
+    of their parent bone's joint (blend_to_gltf new_joints), drawn after the original ones (joints draw
+    in index order). Their DObjDescs are appended (ModelWriter.build)."""
+    tab = json.load(open(os.path.join(work_dir, 'costumes.json'))) \
+        if os.path.exists(os.path.join(work_dir, 'costumes.json')) else {}
+    anims, parents = tab.get('joint_anims') or {}, tab.get('new_joints') or {}
+    for name, objs in layer_objs.items():
+        d = f.details[name]
+        js = d['joints']
+        if d.get('dobjdesc') is None or not js:
+            continue
+        used = [int(np.max(o['joint'])) for o in objs if len(o['joint'])]
+        used += [int(k) for k in (anims.get(name) or {})] + [int(k) for k in (parents.get(name) or {})]
+        want = max(used, default=-1)
+        if want < len(js):
+            continue
+        d['orig_joints'] = len(js)
+        par = {int(k): int(v) for k, v in (parents.get(name) or {}).items()}
+        while len(js) <= want:
+            i = len(js)
+            p = par.get(i, 0)
+            # DObjDescs are depth-first: a joint's parent must be the joint before it or one of
+            # that joint's ancestors
+            chain, a = [], i - 1
+            while a is not None:
+                chain.append(a)
+                a = js[a].parent
+            if p not in chain:
+                raise SystemExit(f'{name} joint {i}: its parent {p} must be joint {i - 1} or one of its '
+                                 f'ancestors {chain[1:]} (joints are stored depth first)')
+            j = MF.Joint(i, js[p].depth + 1, p, None, np.zeros(3), np.zeros(3), np.ones(3))
+            j.world = js[p].world.copy()
+            js.append(j)
+        print(f'  layer {name[1:]}: {len(js) - d["orig_joints"]} new joints ({d["orig_joints"]}..{len(js) - 1})')
 
 
 def main(argv=None):
@@ -82,6 +123,7 @@ def main(argv=None):
             layer_objs[name] = []
         for role, rel in LAYER_FIELDS.items():
             model_fields[d['field'] + rel] = (name, role)
+    add_new_joints(f, layer_objs, a.work_dir)
     keep = [ext[fld] for fld in into_stage if fld not in model_fields]
     scripts = IO.material_scripts(f)               # material animations (water...): kept as they are
     if keep or scripts:

@@ -274,6 +274,13 @@ class ModelWriter:
         joints = d['joints']
         W = [j.world for j in joints]
         links = {j.index for j in joints if j.dl is not None and MF.dl_links(f.char, f.char_int, j.dl)}
+        # a stage layer drawn the 'secondary' way (MPGroundData.layer_mask bit set: grDisplay /
+        # mnMaps draw it with gcDrawDObjTreeDLLinks) reads every joint's dl as a DObjDLLink list:
+        # joints that had none (or new ones) get theirs as lists too, else the game reads a bare
+        # display list as links and crashes
+        if f.object.get('kind') == 'stage' and re.fullmatch(r'L\d', detail) and \
+                f.main[f.attr + 0x44] >> int(detail[1:]) & 1:
+            links = set(range(len(joints)))
         prologue = prologue_for(f, d, textures.lights)
         order = {int(j): v for j, v in (textures.manifest.get('mobj_order') or {}).get(detail, {}).items()}
         # one display list per DObjDLLink list (materials drawn from list 1 = translucent... keep it)
@@ -347,7 +354,11 @@ class ModelWriter:
             targets[DATA] = joint_dl(0)
         else:
             n = len(joints)
-            arr = bytearray(f.char[d['dobjdesc']:d['dobjdesc'] + MF.DOBJDESC_SIZE * n + 4])
+            n0 = d.get('orig_joints', n)              # (import_stage.add_new_joints: joints added)
+            arr = bytearray(f.char[d['dobjdesc']:d['dobjdesc'] + MF.DOBJDESC_SIZE * n0])
+            for j in joints[n0:]:                     # {u32 depth, dl, translate, rotate, scale}
+                arr += struct.pack('>II9f', j.depth, 0, *j.t, *j.r, *j.s)
+            arr += f.char[d['dobjdesc'] + MF.DOBJDESC_SIZE * n0:d['dobjdesc'] + MF.DOBJDESC_SIZE * n0 + 4]
             for j in range(n):
                 struct.pack_into('>I', arr, MF.DOBJDESC_SIZE * j + 4, 0)
             do = blob.add(bytes(arr), 8)
@@ -370,7 +381,8 @@ def write_joint_anims(f, work_dir, blob, remap):
     out = {}
     for name, d in f.details.items():
         joints, arr = d['joints'], d.get('anim')
-        orig = {j.index: f.char_int.get(arr + 4 * j.index) for j in joints} if arr is not None else {}
+        n0 = d.get('orig_joints', len(joints))       # (joints past these are new: no original script)
+        orig = {j.index: f.char_int.get(arr + 4 * j.index) for j in joints[:n0]} if arr is not None else {}
         orig = {k: v for k, v in orig.items() if v is not None}
         mine = blend.get(name) or {}
         ptrs, changed = {}, False
