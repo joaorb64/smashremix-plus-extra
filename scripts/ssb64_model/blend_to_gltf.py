@@ -199,6 +199,50 @@ def export_joint_names():
     return {n.get('name') for n in json.load(open(gl_path))['nodes']}
 
 
+def stage_orig_name(b, have):
+    """The export's name for a stage joint bone's original joint (its bone may have been renumbered:
+    n64_joint_orig, stamped by the N64 Stage panel before its first edit), None for a new joint."""
+    m = re.match(r'(L\d+)_joint_(\d+)$', b.name)
+    if not m:
+        return b.name if b.name in have else None
+    if 'n64_joint_orig' in b.keys():
+        o = int(b['n64_joint_orig'])
+        return f'{m.group(1)}_joint_{o:02d}' if o >= 0 else None
+    return b.name if b.name in have and not b.get('n64_new_joint') else None
+
+
+def stage_parent_index(b):
+    """A stage joint bone's parent joint (its parent bone when that is a joint of its layer, else the
+    layer's root; the root: None)."""
+    m = re.match(r'(L\d+)_joint_(\d+)$', b.name)
+    if int(m.group(2)) == 0:
+        return None
+    p = re.match(rf'{m.group(1)}_joint_(\d+)$', b.parent.name) if b.parent is not None else None
+    return int(p.group(1)) if p else 0
+
+
+def joint_map():
+    """Stages: every layer's joints as Blender has them -> {layer: [{index, orig, parent}]}: orig = the
+    export's joint it is (None: a new joint), parent = its parent joint. A layer the export had and
+    Blender has no bones for left: removed ([]). import_stage.py rebuilds the layers' joints from it."""
+    if bpy.context.scene.get('n64_kind') != 'stage':
+        return None
+    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
+    have = export_joint_names()
+    layers = {m.group(1) for n in have for m in [re.match(r'(L\d+)_joint_\d+$', n or '')] if m}
+    out = {L: [] for L in layers}
+    for b in (arm.data.bones if arm else []):
+        m = re.match(r'(L\d+)_joint_(\d+)$', b.name)
+        if not m:
+            continue
+        o = stage_orig_name(b, have)
+        out.setdefault(m.group(1), []).append(dict(index=int(m.group(2)), orig=int(o.split('_')[-1]) if o else None,
+                                                   parent=stage_parent_index(b)))
+    for rows in out.values():
+        rows.sort(key=lambda r: r['index'])
+    return out
+
+
 def new_joints():
     """Stages: bones L<n>_joint_NN the export didn't have (new joints) -> {layer: {NN: parent NN}}: the
     parent is the bone's parent when that is a joint of the same layer, else the layer's root (0)."""
@@ -245,9 +289,11 @@ def joint_anims():
     A = Matrix(((1, 0, 0, 0), (0, 0, -1, 0), (0, 1, 0, 0), (0, 0, 0, 1)))     # glTF (Y up) -> Blender
     Ai = A.inverted()
     corr = {}                      # per bone: its rest axes vs the joint's (the importer's bone axes): a
+    have = set(by_name)
     for b in arm.data.bones:       # rotation only (bones have no rest scale: a joint's is in its pose)
-        if b.name in by_name:
-            j_rest = (A @ node_world(by_name[b.name]) @ Ai).to_3x3().normalized()
+        o = stage_orig_name(b, have)                     # (stage joints: renumbered ones by their original)
+        if o in by_name:
+            j_rest = (A @ node_world(by_name[o]) @ Ai).to_3x3().normalized()
             corr[b.name] = (j_rest.inverted() @ b.matrix_local.to_3x3().normalized()).to_4x4()
         elif re.match(r'L\d+_joint_\d+$', b.name):       # a new stage joint: no rest transform
             corr[b.name] = b.matrix_local.to_3x3().normalized().to_4x4()
@@ -281,13 +327,13 @@ def joint_anims():
             def game(pbone):                 # the joint's world matrix in glTF space this frame
                 return Ai @ pbone.matrix @ corr[pbone.name].inverted() @ A
             N = game(pb)
-            if name in by_name:
+            sm = re.match(r'(L\d+)_joint_\d+$', name)
+            if sm:                           # a stage joint: relative to its parent joint (as Blender has it)
+                pi = stage_parent_index(arm.data.bones[name])
+                pname = f'{sm.group(1)}_joint_{pi:02d}' if pi is not None else None
+            else:
                 pi = parent.get(by_name[name])
                 pname = nodes[pi].get('name') if pi is not None else None
-            else:                            # a new stage joint: its parent bone's child (another
-                pb_parent = arm.data.bones[name].parent          # joint), else its layer's root
-                pname = pb_parent.name if pb_parent is not None and re.match(
-                    r'L\d+_joint_\d+$', pb_parent.name) else name.split('_joint_')[0] + '_joint_00'
             if pname in arm.pose.bones and pname in corr:
                 N = game(arm.pose.bones[pname]).inverted() @ N
             t['matrices'].append([v for row in N for v in row])
@@ -377,7 +423,8 @@ def shield_pose():
 # hurtboxes / stage collision (gamedata.py applies them)
 open(os.path.join(OUT, 'gamedata.json'), 'w').write(json.dumps(GDB.collect(), indent=1))
 json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims,
-               joint_anims=joint_anims(), new_joints=new_joints(), fighter_anims=fighter_anims(),
+               joint_anims=joint_anims(), new_joints=new_joints(), joint_map=joint_map(),
+               fighter_anims=fighter_anims(),
                shield_pose=shield_pose()),
           open(os.path.join(OUT, 'costumes.json'), 'w'), indent=1)
 
