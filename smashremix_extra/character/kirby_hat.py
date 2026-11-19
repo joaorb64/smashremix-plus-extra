@@ -27,6 +27,7 @@ How a hat gets into the game (no Remix file is replaced):
 import os
 import re
 import struct
+import sys
 
 import yaml
 
@@ -122,6 +123,126 @@ def kirby_action_names(calls):
             if who == "KIRBY" and kind == "action"]
 
 
+def _asm_text(folder):
+    """main.asm with its includes (comments blanked), concatenated."""
+    parts, seen = [], set()
+
+    def walk(path):
+        path = os.path.normpath(path)
+        if path in seen or not os.path.exists(path):
+            return
+        seen.add(path)
+        text = _blank_comments(open(path, encoding="utf-8", errors="replace").read())
+        parts.append(text)
+        for inc in re.findall(r'\binclude\s+"([^"]+)"', text):
+            walk(os.path.join(os.path.dirname(path), inc))
+    walk(os.path.join(folder, "main.asm"))
+    return "\n".join(parts)
+
+
+def animation_frames(data, head=None, flags=0):
+    """An animation file's length in frames (its longest joint script; like ssb64_model's
+    figatree.load), or None if it can't be read."""
+    tools = os.path.join(os.path.dirname(SMASHREMIX_PATH), "scripts", "ssb64_model")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    try:
+        import figatree as FT
+        head = FT.first_pointer_head(data) if head is None else head
+        arr, ptrs = FT.pointer_array(data, head)
+        rest = dict(rx=0.0, ry=0.0, rz=0.0, tx=0.0, ty=0.0, tz=0.0, sx=1.0, sy=1.0, sz=1.0)
+        ends = [FT.play(data, ptrs, sc, rest, anim_joint=bool(flags & FT.FLAG_ANIMJOINT))["frames"]
+                for sc in arr if sc is not None]
+        return max(ends) + 1 if ends else None
+    except Exception:       # (an unreadable file: no check)
+        return None
+
+
+_ARGS = r"\s*([^,()]+?)\s*"
+
+
+def check_animation_lengths(char_folder, original_path):
+    """Kirby hat warnings: a Kirby copy action (add_new_action_params(KIRBY, ...)) whose
+    kirby_hat/animations file isn't as long as the animation its timing comes from:
+      - with its own moveset (kirby_<m>, kirby_hat/moveset/<m>.bin): the character's animation
+        for its own moveset <m> (moveset/<m>.bin), whose timing the copy's moveset follows;
+      - else (Kirby's moveset): Kirby's vanilla animation of the base action (Action.KIRBY.X).
+    -> [warning strings] (also logged)."""
+    text = _asm_text(original_path)
+    upper = char_folder.upper()
+    anims = {os.path.splitext(f)[0].upper(): os.path.join(original_path, "kirby_hat", "animations", f)
+             for f in (os.listdir(os.path.join(original_path, "kirby_hat", "animations"))
+                       if os.path.isdir(os.path.join(original_path, "kirby_hat", "animations")) else [])
+             if f.lower().endswith(".bin")}
+    own_anims = {os.path.splitext(f)[0].upper(): os.path.join(original_path, "animations", f)
+                 for f in (os.listdir(os.path.join(original_path, "animations"))
+                           if os.path.isdir(os.path.join(original_path, "animations")) else [])
+                 if f.lower().endswith(".bin")}
+    if not anims:
+        return []
+    # the character's own actions: moveset label -> its animation file
+    own = {}
+    for m in re.finditer(r"Character\.edit_action_parameters\(" + ",".join([_ARGS] * 4) + r"[,)]", text):
+        who, _, anim, mv = m.groups()
+        if who not in ("KIRBY", "JKIRBY"):
+            own.setdefault(mv.split(".")[-1], anim)
+    for m in re.finditer(r"Character\.add_new_action_params\(" + ",".join([_ARGS] * 5) + r"[,)]", text):
+        who, _, _, anim, mv = m.groups()
+        if who not in ("KIRBY", "JKIRBY"):
+            own.setdefault(mv.split(".")[-1], anim)
+    lengths, warnings, done = {}, [], set()
+
+    def length(path):
+        if path not in lengths:
+            lengths[path] = animation_frames(open(path, "rb").read())
+        return lengths[path]
+
+    vanilla = None
+    for m in re.finditer(r"Character\.add_new_action_params\(" + ",".join([_ARGS] * 6) + r"\)", text):
+        who, name, base, anim, mv, _ = m.groups()
+        km = re.fullmatch(rf"File\.{upper}_KIRBY_ANIM_(\w+)", anim)
+        if who not in ("KIRBY", "JKIRBY") or not km or km.group(1).upper() not in anims or (name, anim, mv) in done:
+            continue
+        done.add((name, anim, mv))
+        path = anims[km.group(1).upper()]
+        n = length(path)
+        ref, what = None, None
+        mm = re.fullmatch(r"(?:\w+\.)?kirby_(\w+)", mv)
+        if mm:                                  # its own moveset: the character's for the same file
+            own_anim = own.get(mm.group(1))
+            om = re.fullmatch(rf"File\.{upper}_ANIM_(\w+)", own_anim or "")
+            if om and om.group(1).upper() in own_anims:
+                ref = length(own_anims[om.group(1).upper()])
+                what = f"{char_folder}'s animations/{os.path.basename(own_anims[om.group(1).upper()])} " \
+                       f"(its moveset {mm.group(1)}, which kirby_{mm.group(1)} follows)"
+        elif mv == "-1" and base.startswith("Action.KIRBY."):   # Kirby's own moveset: his animation's length
+            try:
+                tools = os.path.join(os.path.dirname(SMASHREMIX_PATH), "scripts", "ssb64_model")
+                if tools not in sys.path:
+                    sys.path.insert(0, tools)
+                import motions as MO
+                from SSB import N64, SSBtbl
+                if vanilla is None:
+                    vanilla = (MO.Vanilla(ROM), MO.action_names()[0],
+                               SSBtbl.fromROM(N64(open(ROM, "rb").read())))
+                van, names, entries = vanilla
+                action = names.get(base)
+                i = van.param_index(8, action) if action is not None else None
+                if i is not None:
+                    fid, _, flags = van.params(8)[i]
+                    e = entries[fid]
+                    ref = animation_frames(e.extract("data"), e.tbl or 0, flags)
+                    what = f"Kirby's {base} animation (its moveset)"
+            except Exception:
+                ref = None
+        if n is not None and ref is not None and n != ref:
+            w = (f"Kirby hat warning: {char_folder}: Kirby's {name} animation kirby_hat/animations/"
+                 f"{os.path.basename(path)} is {n} frames, {what} is {ref}")
+            warnings.append(w)
+            logger.warning(w)
+    return warnings
+
+
 class KirbyHats:
     def __init__(self):
         self.hats = []          # [{char, file, offsets, size}]
@@ -151,6 +272,7 @@ class KirbyHats:
             print(f"Kirby actions: {char_folder} adds {n['KIRBY']['action']} (Kirby), "
                   f"{n['JKIRBY']['action']} (J Kirby)")
         self.kirby_action_names += kirby_action_names(calls)
+        check_animation_lengths(char_folder, original_path)
 
         anim_dir = os.path.join(output_path, "kirby_hat", "animations")
         for anim in sorted(os.listdir(anim_dir)) if os.path.isdir(anim_dir) else []:

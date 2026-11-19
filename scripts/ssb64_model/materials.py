@@ -55,6 +55,17 @@ ALPHA_COMPARE_ON = [(0xF9000000, 0x00000008), (0xE2001E01, 0x00000001),   # blen
 ALPHA_COMPARE_OFF = [(0xE2001E01, 0x00000000), (0xE2001300, 0x00000000)]
 
 
+def uses_texel_alpha(state):
+    """Does a material's own render state make texel alpha matter: a render mode of its own,
+    alpha compare, or CVG_X_ALPHA? [(w0, w1)]. Without one, a fighter part draws in the game's
+    opaque mode (ftDisplayMainDecideFogDraw: G_RM_AA_ZB_OPA_SURF2), so alpha-0 texels (DK's
+    pupils, Ken's eyebrows: 0x0000 palette entries) are drawn solid."""
+    for w0, w1 in state:
+        if w0 == 0xE200001C or (w0 == 0xE2001E01 and w1 & 3) or (w0 == 0xE2001300 and w1 & 0x1000):
+            return True
+    return False
+
+
 def g(w0, w1=0):
     return struct.pack('>II', w0 & 0xFFFFFFFF, w1 & 0xFFFFFFFF)
 
@@ -329,8 +340,11 @@ class Material:
             if im is not None:
                 imgs[i] = self._image_from(im, imgs[i], pals[ref_p] if self.ci else None, f'image {i}')
         # costume images from Blender: override the entries each costume uses
+        claimed = set()                     # palettes an earlier costume already uses
         for c, (ti, pi) in enumerate(self.costume_map):
             im = costume_imgs[c] if c < len(costume_imgs) else None
+            shared = pi in claimed
+            claimed.add(pi)
             if im is None:
                 continue
             im = resize(im, w, h)
@@ -343,12 +357,46 @@ class Material:
                 imgs[ti] = im
                 continue
             cols = self._recolor(im, imgs[ti])
+            if cols is not None and shared and \
+                    any(not same_image(col[None], pals[pi][k][None]) for k, col in cols.items()):
+                # palette pi is an earlier costume's too (e.g. costumes added past the original
+                # count repeat the last one's): this costume gets its own (or an identical one)
+                new = pals[pi].copy()
+                for k, col in cols.items():
+                    new[k] = col
+                pi = next((p for p, q in enumerate(pals) if same_image(q, new)), None)
+                if pi is None:
+                    pals.append(new)
+                    pal_raw.append(b'')
+                    pi = len(pals) - 1
+                self.costume_map[c] = [ti, pi]
+                claimed.add(pi)
+                continue
             if cols is not None:                                       # same drawing, new colors: palette pi
                 for k, col in cols.items():
                     if not same_image(col[None], pals[pi][k][None]):
                         pals[pi][k] = col
             else:                                                      # repainted: image ti, palette pi's colors
-                imgs[ti] = self._image_from(im, imgs[ti], pals[pi], f'costume {c}')
+                new_ix = self._repaint_ci(im, imgs[ti], pals[pi], f'costume {c}')
+                # new indices: the costumes before this one get them from their own images
+                for c2 in range(c):
+                    ti2, pi2 = self.costume_map[c2]
+                    im2 = costume_imgs[c2] if c2 < len(costume_imgs) else None
+                    if ti2 != ti or pi2 == pi:
+                        continue
+                    flat2 = clean(resize(im2, w, h)).reshape(-1, 4) if im2 is not None else None
+                    for k in self.allocated:
+                        sel = new_ix.reshape(-1) == k
+                        pals[pi2][k] = flat2[sel][0] if flat2 is not None and sel.any() else pals[pi][k]
+                # repainted AND recolored (e.g. texels moved to another color's index, with the
+                # colors changed too): once each index has one color, those are palette pi's
+                cols = self._recolor(im, new_ix)
+                if cols is not None:
+                    if self.warnings and self.warnings[-1].startswith(f'costume {c}: colors not in'):
+                        self.warnings.pop()
+                    for k, col in cols.items():
+                        pals[pi][k] = col
+                imgs[ti] = new_ix
         # palettes added in Blender (N64 Palette nodes past the original's entries): recolors
         # of the reference image
         for p in range(len(pals), len(self.pal_frames) if self.ci else 0):
@@ -562,6 +610,11 @@ class Material:
         if self.pal_varies or (self.ci and 'pal' in self.animated):
             self.palette_source = 'list'
         self.transparent = self._uses_transparency(self.images, self.palettes)
+        if self.transparent and self.cloak_safe and self.orig_transparent and not uses_texel_alpha(self.state):
+            # alpha-0 texels the game already drew solid (fighter opaque mode, no setup of the
+            # material's own; older exports wrote them as transparent PNG pixels): keep them solid,
+            # don't turn them into a cut-out
+            self.transparent = False
         binary_alpha = self.ci or (self.fmt, self.siz) in ((0, 2), (3, 0))
         modes = [b for a, b in self.state if a == 0xE200001C]
         if self.cloak_safe and binary_alpha and all(m in CUTOUT_MODES for m in modes) and \
@@ -608,13 +661,77 @@ class Material:
     def _image_from(self, im, old, pal, what):
         if pal is None:                                                 # direct color
             return old if same_image(im, old) else im
+        self.allocated = []
         if same_image(pal[old].reshape(im.shape), im):
             return old                                                  # unedited
-        ix, err = nearest_index(im, pal)
+        if self.cloak_safe and not uses_texel_alpha(self.state):
+            # drawn solid whatever the alpha (fighter opaque mode): match colors only, so an
+            # opaque painted black is the alpha-0 black entry (DK's pupils)
+            im = np.asarray(im).copy()
+            im[..., 3] = 255
+            pal_cmp = np.asarray(pal).copy()
+            pal_cmp[:, 3] = 255
+        else:
+            pal_cmp = pal
+        # colors the palette doesn't have: into indices the image doesn't use (e.g. a duplicate
+        # entry), most used first, instead of the nearest color (which would merge them)
+        flat = clean(im).reshape(-1, 4)
+        pp = clean(pal_cmp)
+        far = np.abs(flat[:, None, :] - pp[None, :, :]).max(-1).min(1) > TOL
+        free = [k for k in range(len(pal)) if k not in set(np.unique(old).tolist())]
+        if far.any() and free:
+            cols, counts = np.unique(flat[far], axis=0, return_counts=True)
+            for col in cols[np.argsort(-counts)][:len(free)]:
+                k = free.pop(0)
+                pal[k] = col
+                if pal_cmp is not pal:
+                    pal_cmp[k] = col
+                self.allocated.append(k)
+        ix, err = nearest_index(im, pal_cmp)
         if err > 24:
             self.warnings.append(f'{what}: colors not in the palette were mapped to the nearest one '
                                  '(edit the palette PNGs to change colors)')
         return ix
+
+    def _repaint_ci(self, im, old, pal, what):
+        """A costume image that isn't a pure recolor of the CI image: texels keep their index
+        unless their color differs from the rest of that index's texels (in this image); those
+        go to the index whose texels have their color, else an index the image doesn't use
+        (palette set to it), else the nearest palette color. Keeps the drawing's index layout
+        even when every color changed too (a recolor + a few repainted texels)."""
+        self.allocated = []
+        flat = clean(im).reshape(-1, 4)
+        if self.cloak_safe and not uses_texel_alpha(self.state):
+            flat = flat.copy()
+            flat[:, 3] = 255                    # (drawn solid: alpha doesn't tell colors apart)
+        ix = np.asarray(old).reshape(-1).copy()
+        color_of, moved = {}, np.zeros(len(ix), bool)
+        for k in np.unique(ix):
+            sel = np.nonzero(ix == k)[0]
+            cols, counts = np.unique(flat[sel], axis=0, return_counts=True)
+            main = cols[counts.argmax()]
+            color_of[int(k)] = main
+            moved[sel[np.abs(flat[sel] - main).max(1) > TOL]] = True
+        free = [k for k in range(len(pal)) if k not in color_of]
+        far = False
+        cols, counts = np.unique(flat[moved], axis=0, return_counts=True) if moved.any() else ([], [])
+        for col in [cols[i] for i in np.argsort(-np.asarray(counts))]:      # most texels first
+            sel = moved & (np.abs(flat - col).max(1) <= TOL)
+            k = next((k for k, c in color_of.items() if np.abs(c - col).max() <= TOL), None)
+            if k is None and free:
+                k = free.pop(0)
+                color_of[k] = col
+                pal[k] = col
+                self.allocated.append(k)
+            if k is None:
+                k, err = nearest_index(col[None], pal)
+                k = int(k[0])
+                far = far or err > 24
+            ix[sel] = k
+        if far:
+            self.warnings.append(f'{what}: colors not in the palette were mapped to the nearest one '
+                                 '(edit the palette PNGs to change colors)')
+        return ix.reshape(np.asarray(old).shape)
 
     @staticmethod
     def _recolor(im, idx):

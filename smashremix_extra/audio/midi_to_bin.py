@@ -26,7 +26,8 @@ Game rules (the sequence player crashes otherwise, see bank.py):
   - every channel needs a program change before its first note, to an
     existing instrument (0 is an empty slot)
   - every note's key/velocity must be covered by a sample of its instrument
-  Doubled/overlapping notes (same channel + key) are fixed automatically.
+  Doubled/overlapping notes (same channel + key) are fixed automatically:
+  same-tick doubles merge into one louder note, re-triggers cut the old one.
 
 Instruments come from the MIDI file's program changes: Smash Remix
 instrument ids (the Smash Remix SF2 numbers its presets the same way).
@@ -264,8 +265,11 @@ class MidiConversionError(Exception):
 def fix_overlaps(parts: List[Part]) -> int:
     """Remove doubled/overlapping notes (same channel and key still sounding).
 
-    Same-tick duplicates are merged (loudest velocity, longest duration);
-    a note re-triggered while sounding is cut where the new one starts.
+    Same-tick duplicates are merged into one note with the summed velocity
+    (capped at 127) and the longest duration: two copies of the same sample
+    started together add up in phase, and the player's voice volume is linear
+    in velocity, so this keeps the doubled loudness. A note re-triggered while
+    sounding is cut where the new one starts.
     """
     fixed = 0
     for part in parts:
@@ -276,7 +280,7 @@ def fix_overlaps(parts: List[Part]) -> int:
             if prev and note.tick < prev.tick + prev.duration:
                 fixed += 1
                 if note.tick == prev.tick:
-                    prev.velocity = max(prev.velocity, note.velocity)
+                    prev.velocity = min(127, prev.velocity + note.velocity)
                     prev.duration = max(prev.duration, note.duration)
                     continue
                 prev.duration = note.tick - prev.tick

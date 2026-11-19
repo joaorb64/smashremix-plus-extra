@@ -630,7 +630,7 @@ def decode_model(f, joints, mobjs, dls, cache=None, carry_state=False):
                 w0, w1 = u32(char, o), u32(char, o + 4)
                 op = w0 >> 24
                 if st.get('drawn') and (op in (0xF5, 0xFD, 0xF0, 0xE8, 0xD7) or
-                                        (op == 0xDE and (w1 >> 24) == 0x0E)):
+                                        (op == 0xDE and (w1 >> 24) == 0x0E and o + 4 not in ptrs)):
                     # a new material is being set up: an MObj called for the last one doesn't apply
                     st['mobj'], st['drawn'] = None, False
                 if op == 0xFD:                                   # SETTIMG
@@ -713,7 +713,9 @@ def decode_model(f, joints, mobjs, dls, cache=None, carry_state=False):
                         if all(c is not None for c in cs):
                             geo.tris.append(Tri(j, cs, k, st['ul'], link_of.get(dl, 0)))
                 elif op == 0xDE:
-                    if (w1 >> 24) == 0x0E:                       # MObj material (segment 0x0E)
+                    # MObj material (segment 0x0E); a relocated pointer's raw word can start with
+                    # 0x0E too (the chain's next-offset): a pointer is a display list
+                    if (w1 >> 24) == 0x0E and o + 4 not in ptrs:
                         i = (w1 & 0xFFFFFF) // 8
                         lst = mobjs.get(j, []) if isinstance(mobjs, dict) else mobjs
                         st['mobj'] = lst[i] if i < len(lst) else None

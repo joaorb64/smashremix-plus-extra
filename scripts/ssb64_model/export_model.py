@@ -690,6 +690,14 @@ class Exporter:
             if sig in self.mat_sig:
                 self.mat_index[key] = self.mat_sig[sig]
                 return self.mat_index[key]
+            # fighters: without a render setup of its own the part draws in the game's opaque mode,
+            # where texel alpha does nothing: the PNGs are opaque too (else e.g. DK's pupils, alpha-0
+            # palette entries, showed as holes)
+            import materials as MT
+            self._opaque_tex = (not getattr(f, 'object', None) and (fmt, siz) in ((2, 0), (2, 1), (0, 2))
+                                and not MT.uses_texel_alpha([v for _, v in state]))
+            if self._opaque_tex:
+                entry['opaque_texels'] = True
             entry['images'] = [self.save_tex(name, f'img{i}', im, fmt, siz, w, h, p0) for i, im in enumerate(imgs)]
             entry['palettes'] = [self.save_tex(name, f'pal{i}', i0, fmt, siz, w, h, pl) for i, pl in enumerate(pals)]
             # costume images (what Blender shows): past a clamped tile's extent, the edge
@@ -722,6 +730,9 @@ class Exporter:
         rgba = MF.decode_texture(self.f.char, img, fmt, siz, w, h, pal)
         if fill:
             rgba = MF.clamp_fill(rgba, *fill)
+        if getattr(self, '_opaque_tex', False):
+            rgba = rgba.copy()
+            rgba[..., 3] = 255
         rel = f'textures/{name}_{suffix}.png'
         if self.flip_v:
             rgba = np.ascontiguousarray(rgba[::-1])

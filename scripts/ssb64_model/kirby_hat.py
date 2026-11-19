@@ -167,20 +167,31 @@ def pack(f, char_raw, char_head, textures, hat, item, costumes, say=print, extra
             body_an = [f.char_int.get(an + 4 * i) if an is not None else None for i in range(len(body_ms))]
             body_an = [res.remap[x] if x is not None else None for x in body_an]
             o = hat.get(detail) or hat.get('hi')
-            cmds = [GW.g(0xDE000000)]                                       # the body, then the hat
-            hat_names = []
-            if o is not None and o['tris']:
-                dls, mats = IF.build_joints([o], W, textures, blob, prologue, store, only_joint=HAT_JOINT,
-                                            mobj_order={HAT_JOINT: [None] * len(body_ms)})
+            body = (o or {}).get('body')        # Kirby's body edited in Blender (e.g. retextured): drawn from
+            hat_names = []                      # the blend with his own MObjs (same slots), not the ROM's DL
+            if body is not None:
+                names = list(body['names'])[:len(body_ms)]
+                names += [None] * (len(body_ms) - len(names))
+                dls, mats = IF.build_joints([dict(o, tris=body['tris'] + o['tris'])], W, textures, blob, prologue,
+                                            store, only_joint=HAT_JOINT, mobj_order={HAT_JOINT: names})
                 hat_names = mats[HAT_JOINT][len(body_ms):]
-                cmds.append(GW.g(0xDE000000))
-            top = blob.add(b''.join(cmds) + GW.g(0xDF000000), 8)
-            blob.ptr(top + 4, res.remap[dl])
-            if len(cmds) > 1:
-                blob.ptr(top + 12, dls[HAT_JOINT])
+                top = blob.add(GW.g(0xDE000000) + GW.g(0xDF000000), 8)
+                blob.ptr(top + 4, dls[HAT_JOINT])
+            else:
+                cmds = [GW.g(0xDE000000)]                                   # the body, then the hat
+                if o is not None and o['tris']:
+                    dls, mats = IF.build_joints([o], W, textures, blob, prologue, store, only_joint=HAT_JOINT,
+                                                mobj_order={HAT_JOINT: [None] * len(body_ms)})
+                    hat_names = mats[HAT_JOINT][len(body_ms):]
+                    cmds.append(GW.g(0xDE000000))
+                top = blob.add(b''.join(cmds) + GW.g(0xDF000000), 8)
+                blob.ptr(top + 4, res.remap[dl])
+                if len(cmds) > 1:
+                    blob.ptr(top + 12, dls[HAT_JOINT])
             lst, arr = lists(list(zip(body_ms, body_an)) + [mobj(n) for n in hat_names])
             out.append((top, lst, arr))
             say(f'  {label} {detail}: {len(o["tris"]) if o else 0} triangles'
+                + (f' + Kirby\'s body from the blend ({len(body["tris"])})' if body is not None else '')
                 + (f', {len(hat_names)} MObj(s) after the body\'s {len(body_ms)}' if hat_names else ''))
         return out
     header += hat_parts(hat, 'hat')
@@ -215,11 +226,26 @@ def pack(f, char_raw, char_head, textures, hat, item, costumes, say=print, extra
     return bytes(data)
 
 
+def dl_words(data, at, limit=4096):
+    """A display list's command words up to its end, pointer halves left out (they differ
+    between copies): what tells the ROM body's DL from another."""
+    out = []
+    o = at
+    while o + 8 <= len(data) and len(out) < limit:
+        w0 = struct.unpack_from('>I', data, o)[0]
+        out.append(w0)
+        if w0 >> 24 == 0xDF:
+            break
+        o += 8
+    return out
+
+
 def kirby_with_hat(rom_path, data):
     """Kirby from the ROM with kirby_hat.bin appended to his character data and its parts added as
     model part variants (hat: joint 2, item: joint 13) -> (fighter, {hat_variant, item_variant,
     body_mobjs}). What the Blender export shows and the import reads back against."""
     f, _, _, _ = rom_kirby(rom_path)
+    rom_body = {d: dl_words(f.char, x[0]) for d, x in body_fields(f).items()}
     head, ptrs, hdr, n_extra = read(data)
     base = len(f.char) + (-len(f.char) % 16)
     f.char = bytes(f.char) + bytes(base - len(f.char)) + bytes(data)
@@ -240,7 +266,16 @@ def kirby_with_hat(rom_path, data):
                 t = ptrs.get(hdr + PART_SIZE * k + o)
                 if t is not None:
                     f.main_ext[fld + o] = base + t
-            pair.append(dict(field=fld, dl=f.main_ext.get(fld), mobjsubs=f.main_ext.get(fld + 4), flags=0))
+            pair.append(dict(field=fld, dl=f.main_ext.get(fld), mobjsubs=f.main_ext.get(fld + 4),
+                             scripts=f.main_ext.get(fld + 8), flags=0))   # (costume scripts: Kirby's body colors)
+        if joint == HAT_JOINT:
+            # does the part draw Kirby's ROM body (its first call = the ROM body's display list) or
+            # its own (edited in Blender: pack's 'body')? The import keeps it that way
+            for d, k in (('hi', k0), ('lo', k0 + 1)):
+                top = ptrs.get(hdr + PART_SIZE * k)
+                sub = ptrs.get(top + 4) if top is not None else None
+                if sub is not None and dl_words(data, sub) != rom_body[d]:
+                    info.setdefault('own_body', {}).setdefault(key, []).append(d)
         f.modelparts.setdefault(joint, [])
         if key.startswith('extra_hat_'):
             info.setdefault('extra_hat_variants', []).append(len(f.modelparts[joint]))
@@ -320,12 +355,35 @@ def import_blend(work_dir, export_dir, hat_bin, rom_path=None):
     objs = {o['name']: o for o in IF.load_gltf(os.path.join(work_dir, 'parts.gltf'))} \
         if os.path.exists(os.path.join(work_dir, 'parts.gltf')) else {}
 
+    body_order = {(p['variant'], p['detail']): (p.get('mobj_order') or [])[:n_body]
+                  for p in man.get('model_parts') or [] if p['joint'] == HAT_JOINT}
+    # the body's triangles as exported (the ROM body): per hat part, from the export's model.gltf
+    exp_gl = os.path.join(export_dir, 'model.gltf')
+    exp_objs = {o['name']: o for o in IF.load_gltf(exp_gl)} if os.path.exists(exp_gl) else {}
+
+    def rom_body_tris(name):
+        o = exp_objs.get(name)
+        return sum(1 for m, _ in o['tris'] if IF.base_mat(m) in body) if o else None
+
+    # parts whose file already drew their own body (exported that way): keep drawing the blend's
+    own_body = set()
+    for key, details in (kh.get('own_body') or {}).items():
+        v = kh['hat_variant'] if key == 'hat' else \
+            (kh.get('extra_hat_variants') or [])[int(key.rsplit('_', 1)[1])]
+        own_body |= {(v, d) for d in details}
+
     def part(variant, joint):
         out = {}
         for d in ('hi', 'lo'):
             o = objs.get(f'part{variant}_{d}_j{joint:02d}')
             if o is not None:
                 out[d] = dict(o, tris=[(m, t) for m, t in o['tris'] if IF.base_mat(m) not in body])
+                own = [(m, t) for m, t in o['tris'] if IF.base_mat(m) in body]
+                # Kirby's body edited (some of its triangles now another material, e.g. fur, or
+                # reshaped: its triangle count changed): the file draws the blend's body
+                ref = rom_body_tris(f'part{variant}_{d}_j{joint:02d}') if joint == HAT_JOINT else None
+                if (ref and len(own) != ref) or (joint == HAT_JOINT and (variant, d) in own_body):
+                    out[d]['body'] = dict(tris=own, names=body_order.get((variant, d), []))
         return out
     hat = part(kh['hat_variant'], HAT_JOINT)
     # (no item exported: a new part<N>_hi_j13 after Kirby's own joint 13 parts)
