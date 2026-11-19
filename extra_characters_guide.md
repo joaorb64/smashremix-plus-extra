@@ -153,5 +153,5 @@ Kirby's moveset files: kirby_hat/moveset/NAME.bin, compiled like the character's
 sword trails) and inserted as kirby_NAME. Kirby has model parts on joints 6, 7, 12, 0x11,
 0x12, 0x13 only (others ignore model part commands): a character moveset changing a part on
 one of those, or a texture part (eyes / mouth), needs a Kirby copy without it.
-Examples: Cloud, Ryu, Ken, Kazuya, Terry, Meta Knight (extra hat), Mega Man, Snake, Ice Climbers, Ultimate DK
+Examples: Cloud, Ryu, Ken, Kazuya, Terry, Meta Knight (extra hat), Snake, Ultimate DK
 (status overrides).

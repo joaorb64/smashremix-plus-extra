@@ -17,7 +17,7 @@ All edits are in-place scalar writes - nothing moves, no pointer is touched.
 
 `MPGroundData` sits at `offsets.header[1]` inside header.bin. Field offsets below
 are relative to it; the layout is verified against ssb-decomp `mptypes.h` and a
-real ShadowMoses header.bin.
+real extra stage's header.bin.
 
     +0x44  layer_mask (u8)
     +0x4C  fog_color (u8 r,g,b)     +0x4F  fog_alpha (u8, unused padding)

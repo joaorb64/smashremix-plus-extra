@@ -39,7 +39,7 @@ edited .blend back into its `main.bin` / `character.bin`. Items and projectiles
 layers) work the same way, see [Items and projectiles](#items-and-projectiles) and
 [Stages](#stages).
 
-Status: export and import work. Unedited round trips of Meta Knight, Mega Man and
+Status: export and import work. Unedited round trips of Meta Knight and
 Snake render identically (same textures in every costume, same expressions/palettes,
 same MObj order); so do items and projectiles (rebuilt model files have no leftover
 data). ROM export reads Remix fighters (from `File.asm`) and vanilla fighters and
@@ -588,7 +588,7 @@ animations, shield_pose.bin, kirby_hat/...), with **Open Folder** and the **Log*
 **Write All (Every Animation)** is the same with `import --all`: also every animation with its own
 file (`animations/*.bin`, re-encoded from Blender, edited or not; the base character's borrowed
 ones only when edited, as each would become a new file and main.asm lines), the character's own
-shield_pose.bin and config.yaml even when unchanged: a full set (Mega Man: 67 animations, ~30 s).
+shield_pose.bin and config.yaml even when unchanged: a full set (a 67-animation character: ~30 s).
 
 It runs with Blender's own Python (a sandboxed Blender, like the Flatpak, can't start the system's),
 which needs Pillow and PyYAML: **Install Tools** (shown while they're missing) installs them with pip
@@ -619,7 +619,7 @@ a copy in the folder (kept only when it changed); without it, into the character
   import drops them, and round trips are byte-identical.
 
 Sizes (unedited round trip): Meta Knight 75,296 -> 55,088 bytes (its hi and lo
-models were duplicate data), Mega Man 107,632 -> 115,360, Snake 180,748 -> 107,800.
+models were duplicate data), Snake 180,748 -> 107,800.
 
 #### Fighter animations
 
@@ -678,7 +678,7 @@ to `shield_size` (attributes + 0x74) when it changed.
   are the parts; the import writes edits back there when it can say them (a joint's n-th entry
   switches its material n), else removes the key and writes the files' container (a new 2-entry one
   in character.bin when main.bin's holds fewer entries: vanilla containers often hold one).
-  Costumes should change palettes only (Mega Man): a costume script that picks the image too
+  Costumes should change palettes only: a costume script that picks the image too
   (Cloud's did) fights the alternate textures.
 - **Model parts**: per joint, what it shows: **Body** (the body's piece), **None**, or a variant
   (in the body piece's place, like the game's model part event / `ftParamSetModelPartID`).
