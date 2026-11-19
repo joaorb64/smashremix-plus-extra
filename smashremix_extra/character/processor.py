@@ -7,7 +7,7 @@ import yaml
 from pathlib import Path
 
 from smashremix_extra.constants import (
-    SMASHREMIX_PATH as smashremix_path,
+    SMASHREMIX_PATH as smashremix_path, resource_path,
     PRIMARY_MOVESETS, SHIELD_POSES, TWELVECB_DEFEAT, SP_DUO_POSES, SP_TEAM_POSES, COMMAND_SIZES, ExtraFile,
 )
 from smashremix_extra.image_appender import append_image, get_image_data, ImageMode
@@ -1446,14 +1446,14 @@ class CharacterProcessor:
         if data_screen_cfg:
             os.makedirs(f"{output_path}/datascreen", exist_ok=True)
 
-            font_big = data_screen_cfg.get(
-                "font_big", "appender/extra_resources/font_big.ttf")
-            font_bio = data_screen_cfg.get(
-                "font_bio", "appender/extra_resources/fonts/bio")
-            font_works = data_screen_cfg.get(
-                "font_works", "appender/extra_resources/fonts/works")
-            font_specials = data_screen_cfg.get(
-                "font_specials", "appender/extra_resources/fonts/movenames")
+            font_big = resource_path(data_screen_cfg.get(
+                "font_big", "appender/extra_resources/font_big.ttf"))
+            font_bio = resource_path(data_screen_cfg.get(
+                "font_bio", "appender/extra_resources/fonts/bio"))
+            font_works = resource_path(data_screen_cfg.get(
+                "font_works", "appender/extra_resources/fonts/works"))
+            font_specials = resource_path(data_screen_cfg.get(
+                "font_specials", "appender/extra_resources/fonts/movenames"))
 
             display_name = data_screen_cfg.get(
                 "name", config.get("results", {}).get(

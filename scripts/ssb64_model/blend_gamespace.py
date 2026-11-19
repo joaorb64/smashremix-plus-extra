@@ -8,6 +8,14 @@ import re
 import bpy
 
 
+def fighter_armature():
+    """The N64 fighter armature: the one named "fighter" (the export's), else the first armature
+    carrying the fighter's custom properties (a copy of it, e.g. a retarget rig's CLONE, has them too)."""
+    import bpy
+    arms = [o for o in bpy.data.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()]
+    return next((o for o in arms if o.name == 'fighter'), arms[0] if arms else None)
+
+
 class _GameSpace:
     """The fighter armature's bones in the game's space: sample(frame) -> {bone: its local 4x4
     matrix (numpy) as the game's joint (glTF Y up, the joint's own axes, relative to its parent
@@ -15,7 +23,7 @@ class _GameSpace:
 
     @classmethod
     def make(cls, export_dir):
-        arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()), None)
+        arm = fighter_armature()
         gl_path = os.path.join(export_dir, 'model.gltf')
         if arm is None or not os.path.exists(gl_path):
             return None
@@ -94,10 +102,19 @@ class _GameSpace:
         return out
 
     def keep(self):
+        """Save the armature's state for sampling actions; -> restore(). While sampling, the
+        armature's bone constraints are muted: an action is sampled as its own keys play it (e.g. a
+        retarget rig's constraints, which make the armature follow another one live, would otherwise
+        replace every action with that other armature's current motion)."""
         ad, sc = self.ad, bpy.context.scene
         state = (ad.action, getattr(ad, 'action_slot', None), sc.frame_current)
+        muted = [c for pb in self.arm.pose.bones for c in pb.constraints if not c.mute]
+        for c in muted:
+            c.mute = True
 
         def restore():
+            for c in muted:
+                c.mute = False
             ad.action = state[0]
             if state[1] is not None and hasattr(ad, 'action_slot'):
                 ad.action_slot = state[1]

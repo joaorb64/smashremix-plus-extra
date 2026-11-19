@@ -2150,7 +2150,7 @@ def _flags_owner(context):
     """The armature and its action with motion flags (the active object, or the scene's fighter)."""
     ob = context.active_object
     if ob is None or ob.type != 'ARMATURE':
-        ob = next((o for o in context.scene.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()), None)
+        ob = _scene_fighter(context)
     if ob is None or ob.animation_data is None or ob.animation_data.action is None:
         return ob, None
     act = ob.animation_data.action
@@ -2193,7 +2193,7 @@ class N64_OT_anim_load_bin(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def execute(self, context):
-        arm = next((o for o in context.scene.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()), None)
+        arm = _scene_fighter(context)
         if arm is None:
             self.report({'ERROR'}, 'No N64 fighter armature in this scene')
             return {'CANCELLED'}
@@ -2227,7 +2227,7 @@ class N64_OT_anim_save_bin(bpy.types.Operator):
 
     @staticmethod
     def _arm(context):
-        return next((o for o in context.scene.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()), None)
+        return _scene_fighter(context)
 
     def invoke(self, context, event):
         import json
@@ -4022,6 +4022,13 @@ def _armature_props():
 
 JOINT_BONE_PROPS = _joint_bone_props()
 ARMATURE_PROPS = _armature_props()
+
+
+def _scene_fighter(context):
+    """The scene's N64 fighter armature: the one named "fighter" (the export's), else the first one
+    carrying its custom properties (copies of it, e.g. a retarget rig's CLONE, have them too)."""
+    arms = [o for o in context.scene.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()]
+    return next((o for o in arms if o.name == 'fighter'), arms[0] if arms else None)
 
 
 def _fighter_armature(context):

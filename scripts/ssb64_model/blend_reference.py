@@ -266,6 +266,8 @@ def build(export_dir, arm):
     lc = _find_layer_coll(bpy.context.view_layer.layer_collection, top.name)
     if lc is not None:
         lc.hide_viewport = True
+    if info.get('shield_graphic'):
+        _shield_graphic(ref, info['shield_graphic'])
     return top
 
 
@@ -367,3 +369,119 @@ def _remove_fcurve(act, fc):
                 if fc in list(bag.fcurves):
                     bag.fcurves.remove(fc)
                     return
+
+
+def _driver(target, path, expr, variables, index=-1):
+    """A simple-expression driver (no Python needed: works without auto-run scripts)."""
+    fc = target.driver_add(path, index) if index >= 0 else target.driver_add(path)
+    drv = fc.driver
+    drv.type = 'SCRIPTED'
+    for name, ob, data_path in variables:
+        v = drv.variables.new()
+        v.name, v.type = name, 'SINGLE_PROP'
+        v.targets[0].id, v.targets[0].data_path = ob, data_path
+    drv.expression = expr
+    return fc
+
+
+def _sock(sockets, identifier):
+    return next(s for s in sockets if s.identifier == identifier)
+
+
+def _shield_graphic(ref, g):
+    """'Shield Graphic' next to the 'Shield Bubble' empty (build_blend.py): the game's shield
+    effect (reference.shield_graphic), a quad facing the game's camera (Blender's front view: the
+    game billboards it) on the bubble, half width = the bubble's size x (0.65 health / 55 + 0.35).
+    The bubble's custom properties: n64_shield_health (0..55) and n64_shield_port (0 P1, 1 P2,
+    2 P3, 3 P4 / CPU, 4 the frame it's hit). Preview only: the import reads the bubble's size."""
+    bub = bpy.data.objects.get('Shield Bubble')
+    if bub is None or not bub.users_collection:
+        return None
+    hmax = float(g.get('health_max', 55))
+    bub['n64_shield_health'] = hmax
+    bub.id_properties_ui('n64_shield_health').update(
+        min=0.0, max=hmax, description='Shield health (preview only): the shield shrinks with it')
+    bub['n64_shield_port'] = 0
+    bub.id_properties_ui('n64_shield_port').update(
+        min=0, max=len(g['colors']) - 1, description='Shield color: ' + ', '.join(
+            f'{i} {p}' for i, p in enumerate(g.get('ports', []))))
+    me = bpy.data.meshes.new('Shield Graphic')
+    me.from_pydata([(-1, 0, -1), (1, 0, -1), (1, 0, 1), (-1, 0, 1)], [], [(0, 1, 2, 3)])   # faces -Y
+    uv = me.uv_layers.new(name='UVMap')
+    for li, (u, v) in enumerate([(0, 0), (1, 0), (1, 1), (0, 1)]):
+        uv.data[li].uv = (u, v)
+    ob = bpy.data.objects.new('Shield Graphic', me)
+    for c in bub.users_collection:
+        c.objects.link(ob)
+    ob['n64_helper'] = True
+    ob.hide_select = True                     # (edit the bubble: this follows it)
+    # on the bubble's position, never its rotation (a billboard)
+    cl = ob.constraints.new('COPY_LOCATION')
+    cl.target = bub
+    sc = (f"size * max(abs(sx), abs(sy), abs(sz)) * ({1 - g.get('scale_min', 0.35):g} * "
+          f"min(max(h, 0), {hmax:g}) / {hmax:g} + {g.get('scale_min', 0.35):g})")
+    for i in range(3):
+        _driver(ob, 'scale', sc, [('size', bub, 'empty_display_size'), ('sx', bub, 'scale[0]'),
+                                  ('sy', bub, 'scale[1]'), ('sz', bub, 'scale[2]'),
+                                  ('h', bub, '["n64_shield_health"]')], i)
+
+    # material: color = lerp(env, prim, texel), alpha = texel alpha x prim alpha (0xC0)
+    m = bpy.data.materials.new('Shield Graphic')
+    m['n64_helper'] = True
+    m.use_nodes = True
+    for attr, val in (('surface_render_method', 'BLENDED'), ('blend_method', 'BLEND')):
+        try:
+            setattr(m, attr, val)
+        except (AttributeError, TypeError):
+            pass
+    try:
+        m.use_backface_culling = False
+    except AttributeError:
+        pass
+    nt = m.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new('ShaderNodeOutputMaterial')
+    img = bpy.data.images.load(os.path.join(ref, g['texture']), check_existing=True)
+    img.pack()
+    tex = nt.nodes.new('ShaderNodeTexImage')
+    tex.image, tex.extension = img, 'EXTEND'
+    # port colors: one RGB node each, picked by n64_shield_port (driven mix chain)
+    cols = []
+    for i, c in enumerate(g['colors']):
+        rgb = nt.nodes.new('ShaderNodeRGB')
+        rgb.label = f"Shield env {g.get('ports', [str(i)] * 99)[i]}"
+        rgb.outputs[0].default_value = (*_lin(c['env']), 1.0)
+        cols.append(rgb.outputs[0])
+    env = cols[0]
+    for i in range(1, len(cols)):
+        mix = nt.nodes.new('ShaderNodeMix')
+        mix.data_type = 'RGBA'
+        nt.links.new(env, _sock(mix.inputs, 'A_Color'))
+        nt.links.new(cols[i], _sock(mix.inputs, 'B_Color'))
+        _driver(_sock(mix.inputs, 'Factor_Float'), 'default_value', f'1 if round(p) == {i} else 0',
+                [('p', bub, '["n64_shield_port"]')])
+        env = _sock(mix.outputs, 'Result_Color')
+    prim = nt.nodes.new('ShaderNodeRGB')
+    prim.label = 'Shield prim'
+    prim.outputs[0].default_value = (*_lin(g['colors'][0]['prim']), 1.0)
+    lerp = nt.nodes.new('ShaderNodeMix')         # per channel: env + (prim - env) x texel
+    lerp.data_type = 'VECTOR'
+    lerp.factor_mode = 'NON_UNIFORM'
+    nt.links.new(tex.outputs['Color'], _sock(lerp.inputs, 'Factor_Vector'))
+    nt.links.new(env, _sock(lerp.inputs, 'A_Vector'))
+    nt.links.new(prim.outputs[0], _sock(lerp.inputs, 'B_Vector'))
+    emit = nt.nodes.new('ShaderNodeEmission')
+    nt.links.new(_sock(lerp.outputs, 'Result_Vector'), emit.inputs['Color'])
+    alpha = nt.nodes.new('ShaderNodeMath')
+    alpha.operation = 'MULTIPLY'
+    alpha.inputs[1].default_value = g.get('prim_alpha', 0xC0) / 255
+    nt.links.new(tex.outputs['Alpha'], alpha.inputs[0])
+    transp = nt.nodes.new('ShaderNodeBsdfTransparent')
+    mixs = nt.nodes.new('ShaderNodeMixShader')
+    nt.links.new(alpha.outputs[0], mixs.inputs[0])
+    nt.links.new(transp.outputs[0], mixs.inputs[1])
+    nt.links.new(emit.outputs[0], mixs.inputs[2])
+    nt.links.new(mixs.outputs[0], out.inputs['Surface'])
+    me.materials.append(m)
+    ob.show_in_front = True
+    return ob

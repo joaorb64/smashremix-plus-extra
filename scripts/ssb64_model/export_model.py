@@ -362,7 +362,7 @@ class Exporter:
         self.manifest['shield'] = dict(
             joints=sp['names'], frames=len(tl[0]), flags=f"{sp['flags']:08X}", int_head=sp['int_head'],
             lookup=sp['lookup_off'], file_size=sp['size'], source=sp.get('source'),
-            radius=MF.f32(self.f.main, self.f.attr + SP.A_SHIELD_SIZE),
+            radius=sp.get('radius', MF.f32(self.f.main, self.f.attr + SP.A_SHIELD_SIZE)),
             scripts=[''.join('S' if s is not None else '.' for s in sec['scripts']) for sec in sp['sectors']],
             keys={nm: ks for nm, ks in zip(sp['names'], sp['keys'])})
 
@@ -957,6 +957,43 @@ def rom_external_data(entries, entry):
     return bytes(data), ext
 
 
+def folder_external_data(cfg, char_dir, char_bytes):
+    """A character folder's character.bin followed by the vanilla files its EXTERNAL chain points
+    into (config.yaml offsets: character [internal, external head]; character_reqlist.txt: one file
+    ID per pointer, in chain order; files from motions.ORIGINAL_ROM), and {field offset: target
+    offset} for those pointers - like rom_external_data. Ryu's electric skeleton takes its bone
+    texture from vanilla file 0x12B this way. -> (data, ext, ext_head) (ext_head None: no chain)."""
+    off = (cfg.get('offsets') or {}).get('character') or []
+    ext_head = int(off[1], 16) if len(off) > 1 else 0x3FFFC
+    req = os.path.join(char_dir, 'character_reqlist.txt') if char_dir else None
+    if ext_head >= 0x3FFFC or not req or not os.path.exists(req):
+        return bytes(char_bytes), {}, None
+    ids = []
+    for ln in open(req, encoding='utf-8', errors='replace'):
+        ln = ln.strip()
+        if not ln or ln.startswith('END OF'):
+            continue
+        m = re.match(r'([0-9A-Fa-f]{1,4})\b', ln)
+        if not m:
+            raise SystemExit(f'{req}: "{ln}": only vanilla file IDs are supported in character_reqlist.txt')
+        ids.append(int(m.group(1), 16))
+    if not os.path.exists(MO.ORIGINAL_ROM):
+        raise SystemExit(f'character.bin has an external chain ({req}): needs {MO.ORIGINAL_ROM}')
+    entries = SSBtbl.fromROM(N64(open(MO.ORIGINAL_ROM, 'rb').read()))
+    data = bytearray(char_bytes)
+    links = list(MF.chain(bytes(data), ext_head).items())
+    if len(links) != len(ids):
+        raise SystemExit(f'{req}: {len(ids)} files for {len(links)} external pointers in character.bin')
+    base, ext = {}, {}
+    for (field_off, target), file_id in zip(links, ids):
+        if file_id not in base:
+            data.extend(bytes(-len(data) % 8))
+            base[file_id] = len(data)
+            data.extend(entries[file_id].extract('data'))
+        ext[field_off] = base[file_id] + target
+    return bytes(data), ext, ext_head
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('paths', nargs='+', metavar='PATH',
@@ -1088,7 +1125,15 @@ def main(argv=None):
     else:
         main_path = a.main or os.path.join(char_dir, 'main.bin')
         char_path = a.char or os.path.join(char_dir, 'character.bin')
-        f = MF.load(main_path, char_path, mi, me, ci)
+        char_data, char_ext, _ = folder_external_data(cfg, char_dir if not a.char else None,
+                                                      open(char_path, 'rb').read())
+        if char_ext:            # + the vanilla files its external chain points into (e.g. Ryu's bone texture)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                tmp_char = os.path.join(temp_dir, 'character.bin')
+                open(tmp_char, 'wb').write(char_data)
+                f = MF.load(main_path, tmp_char, mi, me, ci, char_ext)
+        else:
+            f = MF.load(main_path, char_path, mi, me, ci)
         shield = folder_shield_pose(cfg, char_dir) if char_dir and not (a.main or a.char) else None
 
     tf = (cfg.get('attributes') or {}).get('texture_forms') if not a.rom else None
@@ -1114,6 +1159,10 @@ def main(argv=None):
         try:
             ex.shield = SP.load(f, data, head)
             ex.shield['source'] = src
+            # the build writes config.yaml's shield_size over main.bin's (import_fighter compares to it)
+            cfg_r = (cfg.get('attributes') or {}).get('shield_size')
+            if cfg_r is not None:
+                ex.shield['radius'] = float(cfg_r)
         except ValueError as e:
             print(f'  note: no shield pose exported ({e})')
     if not a.no_animations:

@@ -454,7 +454,16 @@ def main(argv=None):
     ci_head = int(off.get('character', ['0004'])[0], 16)
     main_path = a.main or os.path.join(a.char_dir, 'main.bin')
     char_path = a.char or os.path.join(a.char_dir, 'character.bin')
-    f = MF.load(main_path, char_path, mi_head, me_head, ci_head)
+    char_data, char_ext, ce_head = EX.folder_external_data(cfg, a.char_dir if not a.char else None,
+                                                           open(char_path, 'rb').read())
+    if char_ext:   # + the vanilla files its external chain points into, as the export read them
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp_char = os.path.join(temp_dir, 'character.bin')
+            open(tmp_char, 'wb').write(char_data)
+            f = MF.load(main_path, tmp_char, mi_head, me_head, ci_head, char_ext)
+    else:
+        f = MF.load(main_path, char_path, mi_head, me_head, ci_head)
     N = a.costumes or cfg.get('num_costumes') or 1
     textures = Materials(a.work_dir, N, f.char, a.manifest)
     if not (a.costumes or cfg.get('num_costumes')) and textures.manifest.get('costumes'):
@@ -735,6 +744,12 @@ def main(argv=None):
         for fld in keep:
             struct.pack_into('>H', main, fld + 2, res.remap[f.main_ext[fld]] // 4)
         print(f'  old model removed: {len(char)} -> {len(res.data)} bytes')
+        # character.bin's external pointers (into vanilla files, appended above) must all have gone
+        # with the old model: the new one copies what it uses (the chain isn't rebuilt)
+        alive = [fld for fld in char_ext if res.remap.get(fld) is not None]
+        if alive:
+            raise SystemExit('character.bin external pointers outside the model survive at '
+                             + ', '.join(f'0x{x:X}' for x in alive) + ': not supported (its external chain)')
         char = bytearray(res.data)
     blob, retarget = build(len(char))
 
@@ -796,6 +811,20 @@ def main(argv=None):
     shield = apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines)
     open(os.path.join(out, 'character.bin'), 'wb').write(newc)
     open(os.path.join(out, 'main.bin'), 'wb').write(main)
+    if char_ext:   # the external chain is gone (its data copied in): no external head, no reqlist
+        line = f'character: ["{ci_head:04X}", "3FFFC"]'
+        if a.out is None:
+            cfg_path = os.path.join(a.char_dir, 'config.yaml')
+            raw = open(cfg_path, encoding='utf-8', newline='').read()
+            nl = '\r\n' if '\r\n' in raw else '\n'
+            text = GD.set_yaml(raw.replace('\r\n', '\n'), 'offsets.character', [line])
+            open(cfg_path, 'w', encoding='utf-8', newline='').write(text.replace('\n', nl))
+            os.remove(os.path.join(a.char_dir, 'character_reqlist.txt'))
+            print(f'  config.yaml offsets: {line}; character_reqlist.txt removed '
+                  '(its files are copied into character.bin now)')
+        else:
+            print(f'  config.yaml offsets needs (not updated: --out): {line}, and no '
+                  'character_reqlist.txt (its files are copied into character.bin now)')
     open(os.path.join(out, 'main_reqlist.txt'), 'w', encoding='utf-8', newline='').write(
         newline.join(reqlist_lines) + (newline if reqlist_raw.endswith(b'\n') else ''))
     print(f'wrote {out}/character.bin ({len(newc)} bytes), main.bin, main_reqlist.txt')

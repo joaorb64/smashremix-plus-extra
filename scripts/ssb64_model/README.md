@@ -292,7 +292,16 @@ rest): the Animation workspace opens with its Dope Sheet in **Action Editor**, p
 
 The `Shield` collection (hidden at first) has **Shield Bubble**, a sphere on `YRotN` with the
 fighter's `shield_size` (attributes + 0x74) as its radius: the shield at full health (the game's
-30-unit sphere on YRotN, scaled `shield_size / 30`).
+30-unit sphere on YRotN, scaled `shield_size / 30`). config.yaml `attributes.shield_size`, when
+there, is the size (the build writes it over main.bin's).
+
+With the ROM, **Shield Graphic** next to it is the shield as the game draws it (file 163, from
+`reference.py` -> `reference/shield.png`): a quad of `+-30` units with the bubble texture, on
+YRotN's position, always facing the camera (the game billboards it: in Blender it faces the
+front view). Its half width follows the bubble: size x `(0.65 x health / 55 + 0.35)`. Shield Bubble
+custom properties (preview only, not imported): `n64_shield_health` (0..55) and `n64_shield_port`
+(0 P1 red, 1 P2 green, 2 P3 blue, 3 P4 / CPU black, 4 the frame it's hit). Color = lerp(port color,
+white, texel), alpha = texel alpha x 0xC0, as `efManagerShieldProcDisplay` sets it.
 
 Which joints the file covers, in its order: the tree `lbCommonAddDObjAnimJointAll` walks from
 XRotN while guarding. That's the body joints `setup_parts` (attributes + 0x29C) creates, plus the
