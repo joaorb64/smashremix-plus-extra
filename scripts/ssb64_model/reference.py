@@ -77,6 +77,7 @@ def build_models(rom, folder, animations=True):
     from SSB import N64, SSBtbl
     os.makedirs(folder, exist_ok=True)
     models = dict(items=[], opponent=None)
+    entries = None
     for name, label in ITEMS:
         try:
             it = EX.load_rom_item(rom, name)
@@ -111,7 +112,39 @@ def build_models(rom, folder, animations=True):
                                   animations=[a['name'] for a in ex.fighter_anims])
     except (SystemExit, Exception) as e:                         # noqa: BLE001
         print(f'  note: reference opponent not exported ({e})')
+    try:
+        models['shield_graphic'] = shield_graphic(entries or SSBtbl.fromROM(N64(open(rom, 'rb').read())), folder)
+    except (SystemExit, Exception) as e:                         # noqa: BLE001
+        print(f'  note: shield graphic not exported ({e})')
     print(f"reference models: {', '.join(i['label'] for i in models['items'])}"
           + (f", opponent {models['opponent']['name']} ({len(models['opponent']['animations'])} animations)"
              if models['opponent'] else '') + f' -> {folder}')
     return models
+
+
+SHIELD_FILE = 163          # FTManagerCommon: the shield effect's model (decomp efManagerShieldMakeEffect)
+SHIELD_TEX, SHIELD_VTX = 0x8, 0x208
+# efManagerShieldProcDisplay: prim / env per port (index 4: the frame the shield is hit), alpha 0xC0
+SHIELD_COLORS = [((255, 255, 255), (255, 0, 0)), ((255, 255, 255), (0, 255, 0)), ((255, 255, 255), (0, 0, 255)),
+                 ((255, 255, 255), (0, 0, 0)), ((255, 255, 255), (192, 192, 192))]
+
+
+def shield_graphic(entries, folder):
+    """The shield bubble as the game draws it -> folder/shield.png + its draw parameters.
+
+    A camera-facing quad (matrix kinds 0x4F: YRotN's world position, scale = YRotN's world
+    scale; 0x2C: billboard) of +-30 units with a 16x32 IA8 half disc, mirrored in S (tile 32x32,
+    mirror + clamp), combiner color = lerp(env, prim, texel), alpha = texel alpha * prim alpha.
+    ftCommonGuardUpdateShieldCollision scales YRotN by (0.65 * health / 55 + 0.35) * shield_size / 30:
+    at full health the quad's half width is shield_size (in the fighter's unscaled space)."""
+    import model_files as MF
+    from PIL import Image
+    d = entries[SHIELD_FILE].extract('data')
+    half = max(abs(struct.unpack_from('>h', d, SHIELD_VTX + 16 * k)[0]) for k in range(4))
+    tex = MF.decode_texture(d, SHIELD_TEX, 3, 1, 16, 32, None)          # IA8 16x32
+    disc = np.concatenate([tex, tex[:, ::-1]], axis=1)                   # mirror in S -> 32x32
+    # vertex t = 32 at the quad's top (+y): texture rows run bottom -> top; the PNG is upright
+    Image.fromarray(np.ascontiguousarray(disc[::-1]), 'RGBA').save(os.path.join(folder, 'shield.png'))
+    return dict(texture='shield.png', half=half, prim_alpha=0xC0, health_max=55, scale_min=0.35,
+                colors=[dict(prim=p, env=e) for p, e in SHIELD_COLORS],
+                ports=['P1', 'P2', 'P3', 'P4 / CPU', 'Hit'])

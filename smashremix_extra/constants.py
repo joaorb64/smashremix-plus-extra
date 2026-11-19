@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 
 # Resolved relative to this file rather than CWD, since the smashremix
@@ -7,6 +8,22 @@ from dataclasses import dataclass
 # in as a submodule, with its own extra_characters/build/src at CWD).
 SMASHREMIX_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "smashremix")
+
+APPENDER_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def resource_path(path):
+    """A resource path (fonts, templates...) that works from any working directory.
+
+    Paths that exist as given are kept. Otherwise "appender/..." (written for builds run from
+    a content repo that has this repo as its "appender" submodule) and other relative paths
+    are looked up in this repo's folder, whatever it's called (e.g. a downloaded zip)."""
+    if not path or os.path.isabs(path) or os.path.exists(path):
+        return path
+    parts = re.split(r"[\\/]", path)
+    rest = parts[1:] if parts[0] == "appender" else parts
+    candidate = os.path.join(APPENDER_PATH, *rest)
+    return candidate if os.path.exists(candidate) else path
 
 VARIANT_TYPES = ["dl", "omega", "remix", "remix2", "remix3", "remix4", "remix5", "remix6"]
 

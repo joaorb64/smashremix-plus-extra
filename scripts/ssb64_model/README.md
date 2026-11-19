@@ -148,6 +148,45 @@ are optional;
 `export_model.py --help` lists them all), or the stage header file's hexadecimal ID (the decomp calls
 it the Map file). The ROM supplies the stage header and its referenced geometry files.
 
+#### Editing joints and layers: the N64 Stage panel
+
+3D View sidebar > **N64** > **N64 Stage** (stage .blend files) shows each layer as a tree, in draw order
+(top to bottom), each joint indented under its parent. Each row: a mesh icon (selects the joint's meshes;
+a dot: it has none), a bone icon (selects its bone, in Pose Mode: to animate it), its name (**Selected
+Joint > pencil** names it; else its meshes: faces and material) and small icons: animated, new, collision
+group, locked. Layers fold. Click the name: **Selected Joint** below shows its parent, children, what it's
+painted after / before, its meshes (**Put Selected Meshes Here**), animation, collision group, and actions.
+
+- **+** on a layer: **Add Joint** under any parent (no rest transform: it's placed by its animation).
+- Selected Joint: **Up / Down** move it (with its children) before / after its sibling, **Parent** hangs
+  it from another joint (it keeps its place in the world), **Remove** (its children move up; its meshes
+  must go first). Animations read from the game stay as the game's scripts while unchanged; edited, linear
+  keys store as two per segment (**Make Linear**).
+- **Remove Layer** (layers 2 and 3): the whole layer goes; the game then skips it.
+- **Put On Joint**: the selected meshes go on a joint (its layer collection, the joint's vertex group,
+  the armature). Model them around the joint's origin.
+- Animate a joint in Pose Mode like the others (Bone > N64 Joint Animation): location / rotation are
+  relative to its parent joint, in game space.
+
+The game stores a layer's joints depth first and draws them in that order (later = over earlier on the
+painted layers 0, 2 and 3), so after every edit the panel renumbers the layer depth first: bones,
+their vertex groups, animations and the meshes' joint follow. Each bone remembers which original joint
+it is (`n64_joint_orig`); the import (`import_stage.apply_joint_map`, from blend_to_gltf's `joint_map`)
+rebuilds the layers from that: a joint keeps its original's transform, DObjDesc flags, animation script
+and MObj order; new ones have no transform. An unedited layer stays byte-identical. A removed layer's
+header fields are emptied (their external pointers and `header_reqlist.txt` lines go).
+
+Collision groups and joints: collision group N moves / hides with layer 1's joint N (a hazard moves a
+platform's collision by animating that joint, and toggles a group by its number). The panel shows each
+layer 1 joint's group (and its edge count, or "empty": a group the stage's count reserves without lines);
+selecting a collision group mesh shows its joint (N64 Collision panel), with a button to select it. The
+count is the stage's own (scene `n64_collision_groups`, from the export), the same the import checks.
+
+Locked: joint 0 (the layer's root), layer 1's joints 0..N (they carry the collision groups, by index),
+layers 0 and 1 themselves. Hazard code may also address joints by index: check it after renumbering.
+On a layer drawn the "secondary" way (MPGroundData `layer_mask` bit set) every joint's display list is
+written as a DObjDLLink list, as the game reads them there.
+
 ### Hurtboxes (fighters)
 
 The `Hurtboxes` collection (hidden at first: its eye in the outliner, or **Show Hurtboxes** in the
@@ -253,7 +292,16 @@ rest): the Animation workspace opens with its Dope Sheet in **Action Editor**, p
 
 The `Shield` collection (hidden at first) has **Shield Bubble**, a sphere on `YRotN` with the
 fighter's `shield_size` (attributes + 0x74) as its radius: the shield at full health (the game's
-30-unit sphere on YRotN, scaled `shield_size / 30`).
+30-unit sphere on YRotN, scaled `shield_size / 30`). config.yaml `attributes.shield_size`, when
+there, is the size (the build writes it over main.bin's).
+
+With the ROM, **Shield Graphic** next to it is the shield as the game draws it (file 163, from
+`reference.py` -> `reference/shield.png`): a quad of `+-30` units with the bubble texture, on
+YRotN's position, always facing the camera (the game billboards it: in Blender it faces the
+front view). Its half width follows the bubble: size x `(0.65 x health / 55 + 0.35)`. Shield Bubble
+custom properties (preview only, not imported): `n64_shield_health` (0..55) and `n64_shield_port`
+(0 P1 red, 1 P2 green, 2 P3 blue, 3 P4 / CPU black, 4 the frame it's hit). Color = lerp(port color,
+white, texel), alpha = texel alpha x 0xC0, as `efManagerShieldProcDisplay` sets it.
 
 Which joints the file covers, in its order: the tree `lbCommonAddDObjAnimJointAll` walks from
 XRotN while guarding. That's the body joints `setup_parts` (attributes + 0x29C) creates, plus the

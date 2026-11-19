@@ -178,6 +178,9 @@ def build_stage(sc):
     """Manifest 'stage_collision' -> one editable edge mesh per group, Stage objects."""
     root = _coll('Collision')
     groups = max([sc.get('groups') or 0] + [ln['group'] for ln in sc['lines']])
+    # the stage's collision group (yakumono) count: group N moves / hides with layer 1's joint N (the
+    # N64 Stage panel shows the links and keeps those joints in place)
+    bpy.context.scene['n64_collision_groups'] = int(sc.get('groups') or groups)
     gcolls = {g: _coll(f'Group {g}', root) for g in range(1, groups + 1)}
     type_index = {name: i for i, name in enumerate(LINE_TYPES)}
     for group, collection in gcolls.items():

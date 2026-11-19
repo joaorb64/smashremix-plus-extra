@@ -14,6 +14,8 @@ with a fixed pixel gap, then box-filtered down to the final resolution.
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from smashremix_extra.constants import resource_path
+
 SS = 8  # supersampling factor
 
 DEFAULT_1P_FONT = "appender/templates/DFGothic EB.ttf"
@@ -72,6 +74,7 @@ def _render_line(text, font, stretch, gap, space, bold=0.0):
 
 def _font_for_cap(font_path, cap_px):
     """Load font_path at the size whose capital H is cap_px tall."""
+    font_path = resource_path(font_path)
     probe = ImageFont.truetype(font_path, 100 * SS)
     _, h = _cap_box(probe)
     size = int(round(100 * SS * cap_px * SS / h))

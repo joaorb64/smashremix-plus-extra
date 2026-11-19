@@ -191,6 +191,73 @@ sc = bpy.context.scene
 lights = {k: str(sc[f'n64_{k}_color']) for k in ('light', 'shadow') if f'n64_{k}_color' in sc.keys()}
 
 
+def export_joint_names():
+    """The joint (bone) names the export's model.gltf has (a stage's original joints)."""
+    gl_path = os.path.join(export_dir, 'model.gltf')
+    if not os.path.exists(gl_path):
+        return set()
+    return {n.get('name') for n in json.load(open(gl_path))['nodes']}
+
+
+def stage_orig_name(b, have):
+    """The export's name for a stage joint bone's original joint (its bone may have been renumbered:
+    n64_joint_orig, stamped by the N64 Stage panel before its first edit), None for a new joint."""
+    m = re.match(r'(L\d+)_joint_(\d+)$', b.name)
+    if not m:
+        return b.name if b.name in have else None
+    if 'n64_joint_orig' in b.keys():
+        o = int(b['n64_joint_orig'])
+        return f'{m.group(1)}_joint_{o:02d}' if o >= 0 else None
+    return b.name if b.name in have and not b.get('n64_new_joint') else None
+
+
+def stage_parent_index(b):
+    """A stage joint bone's parent joint (its parent bone when that is a joint of its layer, else the
+    layer's root; the root: None)."""
+    m = re.match(r'(L\d+)_joint_(\d+)$', b.name)
+    if int(m.group(2)) == 0:
+        return None
+    p = re.match(rf'{m.group(1)}_joint_(\d+)$', b.parent.name) if b.parent is not None else None
+    return int(p.group(1)) if p else 0
+
+
+def joint_map():
+    """Stages: every layer's joints as Blender has them -> {layer: [{index, orig, parent}]}: orig = the
+    export's joint it is (None: a new joint), parent = its parent joint. A layer the export had and
+    Blender has no bones for left: removed ([]). import_stage.py rebuilds the layers' joints from it."""
+    if bpy.context.scene.get('n64_kind') != 'stage':
+        return None
+    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
+    have = export_joint_names()
+    layers = {m.group(1) for n in have for m in [re.match(r'(L\d+)_joint_\d+$', n or '')] if m}
+    out = {L: [] for L in layers}
+    for b in (arm.data.bones if arm else []):
+        m = re.match(r'(L\d+)_joint_(\d+)$', b.name)
+        if not m:
+            continue
+        o = stage_orig_name(b, have)
+        out.setdefault(m.group(1), []).append(dict(index=int(m.group(2)), orig=int(o.split('_')[-1]) if o else None,
+                                                   parent=stage_parent_index(b)))
+    for rows in out.values():
+        rows.sort(key=lambda r: r['index'])
+    return out
+
+
+def new_joints():
+    """Stages: bones L<n>_joint_NN the export didn't have (new joints) -> {layer: {NN: parent NN}}: the
+    parent is the bone's parent when that is a joint of the same layer, else the layer's root (0)."""
+    arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
+    have = export_joint_names()
+    out = {}
+    for b in (arm.data.bones if arm else []):
+        m = re.match(r'(L\d+)_joint_(\d+)$', b.name)
+        if not m or b.name in have:
+            continue
+        p = re.match(rf'{m.group(1)}_joint_(\d+)$', b.parent.name) if b.parent else None
+        out.setdefault(m.group(1), {})[m.group(2).lstrip('0') or '0'] = int(p.group(1)) if p else 0
+    return out
+
+
 def joint_anims():
     """Stages: each animated joint's local transform per frame (bones L<n>_joint_NN that have
     a game animation: n64_anim_frames, or keyframes), over its own length -> {layer: {joint:
@@ -222,10 +289,14 @@ def joint_anims():
     A = Matrix(((1, 0, 0, 0), (0, 0, -1, 0), (0, 1, 0, 0), (0, 0, 0, 1)))     # glTF (Y up) -> Blender
     Ai = A.inverted()
     corr = {}                      # per bone: its rest axes vs the joint's (the importer's bone axes): a
+    have = set(by_name)
     for b in arm.data.bones:       # rotation only (bones have no rest scale: a joint's is in its pose)
-        if b.name in by_name:
-            j_rest = (A @ node_world(by_name[b.name]) @ Ai).to_3x3().normalized()
+        o = stage_orig_name(b, have)                     # (stage joints: renumbered ones by their original)
+        if o in by_name:
+            j_rest = (A @ node_world(by_name[o]) @ Ai).to_3x3().normalized()
             corr[b.name] = (j_rest.inverted() @ b.matrix_local.to_3x3().normalized()).to_4x4()
+        elif re.match(r'L\d+_joint_\d+$', b.name):       # a new stage joint: no rest transform
+            corr[b.name] = b.matrix_local.to_3x3().normalized().to_4x4()
     fcs = PANEL.anim_fcurves(arm) or []
     keyed = {m.group(1) for fc in fcs for m in [re.match(r'pose\.bones\["([^"]+)"\]', fc.data_path)] if m}
     todo = {}
@@ -256,8 +327,13 @@ def joint_anims():
             def game(pbone):                 # the joint's world matrix in glTF space this frame
                 return Ai @ pbone.matrix @ corr[pbone.name].inverted() @ A
             N = game(pb)
-            pi = parent.get(by_name[name])
-            pname = nodes[pi].get('name') if pi is not None else None
+            sm = re.match(r'(L\d+)_joint_\d+$', name)
+            if sm:                           # a stage joint: relative to its parent joint (as Blender has it)
+                pi = stage_parent_index(arm.data.bones[name])
+                pname = f'{sm.group(1)}_joint_{pi:02d}' if pi is not None else None
+            else:
+                pi = parent.get(by_name[name])
+                pname = nodes[pi].get('name') if pi is not None else None
             if pname in arm.pose.bones and pname in corr:
                 N = game(arm.pose.bones[pname]).inverted() @ N
             t['matrices'].append([v for row in N for v in row])
@@ -353,7 +429,8 @@ def shield_pose():
 # hurtboxes / stage collision (gamedata.py applies them)
 open(os.path.join(OUT, 'gamedata.json'), 'w').write(json.dumps(GDB.collect(), indent=1))
 json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims,
-               joint_anims=joint_anims(), fighter_anims=fighter_anims(),
+               joint_anims=joint_anims(), new_joints=new_joints(), joint_map=joint_map(),
+               fighter_anims=fighter_anims(),
                shield_pose=shield_pose()),
           open(os.path.join(OUT, 'costumes.json'), 'w'), indent=1)
 

@@ -274,8 +274,17 @@ class ModelWriter:
         joints = d['joints']
         W = [j.world for j in joints]
         links = {j.index for j in joints if j.dl is not None and MF.dl_links(f.char, f.char_int, j.dl)}
+        # a stage layer drawn the 'secondary' way (MPGroundData.layer_mask bit set: grDisplay /
+        # mnMaps draw it with gcDrawDObjTreeDLLinks) reads every joint's dl as a DObjDLLink list:
+        # joints that had none (or new ones) get theirs as lists too, else the game reads a bare
+        # display list as links and crashes
+        if f.object.get('kind') == 'stage' and re.fullmatch(r'L\d', detail) and \
+                f.main[f.attr + 0x44] >> int(detail[1:]) & 1:
+            links = set(range(len(joints)))
         prologue = prologue_for(f, d, textures.lights)
         order = {int(j): v for j, v in (textures.manifest.get('mobj_order') or {}).get(detail, {}).items()}
+        if d.get('joint_orig') is not None:          # (import_stage.apply_joint_map: joints renumbered)
+            order = {j.index: order[j.orig] for j in joints if j.orig is not None and j.orig in order}
         # one display list per DObjDLLink list (materials drawn from list 1 = translucent... keep it)
         man_mats = textures.manifest.get('materials') or {}
         link_of = lambda m: int((man_mats.get(IF.base_mat(m)) or {}).get('dl_link', 0))  # noqa: E731
@@ -347,7 +356,24 @@ class ModelWriter:
             targets[DATA] = joint_dl(0)
         else:
             n = len(joints)
-            arr = bytearray(f.char[d['dobjdesc']:d['dobjdesc'] + MF.DOBJDESC_SIZE * n + 4])
+            base, size = d['dobjdesc'], MF.DOBJDESC_SIZE
+            if d.get('joint_orig') is not None:       # (import_stage.apply_joint_map: the .blend's joints)
+                arr = bytearray()
+                for j in joints:                      # {u32 flags | depth, dl, translate, rotate, scale}
+                    src = base + size * j.orig if j.orig is not None else None
+                    flags = (MF.u32(f.char, src) & ~0xFFF) if src is not None else 0
+                    if j.keep:                        # (the original's bytes: unchanged)
+                        arr += struct.pack('>I', flags | j.depth) + f.char[src + 4:src + size]
+                    else:
+                        arr += struct.pack('>II9f', flags | j.depth, 0, *j.t, *j.r, *j.s)
+                end = base + size * d['orig_count']
+                arr += f.char[end:end + 4]            # (the end marker)
+            else:
+                n0 = d.get('orig_joints', n)          # (import_stage.add_new_joints: joints added)
+                arr = bytearray(f.char[base:base + size * n0])
+                for j in joints[n0:]:                 # {u32 depth, dl, translate, rotate, scale}
+                    arr += struct.pack('>II9f', j.depth, 0, *j.t, *j.r, *j.s)
+                arr += f.char[base + size * n0:base + size * n0 + 4]
             for j in range(n):
                 struct.pack_into('>I', arr, MF.DOBJDESC_SIZE * j + 4, 0)
             do = blob.add(bytes(arr), 8)
@@ -370,7 +396,12 @@ def write_joint_anims(f, work_dir, blob, remap):
     out = {}
     for name, d in f.details.items():
         joints, arr = d['joints'], d.get('anim')
-        orig = {j.index: f.char_int.get(arr + 4 * j.index) for j in joints} if arr is not None else {}
+        n0 = d.get('orig_joints', len(joints))       # (joints past these are new: no original script)
+        if d.get('joint_orig') is not None:          # (renumbered: each joint's original's script)
+            orig = {j.index: f.char_int.get(arr + 4 * j.orig) for j in joints if j.orig is not None} \
+                if arr is not None else {}
+        else:
+            orig = {j.index: f.char_int.get(arr + 4 * j.index) for j in joints[:n0]} if arr is not None else {}
         orig = {k: v for k, v in orig.items() if v is not None}
         mine = blend.get(name) or {}
         ptrs, changed = {}, False
