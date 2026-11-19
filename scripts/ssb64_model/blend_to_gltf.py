@@ -463,9 +463,17 @@ for me in {o.data for o in bpy.data.objects if o.type == 'MESH'}:      # (costum
     if len(me.uv_layers) > 6:
         print(f'  warning: {me.name}: no room for the vertex color UV maps (8 max); its colors use COLOR_0')
         continue
-    uv_rg, uv_ba = me.uv_layers.new(name='N64_RG'), me.uv_layers.new(name='N64_BA')
-    for li, loop in enumerate(me.loops):
-        c = attr.data[li if attr.domain == 'CORNER' else loop.vertex_index].color_srgb
+    # read the colors before adding the UV maps: adding attributes reallocates the mesh's
+    # attribute storage, which leaves `attr` (and its .data) dangling (IndexError, size 0)
+    corner = attr.domain == 'CORNER'
+    if len(attr.data) == 0:
+        continue
+    cols = [tuple(attr.data[li if corner else loop.vertex_index].color_srgb)
+            for li, loop in enumerate(me.loops)]
+    me.uv_layers.new(name='N64_RG')
+    me.uv_layers.new(name='N64_BA')
+    uv_rg, uv_ba = me.uv_layers['N64_RG'], me.uv_layers['N64_BA']
+    for li, c in enumerate(cols):
         uv_rg.data[li].uv = (c[0], c[1])
         uv_ba.data[li].uv = (c[2], c[3])
 
