@@ -336,10 +336,27 @@ def tex_flip_v(scene=None):
     return bool(scene is not None and scene.get('n64_tex_flip_v'))
 
 
+# bumped when the material view's nodes change: blends made before rebuild them once (register)
+VIEW_VERSION = 2
+
+
+def refresh_old_views():
+    try:
+        mats = list(bpy.data.materials)
+    except AttributeError:                   # (add-on registered before a file is loaded)
+        return
+    for m in mats:
+        if m.node_tree is None or m.get('_n64_view_ver', 1) >= VIEW_VERSION:
+            continue
+        if any(n.name.startswith('N64 CC') for n in m.node_tree.nodes):
+            update_view(m)
+
+
 def update_view(m, context=None):
     """Make the material's look in Blender follow its n64_* settings."""
     if not isinstance(m, bpy.types.Material) or m.node_tree is None:
         return
+    m['_n64_view_ver'] = VIEW_VERSION
     nt = m.node_tree
     tex = _image_node(m)
     out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
@@ -461,6 +478,7 @@ def _recolored(src, pal0, palp, name):
         if img is not None:
             bpy.data.images.remove(img)
         img = bpy.data.images.new(name, src.size[0], src.size[1], alpha=True)
+    game_alpha(img)
     img.pixels.foreach_set(out.ravel())
     img.update()
     try:
@@ -613,7 +631,12 @@ def _format_view(m, node, nt, color, alpha):
         return math('DIVIDE', math('FLOOR', math('MULTIPLY', x, 255.0 / (1 << (8 - b)))), float((1 << b) - 1))
 
     def one_bit(a):
-        return math('GREATER_THAN', a, 0.4999)
+        # 1-bit alpha is per texel (the build stores it so); the game filters between texels
+        # (bilinear), so the sampled alpha is fractional at a cut-out's edge, and its color there
+        # mixes in the transparent texels' color: with a low alpha compare that's the dark border
+        # the game draws. Snapping the filtered alpha here would cut at 50% and hide it: kept as
+        # filtered (images edited with soft alpha preview soft; the build makes each texel on/off).
+        return a
     if fmt.startswith('CI'):             # palette colors are RGBA5551: alpha on / off
         return color, one_bit(alpha)
     g = node('ShaderNodeGamma')          # linear -> the game's values
@@ -1116,10 +1139,34 @@ class N64_OT_texture_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def game_alpha(img):
+    """The game filters a texture's color and alpha separately (bilinear on straight alpha): the
+    color under transparent texels bleeds into the edge texels that pass the alpha compare (a
+    dark border around a cut-out when they're black). Blender filters premultiplied (that color is
+    lost) unless the image is Channel Packed: set so, it shows the same border."""
+    if img is not None and getattr(img, 'alpha_mode', None) not in (None, 'CHANNEL_PACKED', 'NONE'):
+        try:
+            img.alpha_mode = 'CHANNEL_PACKED'
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+    return img
+
+
+def game_alpha_all():
+    try:
+        images = list(bpy.data.images)
+    except AttributeError:                   # (add-on registered before a file is loaded)
+        return
+    for img in images:
+        game_alpha(img)
+
+
 def _image_changed(*_):
     """An image was picked / opened on a texture node: refresh those materials' N64 view."""
     for m in bpy.data.materials:
         tex = _tex_node(m)
+        if tex is not None:
+            game_alpha(tex.image)
         name = tex.image.name if tex is not None and tex.image is not None else ''
         if m.get('_n64_image', '') != name:
             m['_n64_image'] = name
@@ -1662,7 +1709,7 @@ def new_frame_image(src, name):
         tmp.filepath_raw, tmp.file_format = path, 'PNG'
         tmp.save()
         bpy.data.images.remove(tmp)
-    img = bpy.data.images.load(path)
+    img = game_alpha(bpy.data.images.load(path))
     img.name = name
     img.filepath = rel
     return img
@@ -4415,8 +4462,8 @@ def _load_image(path):
     want = os.path.normpath(path)
     for img in bpy.data.images:                 # (the .blend's own copy: a relative path)
         if img.filepath and os.path.normpath(bpy.path.abspath(img.filepath, library=img.library)) == want:
-            return img
-    return bpy.data.images.load(path, check_existing=True)
+            return game_alpha(img)
+    return game_alpha(bpy.data.images.load(path, check_existing=True))
 
 
 def _costume_mat(base, k):
@@ -6272,6 +6319,8 @@ def register():
             ob.show_in_front = True
             _set_collision_group_renderer(ob)
     _register_collision_draw_handler()
+    game_alpha_all()                       # (blends made before: their images filter like the game's)
+    refresh_old_views()
     for name, prop in {**PROPS, **ADV_PROPS}.items():
         setattr(bpy.types.Material, name, prop)
     bpy.types.Material.n64ui_anim_loop = bpy.props.BoolProperty(get=_mat_loop_get, set=_mat_loop_set,

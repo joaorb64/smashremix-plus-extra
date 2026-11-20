@@ -85,6 +85,7 @@ def image(rel):
     if img is None:
         img = bpy.data.images.load(os.path.join(DIR, rel), check_existing=True)
         img.filepath = '//' + rel
+    img.alpha_mode = 'CHANNEL_PACKED'      # filtered like the game (n64_panel.game_alpha)
     return img
 
 
@@ -131,6 +132,8 @@ for m in bpy.data.materials:
         for node in m.node_tree.nodes:
             if node.type == 'TEX_IMAGE':
                 node.interpolation = 'Linear'                # the game filters (bilinear)
+                if node.image is not None:          # color and alpha filtered apart, like the game:
+                    node.image.alpha_mode = 'CHANNEL_PACKED'     # cut-outs get its edge border
                 if entry and entry.get('wrap'):     # Blender has one mode for both axes: use S's
                     try:
                         node.extension = EXTENSION.get(entry['wrap'].get('s'), 'REPEAT')

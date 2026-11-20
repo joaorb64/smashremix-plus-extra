@@ -80,6 +80,7 @@ def _material(name, entry, folder, lights=None):
     if png and os.path.exists(png) and bsdf is not None:
         tex = nt.nodes.new('ShaderNodeTexImage')
         tex.image = bpy.data.images.load(png, check_existing=True)
+        tex.image.alpha_mode = 'CHANNEL_PACKED'     # filtered like the game (cut-out edges)
         tex.location = (-400, 200)
         try:
             tex.extension = {'repeat': 'REPEAT', 'mirror': 'MIRROR'}.get((entry.get('wrap') or {}).get('s'), 'EXTEND')
@@ -447,6 +448,7 @@ def _shield_graphic(ref, g):
     nt.nodes.clear()
     out = nt.nodes.new('ShaderNodeOutputMaterial')
     img = bpy.data.images.load(os.path.join(ref, g['texture']), check_existing=True)
+    img.alpha_mode = 'CHANNEL_PACKED'
     img.pack()
     tex = nt.nodes.new('ShaderNodeTexImage')
     tex.image, tex.extension = img, 'EXTEND'
