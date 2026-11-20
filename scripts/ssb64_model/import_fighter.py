@@ -246,17 +246,21 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
         by_material = {}
         for mat, tri in triangles:
             by_material.setdefault(base_mat(mat), []).append((mat, tri))
+        want, have = {}, {k: len(v) for k, v in by_material.items()}
+        for run in runs:
+            want[base_mat(run['material'])] = want.get(base_mat(run['material']), 0) + int(run['triangles'])
+        if want != have:
+            # edited in Blender (triangles added / removed): the export's runs no longer say how its
+            # triangles interleave: drawn by material, in the export's material order
+            print(f"  note: {o['name']}: edited ({sum(want.values())} -> {sum(have.values())} triangles): drawn by "
+                  'material in the export\'s order (its original interleaved draw runs no longer apply)')
+            return triangles
         out = []
         for run in runs:
             name, count = base_mat(run['material']), int(run['triangles'])
             entries = by_material.get(name, [])
-            if len(entries) < count:
-                raise SystemExit(f"{o['name']}: draw-order manifest requests {count} triangles for {name}, "
-                                 f"but the Blender mesh has {len(entries)}")
             out.extend(entries[:count])
             del entries[:count]
-        if any(entries for entries in by_material.values()):
-            raise SystemExit(f"{o['name']}: Blender mesh triangles do not match the stage draw-order manifest")
         return out
 
     for o in objs:
