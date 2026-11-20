@@ -315,12 +315,24 @@ def export(hat_bin, out_dir, rom_path=DEFAULT_ROM, animations=True, preview=True
     os.makedirs(out_dir)
     shutil.copy(hat_bin, os.path.join(out_dir, 'exported_' + BIN))
     ex = EX.Exporter(f, out_dir, 1)
-    if animations:                       # every Kirby animation, for reference
+    if animations:                       # the character's Kirby animations, then every ROM Kirby one
+        own = []
+        try:
+            own = hat_animations(os.path.dirname(os.path.dirname(os.path.abspath(hat_bin))), f)
+        except (OSError, ValueError, KeyError) as e:
+            print(f'  note: no kirby_hat/animations exported ({e})')
+        rom = []
         try:
             _, _, _, entries = rom_kirby(rom_path)
-            ex.fighter_anims = EX.rom_animations(entries, f, 'KIRBY')
+            rom = EX.rom_animations(entries, f, 'KIRBY')
         except (OSError, ValueError, KeyError) as e:
             print(f'  note: no Kirby animations exported ({e})')
+        taken = {x['name'] for x in own}
+        for x in rom:
+            while x['name'] in taken:
+                x['name'] += '_'
+            taken.add(x['name'])
+        ex.fighter_anims = own + rom
     ex.manifest['source'] = dict(kind='kirby_hat', folder=os.path.abspath(os.path.dirname(hat_bin)),
                                  rom=os.path.abspath(rom_path))
     ex.manifest['kirby_hat'] = dict(info, joint=HAT_JOINT, item_joint=ITEM_JOINT)
@@ -335,6 +347,79 @@ def export(hat_bin, out_dir, rom_path=DEFAULT_ROM, animations=True, preview=True
           + (f', item: part {info["item_variant"]} of joint {ITEM_JOINT}' if 'item_variant' in info else '')
           + f') -> {out_dir}')
     return out_dir
+
+
+ANIM_DIR = 'animations'      # (in the kirby_hat folder) Kirby's animations for the copied moves
+
+
+def hat_animations(char_dir, f):
+    """The character's kirby_hat/animations/*.bin (Kirby's animations for its copied moves), with
+    the flags its main.asm gives the Kirby actions playing them (add_new_action_params(KIRBY /
+    JKIRBY, ...); -1: Kirby's vanilla ones). Source 'kirby_hat/animations/<file>'."""
+    import export_model as EX
+    import figatree as FT
+    import motions as MO
+    adir = os.path.join(char_dir, 'kirby_hat', ANIM_DIR)
+    if not os.path.isdir(adir):
+        return []
+    name = os.path.basename(os.path.normpath(char_dir))
+    try:
+        mot, _ = MO.folder_motions(char_dir, name, 'KIRBY', anim_dir=f'kirby_hat/{ANIM_DIR}',
+                                   file_kind='KIRBY_ANIM', owners={'KIRBY', 'JKIRBY'})
+    except OSError as e:
+        print(f'  note: Kirby action flags not read ({e}); guessing them from each file\'s joint count')
+        mot = {}
+    out = []
+    for fn in sorted(os.listdir(adir), key=str.lower):
+        if not fn.lower().endswith('.bin'):
+            continue
+        stem = fn[:-4]
+        data = open(os.path.join(adir, fn), 'rb').read()
+        e = mot.get(stem) or dict(flags=None, actions=[], conflicts=[])
+        e['actions'] = list(dict.fromkeys(e['actions']))      # (KIRBY and JKIRBY lines: the same names)
+        flags, guessed = FT.pick_flags(f, data, [e['flags']] + [c[1] for c in e['conflicts']])
+        try:
+            anim = FT.load(f, data, flags=flags)
+        except Exception as err:          # (a file that isn't an animation)
+            print(f'  note: kirby_hat/{ANIM_DIR}/{fn}: not read ({err})')
+            continue
+        out.append(dict(name=EX.animation_name([stem] + e['actions'], ' (copy)'), anim=anim,
+                        actions=e['actions'], flags=flags, guessed=guessed or not e['actions'],
+                        source=f'kirby_hat/{ANIM_DIR}/{fn}'))
+    print(f'  {len(out)} kirby_hat animations ({sum(1 for x in out if x["guessed"])} with guessed flags)')
+    return out
+
+
+def import_animations(work_dir, export_dir, man, f, hat_dir):
+    """The character's Kirby animations edited in Blender (blend_to_gltf.py's changed fighter
+    animations whose source is kirby_hat/animations/<file>) -> HAT_DIR/animations/<file>.
+    (Flags changed in Blender: main.asm's add_new_action_params lines are left for you.)"""
+    import figatree as FT
+    try:
+        changed = json.load(open(os.path.join(work_dir, 'costumes.json'))).get('fighter_anims') or []
+    except (OSError, ValueError):
+        changed = []
+    infos = man.get('fighter_animations') or {}
+    prefix = f'kirby_hat/{ANIM_DIR}/'
+    for c in changed:
+        src = (infos.get(c['export_name']) or {}).get('source') or ''
+        if not src.startswith(prefix):
+            if c.get('export_name') in infos:
+                print(f'  note: {c["name"]}: Kirby\'s own (ROM) animation, edited: not written')
+            continue
+        flags = int(str(c['flags']), 16)
+        written = FT.written_flags(flags)
+        loops = {b: True for b in c['values']} if c.get('loop') else None
+        data = FT.encode_animation(f, written, c['values'], c['frames'], loops=loops, candidates=c.get('keys'))
+        adir = os.path.join(hat_dir, ANIM_DIR)
+        os.makedirs(adir, exist_ok=True)
+        path = os.path.join(adir, src[len(prefix):])
+        before = os.path.getsize(path) if os.path.exists(path) else 0
+        open(path, 'wb').write(data)
+        msg = f'  kirby animation {src[len(prefix):]}: {before} -> {len(data)} bytes'
+        if written != int(str(c.get('flags_before') or '0'), 16):
+            msg += f'; flags now {written:08X}: update its add_new_action_params lines in main.asm'
+        print(msg)
 
 
 def import_blend(work_dir, export_dir, hat_bin, rom_path=None):
@@ -398,6 +483,7 @@ def import_blend(work_dir, export_dir, hat_bin, rom_path=None):
     data = pack(f, char_raw, char_head, textures, hat, item, n, extra_hats=extras)
     open(hat_bin, 'wb').write(data)
     print(f'wrote {hat_bin} ({len(data)} bytes)')
+    import_animations(work_dir, export_dir, man, f, os.path.dirname(os.path.abspath(hat_bin)))
     return hat_bin
 
 

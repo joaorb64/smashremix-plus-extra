@@ -390,9 +390,10 @@ def _sock(sockets, identifier):
 
 def _shield_graphic(ref, g):
     """'Shield Graphic' next to the 'Shield Bubble' empty (build_blend.py): the game's shield
-    effect (reference.shield_graphic), a quad facing the game's camera (Blender's front view: the
-    game billboards it) on the bubble, half width = the bubble's size x (0.65 health / 55 + 0.35).
-    The bubble's custom properties: n64_shield_health (0..55) and n64_shield_port (0 P1, 1 P2,
+    effect (reference.shield_graphic), a quad the panel (n64_panel._shield_billboard_tick) keeps
+    facing the 3D view (the game billboards it), at the bubble's front (drawn over the fighter), half width = the bubble's size x (0.65 health / 55 + 0.35).
+    The bubble's custom properties: n64_shield_health (0..55), n64_shield_opacity (preview only)
+    and n64_shield_port (0 P1, 1 P2,
     2 P3, 3 P4 / CPU, 4 the frame it's hit). Preview only: the import reads the bubble's size."""
     bub = bpy.data.objects.get('Shield Bubble')
     if bub is None or not bub.users_collection:
@@ -401,6 +402,10 @@ def _shield_graphic(ref, g):
     bub['n64_shield_health'] = hmax
     bub.id_properties_ui('n64_shield_health').update(
         min=0.0, max=hmax, description='Shield health (preview only): the shield shrinks with it')
+    bub['n64_shield_opacity'] = 0.35
+    bub.id_properties_ui('n64_shield_opacity').update(
+        min=0.0, max=1.0, description='Shield graphic opacity (preview only; the game draws it at '
+                                      f"{g.get('prim_alpha', 0xC0) / 255:.2f} of its texture alpha): low to see the fighter")
     bub['n64_shield_port'] = 0
     bub.id_properties_ui('n64_shield_port').update(
         min=0, max=len(g['colors']) - 1, description='Shield color: ' + ', '.join(
@@ -476,6 +481,12 @@ def _shield_graphic(ref, g):
     alpha.operation = 'MULTIPLY'
     alpha.inputs[1].default_value = g.get('prim_alpha', 0xC0) / 255
     nt.links.new(tex.outputs['Alpha'], alpha.inputs[0])
+    fade = nt.nodes.new('ShaderNodeMath')        # x the preview opacity (n64_shield_opacity)
+    fade.operation = 'MULTIPLY'
+    fade.label = 'Preview opacity'
+    nt.links.new(alpha.outputs[0], fade.inputs[0])
+    _driver(fade.inputs[1], 'default_value', 'o', [('o', bub, '["n64_shield_opacity"]')])
+    alpha = fade
     transp = nt.nodes.new('ShaderNodeBsdfTransparent')
     mixs = nt.nodes.new('ShaderNodeMixShader')
     nt.links.new(alpha.outputs[0], mixs.inputs[0])

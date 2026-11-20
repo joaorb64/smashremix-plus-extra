@@ -109,7 +109,9 @@ scripts) using config.yaml `offsets:`. Meshes are `L<n>_j<joint>`, bones
 its DObj joints (rooms) are the meshes `L<n>_j<joint>` in its `Layer <n> - <type>` collection. Layer 0 is the
 background, layer 1 is the z-buffered stage/collision-group layer, and layers 2 and 3
 are foreground. Layer 1's joints are the groups the hazard code toggles, by index.
-`previews/stage.png`: the whole stage from the six sides; `previews/layers.png`: each
+`previews/stage.png`: the whole stage from the six sides; `previews/camera.png`: the whole stage
+through the game camera (the .blend's `Game Camera`: 38 degree perspective framing the camera
+bounds, tilted by `light_angle` z); `previews/layers.png`: each
 layer alone.
 
 Layer types (decomp grdisplay.c), drawn in this order:
@@ -290,16 +292,19 @@ rest): the Animation workspace opens with its Dope Sheet in **Action Editor**, p
   plays its sector script as it is (`ftCommonGuardInitJoints` starts at `dobj_lookup[1]`), so
   e.g. Snake's 90-degree XRotN neutral doesn't show in game.
 
-The `Shield` collection (hidden at first) has **Shield Bubble**, a sphere on `YRotN` with the
+The `Shield` collection (hidden at first; shown while the fighter's action is `Shield` or `Shield
+Neutral`, hidden again after when it was shown that way) has **Shield Bubble**, a sphere on `YRotN` with the
 fighter's `shield_size` (attributes + 0x74) as its radius: the shield at full health (the game's
 30-unit sphere on YRotN, scaled `shield_size / 30`). config.yaml `attributes.shield_size`, when
 there, is the size (the build writes it over main.bin's).
 
 With the ROM, **Shield Graphic** next to it is the shield as the game draws it (file 163, from
 `reference.py` -> `reference/shield.png`): a quad of `+-30` units with the bubble texture, on
-YRotN's position, always facing the camera (the game billboards it: in Blender it faces the
-front view). Its half width follows the bubble: size x `(0.65 x health / 55 + 0.35)`. Shield Bubble
-custom properties (preview only, not imported): `n64_shield_health` (0..55) and `n64_shield_port`
+YRotN's position, always facing the camera (the game billboards it: in Blender the panel turns it
+to the largest 3D view every 0.1 s, or to the scene camera in camera view, and moves it to the
+bubble's front so it's drawn over the fighter). Its half width follows the bubble: size x
+`(0.65 x health / 55 + 0.35)`. Shield Bubble custom properties (preview only, not imported):
+`n64_shield_health` (0..55), `n64_shield_opacity` (default 0.35, to see the fighter) and `n64_shield_port`
 (0 P1 red, 1 P2 green, 2 P3 blue, 3 P4 / CPU black, 4 the frame it's hit). Color = lerp(port color,
 white, texel), alpha = texel alpha x 0xC0, as `efManagerShieldProcDisplay` sets it.
 
@@ -820,6 +825,11 @@ the hat as his body's model part (`part<H>_*_j02`) and holding the item as his h
 (`part<I>_*_j13`), both shown in Model parts. `import OUT_DIR` writes the character's files and
 then `kirby_hat.bin` from that blend (`import OUT_DIR/kirby_hat` does only the hat). The hat
 part's Kirby-body triangles are reference only: the file always takes the ROM's body.
+The character's own Kirby animations, `kirby_hat/animations/*.bin`, come first in that blend,
+named `<file> | <Kirby actions> (copy)`, with the flags from main.asm's
+`add_new_action_params(KIRBY / JKIRBY, ...)` lines. When you edit one, the import writes it back to
+`kirby_hat/animations/` (if you change its flags, update the main.asm lines yourself). Edits to
+Kirby's ROM animations are not written.
 `kirby_hat.py new HAT_DIR` starts one, `kirby_hat.py preview BIN OUT.png` renders it.
 
 ## Reference items and opponent (fighters)
@@ -867,6 +877,10 @@ figatree.encode_animation), for the flags in the dialog (default: the action's, 
 Loop setting. Files are written in the 16-bit format, so the motion playing it needs the flags
 without 0x8 (the report says which). Default path: the file the action was loaded from, else the
 character's `animations/<action>.bin`.
+
+**Rest Pose** (below them) puts the fighter back at rest: it picks the `Rest Pose` action (one key
+per bone at frame 0, at rest; the export makes it, the button makes it when missing). It isn't a
+game animation: the import ignores it.
 
 **Lock Bones Not in This Animation** (N64 Animation panel, on by default): the bones the active
 action's file has no script for are locked (transform locks) and hidden - the joints its motion

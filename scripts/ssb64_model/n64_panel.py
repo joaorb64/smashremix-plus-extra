@@ -2006,6 +2006,147 @@ def _sync_loops_on_update(scene, depsgraph):
         sync_loops()
         _follow_action_range(scene)
         _sync_bone_locks(scene)
+        _sync_shield_collection(scene)
+
+
+# ---- shield preview: the Shield collection (Shield Bubble + Shield Graphic, build_blend.py /
+# blend_reference.py) shows itself while a shield action ('Shield' / 'Shield Neutral') is the
+# fighter's, and hides again after (only when it was shown this way). The graphic is a billboard
+# like the game's: a timer turns it to the 3D view (the largest one; its camera in camera view)
+# and puts it at the bubble's front, so it's drawn over the fighter.
+SHIELD_ACTIONS = ('Shield', 'Shield Neutral')
+_SHIELD_STATE = {}
+
+
+def _shield_lc(view_layer):
+    def find(lc):
+        if lc.collection.name == 'Shield':
+            return lc
+        for ch in lc.children:
+            r = find(ch)
+            if r is not None:
+                return r
+        return None
+    return find(view_layer.layer_collection)
+
+
+def _sync_shield_collection(scene):
+    arms = [o for o in scene.objects if o.type == 'ARMATURE' and 'n64_hidden_parts' in o.keys()]
+    arm = next((o for o in arms if o.name == 'fighter'), arms[0] if arms else None)
+    if arm is None or bpy.data.objects.get('Shield Bubble') is None:
+        return
+    act = arm.animation_data.action if arm.animation_data is not None else None
+    on = act is not None and act.name in SHIELD_ACTIONS
+    if _SHIELD_STATE.get(scene.name) == on:
+        return
+    _SHIELD_STATE[scene.name] = on
+    for vl in scene.view_layers:
+        lc = _shield_lc(vl)
+        if lc is None:
+            continue
+        if on and lc.hide_viewport:
+            lc.hide_viewport = False
+            scene['n64_shield_auto_shown'] = True
+        elif not on and scene.get('n64_shield_auto_shown'):
+            lc.hide_viewport = True
+    if not on and 'n64_shield_auto_shown' in scene.keys():
+        del scene['n64_shield_auto_shown']
+
+
+_SHIELD_FACE = mathutils.Quaternion((1.0, 0.0, 0.0), -math.pi / 2)    # the quad's -Y normal -> view +Z
+
+
+def _shield_view_rotation(scene):
+    best, area_max = None, -1
+    wm = bpy.context.window_manager
+    for win in (wm.windows if wm else []):
+        for area in win.screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+            r3d = area.spaces.active.region_3d
+            if r3d is None or area.width * area.height <= area_max:
+                continue
+            area_max = area.width * area.height
+            if r3d.view_perspective == 'CAMERA' and scene.camera is not None:
+                best = scene.camera.matrix_world.to_quaternion()
+            else:
+                best = r3d.view_rotation.copy()
+    return best
+
+
+def _shield_billboard_tick():
+    try:
+        scene = bpy.context.scene
+        ob = bpy.data.objects.get('Shield Graphic')
+        if scene is None or ob is None or not ob.visible_get():
+            return 0.1
+        rot = _shield_view_rotation(scene)
+        if rot is None:
+            return 0.1
+        q = rot @ _SHIELD_FACE
+        loc = rot @ mathutils.Vector((0.0, 0.0, 1.0)) * abs(ob.scale.x)    # to the bubble's front
+        cl = next((c for c in ob.constraints if c.type == 'COPY_LOCATION'), None)
+        if cl is not None and not cl.use_offset:
+            cl.use_offset = True
+        if ob.rotation_mode != 'QUATERNION':
+            ob.rotation_mode = 'QUATERNION'
+        if ob.rotation_quaternion.rotation_difference(q).angle > 1e-4:
+            ob.rotation_quaternion = q
+        if (ob.location - loc).length > 1e-3:
+            ob.location = loc
+    except (ReferenceError, AttributeError, RuntimeError):
+        pass
+    return 0.1
+
+
+# ---- 'Rest Pose': an action with one key (frame 0) on every bone at its rest transform; pick it
+# to put the fighter back at rest. Not a game animation (no n64_export): the import ignores it.
+REST_ACTION = 'Rest Pose'
+
+
+def ensure_rest_action(arm):
+    act = bpy.data.actions.get(REST_ACTION)
+    if act is None:
+        act = bpy.data.actions.new(REST_ACTION)
+    act.use_fake_user = True
+    act['n64_helper'] = True
+    ad = arm.animation_data or arm.animation_data_create()
+    before = ad.action
+    ad.action = act
+    for pb in arm.pose.bones:
+        pb.location, pb.scale = (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
+        pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+        pb.rotation_euler = (0.0, 0.0, 0.0)
+        pb.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
+        rot = {'QUATERNION': 'rotation_quaternion', 'AXIS_ANGLE': 'rotation_axis_angle'}.get(
+            pb.rotation_mode, 'rotation_euler')
+        for path in ('location', rot, 'scale'):
+            pb.keyframe_insert(path, frame=0, group=pb.name)
+    try:
+        act.use_frame_range = True
+        act.frame_start, act.frame_end = 0, 1
+    except (AttributeError, TypeError):
+        pass
+    ad.action = before
+    return act
+
+
+class N64_OT_rest_pose(bpy.types.Operator):
+    bl_idname = 'n64.rest_pose'
+    bl_label = 'Rest Pose'
+    bl_description = ("Put the fighter back at its rest pose: picks the 'Rest Pose' action (one key per "
+                      'bone at rest; made if missing). Not a game animation: the import ignores it')
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        arm = _scene_fighter(context)
+        if arm is None:
+            self.report({'ERROR'}, 'No N64 fighter armature in this scene')
+            return {'CANCELLED'}
+        act = bpy.data.actions.get(REST_ACTION) or ensure_rest_action(arm)
+        (arm.animation_data or arm.animation_data_create()).action = act
+        context.scene.frame_set(0)
+        return {'FINISHED'}
 
 
 def _last_key(fcurves):
@@ -2291,6 +2432,7 @@ def draw_motion_flags(lay, context):
     row = lay.row(align=True)
     row.operator('n64.anim_load_bin', icon='IMPORT')
     row.operator('n64.anim_save_bin', icon='EXPORT')
+    lay.operator('n64.rest_pose', icon='ARMATURE_DATA')
     ob, act = _flags_owner(context)
     if act is None:
         lay.label(text='Pick a fighter animation in the Action Editor', icon='INFO')
@@ -6009,7 +6151,7 @@ CLASSES = (N64_OT_vs_view, N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_
            N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene, N64_PT_gamedata,
            N64_OT_hurtbox_add, N64_OT_hurtbox_remove, N64_OT_hurtbox_select, N64_PT_bone_hurtboxes,
            N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools,
-           N64_PT_motion_flags, N64_OT_anim_load_bin, N64_OT_anim_save_bin,
+           N64_PT_motion_flags, N64_OT_anim_load_bin, N64_OT_anim_save_bin, N64_OT_rest_pose,
            N64_OT_hidden_part_add, N64_OT_hidden_part_remove, N64_PT_bone_joint, N64_PT_fighter_joints,
            N64_OT_part_show, N64_OT_part_select, N64_OT_part_add, N64_OT_part_remove, N64_OT_costume_show,
            N64_OT_expression_show, N64_OT_alt_texture_add, N64_OT_alt_texture_remove, N64_OT_alt_texture_slot,
@@ -6193,6 +6335,8 @@ def register():
         bpy.app.timers.register(_sidebar_tab_timer, first_interval=0.6)
         bpy.msgbus.subscribe_rna(key=(bpy.types.Window, 'workspace'), owner=_MSGBUS_OWNER, args=(),
                                  notify=_workspace_changed)
+        if not bpy.app.timers.is_registered(_shield_billboard_tick):
+            bpy.app.timers.register(_shield_billboard_tick, first_interval=0.5, persistent=True)
     # picking / opening an image on a texture node refreshes the N64 view
     bpy.msgbus.subscribe_rna(key=(bpy.types.ShaderNodeTexImage, 'image'), owner=_MSGBUS_OWNER, args=(),
                              notify=_image_changed)
@@ -6200,6 +6344,8 @@ def register():
 
 def unregister():
     _unregister_collision_draw_handler()
+    if bpy.app.timers.is_registered(_shield_billboard_tick):
+        bpy.app.timers.unregister(_shield_billboard_tick)
     bpy.msgbus.clear_by_owner(_MSGBUS_OWNER)
     for c in reversed(CLASSES):
         try:

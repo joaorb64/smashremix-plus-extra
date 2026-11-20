@@ -6,6 +6,10 @@
   parts.png        every model part from the six sides, in every costume when its
                    colors change per costume
   skeleton.png     the electric-shock skeleton model(s)
+  stage.png        stages: the whole stage from the six sides
+  camera.png       stages: the whole stage through the game camera (perspective, 38 degrees,
+                   framing the camera bounds, tilted by light_angle z; build_blend's Game Camera)
+  layers.png       stages: each geometry layer alone
 
     python3 preview.py EXPORT_DIR [--out DIR] [--size 200]
 
@@ -166,27 +170,86 @@ def wrap_coord(x, n, mode, clamp=None):
 STAGE_LAYER_PRIORITY = {0: 4, 1: 6, 2: 13, 3: 17}
 
 
-def render(tris, yaw, H, bounds=None, pitch=0.0):
-    """Orthographic render looking along -z after rotating by yaw around y
-    (and pitch around x: pi/2 = looking straight down)."""
-    c, s = np.cos(yaw), np.sin(yaw)
-    rot = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
-    cp, sp = np.cos(pitch), np.sin(pitch)
-    rot = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]]) @ rot
-    if bounds is None:
-        allp = np.concatenate([t[0] for t in tris]) @ rot.T
-        lo, hi = allp.min(0), allp.max(0)
+def game_camera(view, tris=None):
+    """The game camera (as build_blend.py's 'Game Camera'; gmcamera.c): 38 degrees vertical
+    field of view, 320 x 240, tilted down by the stage's light_angle z (radians), framing the
+    stage's camera bounds (else the model). -> dict(eye, at, fovy) in game units."""
+    tilt = -float((view.get('light_angle') or [0, 0, -0.17453294])[2])
+    if view.get('camera_bounds'):
+        top, bottom, right, left = view['camera_bounds']
+        cx, cy, half_w, half_h = (left + right) / 2, (top + bottom) / 2, (right - left) / 2, (top - bottom) / 2
     else:
-        lo, hi = bounds
-    span = max(hi[1] - lo[1], hi[0] - lo[0], 1e-6)
-    scale = (H - 16) / span
-    W = int((hi[0] - lo[0]) * scale) + 16
+        p = np.concatenate([t[0] for t in tris]) if tris else np.zeros((1, 3))
+        cx, cy = (p[:, 0].min() + p[:, 0].max()) / 2, (p[:, 1].min() + p[:, 1].max()) / 2
+        half_w = max(1.0, np.ptp(p[:, 0]) / 2 * 1.15)
+        half_h = max(1.0, np.ptp(p[:, 1]) / 2 * 1.15)
+    t = np.tan(np.radians(19.0))
+    dist = max(half_h / t, half_w / (t * 320 / 240))
+    eye = np.array([cx, cy + dist * np.sin(tilt), dist * np.cos(tilt)])
+    return dict(eye=eye, at=np.array([cx, cy, 0.0]), fovy=38.0, near=128.0)
+
+
+def look_at(eye, at):
+    """Rows: camera right, up, back (the camera looks along its -z, like the orthographic views)."""
+    back = eye - at
+    back = back / np.linalg.norm(back)
+    right = np.cross([0.0, 1.0, 0.0], back)
+    right = right / np.linalg.norm(right)
+    return np.array([right, np.cross(back, right), back])
+
+
+def clip_near(q, attrs, near):
+    """Clip a camera-space triangle to z <= -near (Sutherland-Hodgman) -> [(q, attrs)] triangles;
+    attrs: per-vertex arrays (uv, normal, color) interpolated along."""
+    inside = q[:, 2] <= -near
+    if inside.all():
+        return [(q, attrs)]
+    if not inside.any():
+        return []
+    poly = []
+    for i in range(3):
+        j = (i + 1) % 3
+        if inside[i]:
+            poly.append((q[i], [a[i] for a in attrs]))
+        if inside[i] != inside[j]:
+            f = (-near - q[i, 2]) / (q[j, 2] - q[i, 2])
+            poly.append((q[i] + f * (q[j] - q[i]), [a[i] + f * (a[j] - a[i]) for a in attrs]))
+    out = []
+    for k in range(1, len(poly) - 1):
+        vs = (poly[0], poly[k], poly[k + 1])
+        out.append((np.array([v[0] for v in vs]), [np.array([v[1][n] for v in vs]) for n in range(len(attrs))]))
+    return out
+
+
+def render(tris, yaw, H, bounds=None, pitch=0.0, cam=None):
+    """Orthographic render looking along -z after rotating by yaw around y
+    (and pitch around x: pi/2 = looking straight down). With cam (game_camera()): a
+    perspective render from that camera, 4:3 (H tall), perspective-correct."""
+    if cam is not None:
+        rot = look_at(cam['eye'], cam['at'])
+        W = H * 4 // 3
+        focal = (H / 2) / np.tan(np.radians(cam['fovy']) / 2)
+        lo = hi = scale = None
+    else:
+        c, s = np.cos(yaw), np.sin(yaw)
+        rot = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        rot = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]]) @ rot
+        if bounds is None:
+            allp = np.concatenate([t[0] for t in tris]) @ rot.T
+            lo, hi = allp.min(0), allp.max(0)
+        else:
+            lo, hi = bounds
+        span = max(hi[1] - lo[1], hi[0] - lo[0], 1e-6)
+        scale = (H - 16) / span
+        W = int((hi[0] - lo[0]) * scale) + 16
+    origin = cam['eye'] if cam is not None else np.zeros(3)
     img = np.full((H, W, 3), 58.0)
     zb = np.full((H, W), -1e9)
     if all(t[9] == 0x30 for t in tris):
         # opaque first, then blended surfaces back to front (alpha blended, no depth write)
         opaque = [t for t in tris if not t[5]]
-        blended = sorted((t for t in tris if t[5]), key=lambda t: (t[0] @ rot.T)[:, 2].mean())
+        blended = sorted((t for t in tris if t[5]), key=lambda t: ((t[0] - origin) @ rot.T)[:, 2].mean())
         order = opaque + blended
     else:
         # some surfaces aren't depth tested (stage backgrounds: painted in display-list
@@ -194,66 +257,87 @@ def render(tris, yaw, H, bounds=None, pitch=0.0):
         # Stage layers draw by priority (grdisplay.c): 0 (4, background), 1 (6, depth-
         # tested, with the fighters), 2 (13) and 3 (17) over everything
         order = sorted(tris, key=lambda t: STAGE_LAYER_PRIORITY.get(t[10], 0)) if len(tris[0]) > 10 else tris
-    for P, UV, tex, col, wrap, blend, NR, cull, shading, zmode, _layer in order:
-        q = P @ rot.T
-        n = np.cross(q[1] - q[0], q[2] - q[0])
+    for P, UV0, tex, col, wrap, blend, NR0, cull, shading, zmode, _layer in order:
+        q0 = (P - origin) @ rot.T
+        n = np.cross(q0[1] - q0[0], q0[2] - q0[0])
         ln = np.linalg.norm(n)
         if ln == 0:
             continue
-        facing = n[2] > 0                         # counter-clockwise toward the viewer
+        # counter-clockwise toward the viewer (perspective: toward the eye, at the origin)
+        facing = (n @ -q0[0] > 0) if cam is not None else n[2] > 0
         if (cull & 0x400 and not facing) or (cull & 0x200 and facing):
             continue
-        # per-vertex lighting from the model's normals (light fixed to the camera), interpolated
-        if shading[3]:                            # lit: the material's (or model's) light colors
-            nv = NR[0] @ rot.T
-            vshade = shading[5][None, :] + shading[4][None, :] * np.clip(nv @ LIGHT, 0, None)[:, None]
-        else:                                     # unlit: vertex colors
-            c = NR[1][:, :3]                      # linear in the glTF: back to the game's (sRGB) values
-            vshade = np.where(c <= 0.0031308, c * 12.92, 1.055 * np.clip(c, 0, 1) ** (1 / 2.4) - 0.055)
+        parts = (clip_near(q0, [UV0, NR0[0], NR0[1]], cam['near']) if cam is not None
+                 else [(q0, [UV0, NR0[0], NR0[1]])])
+        for q, (UV, nrm, vcol) in parts:
+            raster(img, zb, q, UV, nrm, vcol, tex, col, wrap, blend, shading, zmode, rot,
+                   W, H, lo, hi, scale, focal if cam is not None else None)
+    return Image.fromarray(img.clip(0, 255).astype(np.uint8))
+
+
+def raster(img, zb, q, UV, nrm, vcol, tex, col, wrap, blend, shading, zmode, rot, W, H, lo, hi, scale, focal):
+    """One camera-space triangle into img / zb (orthographic, or perspective with focal)."""
+    # per-vertex lighting from the model's normals (light fixed to the camera), interpolated
+    if shading[3]:                            # lit: the material's (or model's) light colors
+        nv = nrm @ rot.T
+        vshade = shading[5][None, :] + shading[4][None, :] * np.clip(nv @ LIGHT, 0, None)[:, None]
+    else:                                     # unlit: vertex colors
+        c = vcol[:, :3]                       # linear in the glTF: back to the game's (sRGB) values
+        vshade = np.where(c <= 0.0031308, c * 12.92, 1.055 * np.clip(c, 0, 1) ** (1 / 2.4) - 0.055)
+    if focal:
+        w = 1.0 / -q[:, 2]                    # 1 / depth: larger is closer, linear on screen
+        x = W / 2 + focal * q[:, 0] * w
+        y = H / 2 - focal * q[:, 1] * w
+    else:
+        w = np.ones(3)
         x = (q[:, 0] - lo[0]) * scale + 8
         y = (hi[1] - q[:, 1]) * scale + 8
-        x0, x1 = int(max(0, np.floor(x.min()))), int(min(W - 1, np.ceil(x.max())))
-        y0, y1 = int(max(0, np.floor(y.min()))), int(min(H - 1, np.ceil(y.max())))
-        if x0 > x1 or y0 > y1:
-            continue
-        d = (y[1] - y[2]) * (x[0] - x[2]) + (x[2] - x[1]) * (y[0] - y[2])
-        if abs(d) < 1e-9:
-            continue
-        xs, ys = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
-        a = ((y[1] - y[2]) * (xs - x[2]) + (x[2] - x[1]) * (ys - y[2])) / d
-        b = ((y[2] - y[0]) * (xs - x[2]) + (x[0] - x[2]) * (ys - y[2])) / d
+    x0, x1 = int(max(0, np.floor(x.min()))), int(min(W - 1, np.ceil(x.max())))
+    y0, y1 = int(max(0, np.floor(y.min()))), int(min(H - 1, np.ceil(y.max())))
+    if x0 > x1 or y0 > y1:
+        return
+    d = (y[1] - y[2]) * (x[0] - x[2]) + (x[2] - x[1]) * (y[0] - y[2])
+    if abs(d) < 1e-9:
+        return
+    xs, ys = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
+    a = ((y[1] - y[2]) * (xs - x[2]) + (x[2] - x[1]) * (ys - y[2])) / d
+    b = ((y[2] - y[0]) * (xs - x[2]) + (x[0] - x[2]) * (ys - y[2])) / d
+    cc = 1 - a - b
+    inside = (a >= 0) & (b >= 0) & (cc >= 0)
+    if not inside.any():
+        return
+    if focal:
+        z = a * w[0] + b * w[1] + cc * w[2]   # 1 / depth (interpolates linearly on screen)
+        a, b = a * w[0] / z, b * w[1] / z     # perspective-correct weights
         cc = 1 - a - b
-        inside = (a >= 0) & (b >= 0) & (cc >= 0)
-        if not inside.any():
-            continue
+    else:
         z = a * q[0, 2] + b * q[1, 2] + cc * q[2, 2]
-        shade = np.minimum(a[..., None] * vshade[0] + b[..., None] * vshade[1] + cc[..., None] * vshade[2], 1.0)
-        sub = zb[y0:y1 + 1, x0:x1 + 1]
-        m = inside & (z > sub) if zmode & 0x10 else inside
-        if tex is not None:
-            th, tw = tex.shape[:2]
-            u = (a * UV[0, 0] + b * UV[1, 0] + cc * UV[2, 0]) * tw
-            v = (a * UV[0, 1] + b * UV[1, 1] + cc * UV[2, 1]) * th
-            ws, wt = (wrap or {}).get('s', 'repeat'), (wrap or {}).get('t', 'repeat')
-            tx = wrap_coord(np.floor(u).astype(int), tw, ws, (wrap or {}).get('clamp_s'))
-            ty = wrap_coord(np.floor(v).astype(int), th, wt, (wrap or {}).get('clamp_t'))
-            texel = tex[ty, tx] / 255
-        else:
-            texel = np.concatenate([np.broadcast_to(col / 255, xs.shape + (3,)), np.ones(xs.shape + (1,))], -1)
-        # the material's color combiner (two cycles), with its prim / env colors
-        out = combine(shading[0], texel, shade, shading[1], shading[2])
-        px, alpha = out[..., :3] * 255, out[..., 3]
-        if not blend:
-            m = m & (alpha >= 0.5)
-        region = img[y0:y1 + 1, x0:x1 + 1]
-        if blend:
-            a = alpha[m][:, None]
-            region[m] = px[m] * a + region[m] * (1 - a)
-        else:
-            region[m] = px[m]
-            if zmode & 0x20:                      # Z update
-                sub[m] = z[m]
-    return Image.fromarray(img.clip(0, 255).astype(np.uint8))
+    shade = np.minimum(a[..., None] * vshade[0] + b[..., None] * vshade[1] + cc[..., None] * vshade[2], 1.0)
+    sub = zb[y0:y1 + 1, x0:x1 + 1]
+    m = inside & (z > sub) if zmode & 0x10 else inside
+    if tex is not None:
+        th, tw = tex.shape[:2]
+        u = (a * UV[0, 0] + b * UV[1, 0] + cc * UV[2, 0]) * tw
+        v = (a * UV[0, 1] + b * UV[1, 1] + cc * UV[2, 1]) * th
+        ws, wt = (wrap or {}).get('s', 'repeat'), (wrap or {}).get('t', 'repeat')
+        tx = wrap_coord(np.floor(u).astype(int), tw, ws, (wrap or {}).get('clamp_s'))
+        ty = wrap_coord(np.floor(v).astype(int), th, wt, (wrap or {}).get('clamp_t'))
+        texel = tex[ty, tx] / 255
+    else:
+        texel = np.concatenate([np.broadcast_to(col / 255, xs.shape + (3,)), np.ones(xs.shape + (1,))], -1)
+    # the material's color combiner (two cycles), with its prim / env colors
+    out = combine(shading[0], texel, shade, shading[1], shading[2])
+    px, alpha = out[..., :3] * 255, out[..., 3]
+    if not blend:
+        m = m & (alpha >= 0.5)
+    region = img[y0:y1 + 1, x0:x1 + 1]
+    if blend:
+        a = alpha[m][:, None]
+        region[m] = px[m] * a + region[m] * (1 - a)
+    else:
+        region[m] = px[m]
+        if zmode & 0x20:                      # Z update
+            sub[m] = z[m]
 
 
 def label(im, text):
@@ -327,6 +411,16 @@ def stage_sheet(md, size):
     """Stages: the whole stage (every layer, in the game's drawing order) from the front,
     left, back, right, top and bottom."""
     return vstack([header('stage (all layers)', 6 * (size + 6)), view_row(md.tris('L', 0), size, 'stage')])
+
+
+def camera_sheet(md, height=480):
+    """Stages: the whole stage through the game camera (game_camera(): the stage's camera
+    bounds and tilt; the Blender export's 'Game Camera'), 4:3."""
+    tris = md.tris('L', 0)
+    if not tris:
+        return None
+    cam = game_camera(md.man.get('stage_view') or {}, tris)
+    return label(render(tris, 0.0, height, cam=cam), 'game camera')
 
 
 def layers_sheet(md, size):
@@ -404,7 +498,8 @@ def sheets(folder, size=200):
     """{name: image} for every sheet that has something to show."""
     md = Model(folder)
     if (md.man.get('object') or {}).get('kind') == 'stage':
-        out = {'stage': stage_sheet(md, size * 2), 'layers': layers_sheet(md, size),
+        out = {'stage': stage_sheet(md, size * 2), 'camera': camera_sheet(md, max(240, size * 12 // 5)),
+               'layers': layers_sheet(md, size),
                'variants': expressions_sheet(md, size)}
         return {k: v for k, v in out.items() if v is not None}
     if md.man.get('object'):      # items / projectiles: alternate images (e.g. damage stages), full size

@@ -564,9 +564,9 @@ def decode_texture(d, addr, fmt, siz, w, h, pal_addr, stride=None):
                 else:
                     i, a = v >> 8, v & 255
                 out[y, x] = (i, i, i, a)
-            else:
+            else:                        # I: the RDP copies the intensity into all four channels
                 i = v * 17 if bpp == 4 else v
-                out[y, x] = (i, i, i, 255)
+                out[y, x] = (i, i, i, i)
     return out
 
 

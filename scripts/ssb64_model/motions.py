@@ -127,14 +127,17 @@ def _num(v):
         return None
 
 
-def folder_motions(char_dir, char_name, base_character, vanilla=None):
+def folder_motions(char_dir, char_name, base_character, vanilla=None, anim_dir='animations',
+                   file_kind='ANIM', owners=None):
     """A Remix character folder's animations -> ({file stem: dict(flags, actions: [labels],
     conflicts)}, {action labels main.asm gives an animation}) from its main.asm, -1 flags resolved
-    from the base character's vanilla tables. char_name: the folder's name (File.<NAME>_ANIM_<STEM>)."""
+    from the base character's vanilla tables. char_name: the folder's name (File.<NAME>_ANIM_<STEM>).
+    Kirby's copy-ability animations: anim_dir='kirby_hat/animations', file_kind='KIRBY_ANIM',
+    owners={'KIRBY', 'JKIRBY'} (only the calls for those characters), base_character='KIRBY'."""
     asm = os.path.join(char_dir, 'main.asm')
+    adir = os.path.join(char_dir, *anim_dir.split('/'))
     stems = {os.path.splitext(x)[0].upper(): os.path.splitext(x)[0]
-             for x in os.listdir(os.path.join(char_dir, 'animations'))} \
-        if os.path.isdir(os.path.join(char_dir, 'animations')) else {}
+             for x in os.listdir(adir)} if os.path.isdir(adir) else {}
     if not os.path.exists(asm) or not stems:
         return {}, set()
     names, by_id = action_names()
@@ -143,7 +146,7 @@ def folder_motions(char_dir, char_name, base_character, vanilla=None):
         van = vanilla or (Vanilla() if cid is not None else None)
     except OSError:
         van = None
-    prefix = f'File.{char_name.upper()}_ANIM_'
+    prefix = f'File.{char_name.upper()}_{file_kind}_'
     text = re.sub(r'//[^\n]*', '', open(asm, encoding='utf-8', errors='replace').read())
     new_flags = {}                       # a new action's flags (add_new_action_params)
     out = {}
@@ -172,6 +175,10 @@ def folder_motions(char_dir, char_name, base_character, vanilla=None):
 
     calls = re.findall(r'Character\.(edit_action_parameters|add_new_action_params|edit_menu_action_parameters)'
                        r'\(([^\n]*)\)', text)
+    kirby = {'KIRBY', 'JKIRBY'}                 # (a character's Kirby copy actions: not its own)
+    calls = [(k, raw) for k, raw in calls
+             if (_args(raw)[0].strip().upper() in owners if owners is not None
+                 else _args(raw)[0].strip().upper() not in kirby - {char_name.upper()})]
     for kind, raw in calls:                                    # new actions first (edits refer to them)
         if kind != 'add_new_action_params':
             continue

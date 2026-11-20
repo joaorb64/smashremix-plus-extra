@@ -375,6 +375,11 @@ if SHIELD and arm is not None:
         bub.matrix_world = arm.matrix_world @ arm.data.bones['YRotN'].matrix_local     # at the joint
         bub.show_in_front = True
     scene['n64_shield_frames'] = int(SHIELD['frames'])
+if arm is not None and not IS_STAGE and 'n64_hidden_parts' in arm.keys():
+    # 'Rest Pose': one key per bone at rest (n64_panel; also its Rest Pose button), to go back to rest
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import n64_panel as _PR  # noqa: E402
+    _PR.ensure_rest_action(arm)
 if IS_STAGE:
     # One type collection per MPGroundData slot (layer), holding its rooms' meshes.
     stage_types = {
