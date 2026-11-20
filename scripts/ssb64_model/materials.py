@@ -23,6 +23,7 @@ Materials that aren't in the manifest (made in Blender) become CI4 from their
 costume images (16 colors).
 """
 import os
+import re
 import struct
 
 import numpy as np
@@ -216,8 +217,10 @@ def resize(im, w, h):
 class Material:
     """One rebuilt material: encoded image / palette lists + how it's drawn."""
 
-    def __init__(self, name, entry, base, root, costume_imgs, props, costumes, cloak_safe=True):
+    def __init__(self, name, entry, base, root, costume_imgs, props, costumes, cloak_safe=True, layout=1,
+                 costume_paths=None, sources=None):
         self.name = name
+        self.sources = dict(sources or {})        # costume added in Blender -> the one it copies
         self.cloak_safe = cloak_safe
         self.cutout = False
         e = entry or {}
@@ -273,6 +276,8 @@ class Material:
         self._init_state(e, props)
         self.flags = e.get('flags', 0x05)
         self.costume_colors = e.get('costume_colors')      # MObj colors per costume (kept)
+        if self.costume_colors:
+            self.costume_colors = self._extend([dict(x) for x in self.costume_colors], costumes)
         self.mobj = e.get('mobj')
         self.image_source = e.get('image_source', 'list')
         self.palette_source = e.get('palette_source', 'list') if self.ci else None
@@ -310,10 +315,7 @@ class Material:
                 return None
             return resize(_rows(np.asarray(Image.open(p).convert('RGBA'))), w, h)
 
-        self.costume_map = [list(m) for m in e.get('costume_map') or [[0, 0]]]
-        while len(self.costume_map) < costumes:
-            self.costume_map.append(self.costume_map[-1])
-        self.costume_map = self.costume_map[:costumes]
+        self.costume_map = self._extend([list(m) for m in e.get('costume_map') or [[0, 0]]], costumes)
         img_addrs = list(e.get('image_addrs') or [])
         pal_addrs = list(e.get('palette_addrs') or []) if self.ci else []
         img_raw = [bytes(base[a:a + nbytes]) if a is not None else None for a in img_addrs]   # None: empty slot
@@ -329,14 +331,50 @@ class Material:
         orig_imgs = [x.copy() if x is not None else None for x in imgs]
         orig_pals = [x.copy() for x in pals]
         ref_i, ref_p = self.costume_map[0][0], (self.costume_map[0][1] if self.ci else 0)
+        # (one file per image / palette, costumes showing them - tex_layout 2: a file a costume shows
+        # is read through that costume below, which also takes a repaint; the passes here only read
+        # the files no costume shows: other expressions, unused palettes)
+        shown = {rel for rel in (e.get('costumes') or []) if rel} if layout >= 2 else set()
+        n_imgs0, n_pals0 = len(imgs), len(pals)
+        # more palettes / images as files next to the material's (tex_layout 2: <mat>_pal<p>.png,
+        # <mat>_img<i>.png past the list's end, numbered on): added to its lists
+        if layout >= 2 and root:
+            tdir = os.path.join(root, 'textures')
+            while self.ci and os.path.exists(os.path.join(tdir, f'{name}_pal{len(pals)}.png')) and \
+                    len(self.pal_frames) <= len(pals):
+                im = png(f'textures/{name}_pal{len(pals)}.png')
+                pals.append(self._palette_from(im, imgs[ref_i], pals[ref_p], f'palette {len(pals)}'))
+                pal_raw.append(b'')
+                self.warnings.append(f'palette {len(pals) - 1} added (textures/{name}_pal{len(pals) - 1}.png)')
+            while os.path.exists(os.path.join(tdir, f'{name}_img{len(imgs)}.png')) and len(self.frames) <= len(imgs):
+                im = png(f'textures/{name}_img{len(imgs)}.png')
+                imgs.append(nearest_index(im, pals[ref_p])[0] if self.ci else im)
+                img_raw.append(b'')
+                self.warnings.append(f'image {len(imgs) - 1} added (textures/{name}_img{len(imgs) - 1}.png)')
+        # each costume uses what the file it shows is (tex_layout 2: <mat>.png = costume 0's pair,
+        # <mat>_pal<p>.png = palette p on that image, <mat>_img<i>.png = image i with that palette): a
+        # costume added in Blender, or one pointed at another palette's file, follows its file
+        if layout >= 2:
+            for c, path in enumerate((costume_paths or [])[:costumes]):
+                b_ = os.path.basename(path or '')
+                m_ = re.match(rf'{re.escape(name)}(?:_pal(\d+)|_img(\d+))?\.png$', b_)
+                if not m_:
+                    continue
+                ti_, pi_ = ref_i, ref_p
+                if m_.group(1) is not None and self.ci and int(m_.group(1)) < len(pals):
+                    pi_ = int(m_.group(1))
+                elif m_.group(2) is not None and int(m_.group(2)) < len(imgs):
+                    ti_ = int(m_.group(2))
+                self.costume_map[c] = [ti_, pi_]
+
         # palette PNGs (drawn with the reference image)
         for p, rel in enumerate((e.get('palettes') or [])[:len(pals)]):
-            im = png(rel)
+            im = png(rel) if rel not in shown else None
             if im is not None:
                 pals[p] = self._palette_from(im, imgs[ref_i], pals[p], f'palette {p}')
         # image PNGs (drawn with the reference palette)
         for i, rel in enumerate((e.get('images') or [])[:len(imgs)]):
-            im = png(rel) if imgs[i] is not None else None
+            im = png(rel) if imgs[i] is not None and rel not in shown else None
             if im is not None:
                 imgs[i] = self._image_from(im, imgs[i], pals[ref_p] if self.ci else None, f'image {i}')
         # costume images from Blender: override the entries each costume uses
@@ -345,13 +383,14 @@ class Material:
             im = costume_imgs[c] if c < len(costume_imgs) else None
             shared = pi in claimed
             claimed.add(pi)
-            if im is None:
-                continue
+            if im is None or ti >= n_imgs0 or pi >= max(n_pals0, 1) and self.ci:
+                continue                                 # (an entry its file added: read already)
             im = resize(im, w, h)
             # not painted in Blender (still the exported costume image): the entry PNGs decide
             orig = orig_imgs[ti] if not self.ci else orig_pals[pi][orig_imgs[ti]].reshape(h, w, 4)
             # the export fills past a clamped tile's extent with the edge texel (MF.clamp_fill)
-            if same_image(MF.clamp_fill(orig, self.wrap_dict, (self.tile_w, self.tile_h)), im):
+            if same_image(orig, im) or \
+                    same_image(MF.clamp_fill(orig, self.wrap_dict, (self.tile_w, self.tile_h)), im):
                 continue
             if not self.ci:
                 imgs[ti] = im
@@ -512,8 +551,7 @@ class Material:
             e = dict(state=[['FC327E05', 'FF17FDFF']])
         self._init_state(e, props)
         cols = [dict(x) for x in (e.get('costume_colors') or [])] or [{} for _ in range(costumes)]
-        while len(cols) < costumes:
-            cols.append(dict(cols[-1]))
+        cols = self._extend(cols, costumes)
         for c in range(costumes):
             im = costume_imgs[c] if c < len(costume_imgs) else None
             if im is None:
@@ -538,6 +576,17 @@ class Material:
                 self.state.append((0xFC327E05, 0xFF17FDFF))           # prim x shade
             self.costume_colors = None
         self.tex_varies = self.pal_varies = False
+
+    def _extend(self, per_costume, costumes):
+        """A per-costume list to `costumes` entries: a costume added in Blender takes the one it copies
+        (self.sources), else (older .blends) the last; past the count: cut."""
+        import copy
+        out = list(per_costume)
+        while len(out) < costumes:
+            c = len(out)
+            src = self.sources.get(c, len(out) - 1)
+            out.append(copy.deepcopy(out[min(src, len(out) - 1)]))
+        return out[:costumes]
 
     # ---------------------------------------------------------------- building
     def _build_new(self, costume_imgs, costumes, n_pal):

@@ -515,23 +515,27 @@ def write_joint_cubic(values, rest, candidates=(), loop=False):
 
 
 def write_file(per_joint_scripts):
-    """An animation file: [script bytes or None] (the joint order) -> bytes, with its internal
-    relocation chain (head: the first non-NULL entry; appender rule)."""
+    """An animation file: [script per joint in the joint order: bytes, (bytes, [(field, target)]
+    pointers inside it, both relative to the script: 32-bit scripts' jumps), or None] -> bytes,
+    with its internal relocation chain (head: the first non-NULL entry; appender rule)."""
     n = len(per_joint_scripts)
     data = bytearray(4 * n)
     targets = []
+    inner = []
     for sc in per_joint_scripts:
         if sc is None:
             targets.append(None)
             continue
+        raw, fix = (sc if isinstance(sc, tuple) else (sc, []))
         while len(data) % 4:
             data += b'\0'
         targets.append(len(data))
-        data += sc
-    fields = [4 * i for i, t in enumerate(targets) if t is not None]
-    for k, fo in enumerate(fields):
-        nxt = fields[k + 1] // 4 if k + 1 < len(fields) else 0xFFFF
-        struct.pack_into('>HH', data, fo, nxt, targets[fo // 4] // 4)
+        inner += [(len(data) + a, len(data) + b) for a, b in fix]
+        data += raw
+    items = sorted([(4 * i, t) for i, t in enumerate(targets) if t is not None] + inner)
+    for k, (fo, tg) in enumerate(items):
+        nxt = items[k + 1][0] // 4 if k + 1 < len(items) else 0xFFFF
+        struct.pack_into('>HH', data, fo, nxt, tg // 4)
     return bytes(data)
 
 
@@ -540,12 +544,13 @@ def written_flags(flags):
     return flags & ~FLAG_ANIMJOINT
 
 
-def encode_animation(f, flags, values, frames, loops=None, candidates=None):
+def encode_animation(f, flags, values, frames, loops=None, candidates=None, jm=None):
     """A whole animation: values {bone name: {track name: per-frame}} (joints left out: their
     rest) for these motion flags -> file bytes, in the 16-bit format (its motion's flags must
     then be written_flags(flags)). loops: {bone: True} for scripts that loop; candidates:
-    {bone: key frames to prefer}."""
-    order = joint_order(f, flags)
+    {bone: key frames to prefer}. jm (jointmap.JointMap): joints added / removed in Blender - the
+    file in the new joint order (values named by the old / temporary joint numbers)."""
+    order = joint_order(f, flags) if jm is None else [jm.old_game(g) for g in jm.joint_order(flags)]
     joints = {f'joint_{j.index:02d}': j for j in f.details['hi']['joints']}
     scripts = []
     for g in order:
@@ -553,6 +558,11 @@ def encode_animation(f, flags, values, frames, loops=None, candidates=None):
         j = joints.get(nm)
         rest = JA.rest_values(j) if j is not None else dict(rx=0.0, ry=0.0, rz=0.0, tx=0.0, ty=0.0, tz=0.0,
                                                             sx=1.0, sy=1.0, sz=1.0)
+        if jm is not None and g - 4 in jm.added:          # an added joint: its own rest (parent's axes)
+            t = jm.added[g - 4]['t']
+            rest = dict(rest, tx=t[0], ty=t[1], tz=t[2])
+        if jm is not None and g - 4 in jm.moved:          # a moved joint: its rest under the new parent
+            rest = dict(jm.moved_rest[g - 4])
         v = values.get(nm)
         if v is None:
             scripts.append(None)

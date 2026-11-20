@@ -709,6 +709,7 @@ import blend_gamedata as GDB  # noqa: E402
 GDB.build(man)
 if arm is not None and man.get('joint_attrs') and not IS_STAGE and not man.get('object'):
     GDB.apply_joint_attrs(arm, man['joint_attrs'])      # (Bone > N64 Joint, Armature > N64 Fighter Joints)
+    PANEL.color_special_joints(arm, force=True)         # (viewport colors of the joints those name)
 for ob in bpy.data.objects:
     if ob.get('n64_gamedata') == 'collision_group':
         PANEL._set_collision_group_renderer(ob)

@@ -217,6 +217,9 @@ GL_WRAP = {'repeat': REPEAT, 'mirror': MIRRORED_REPEAT, 'clamp': CLAMP_TO_EDGE}
 
 # Textures are written upside down from the game's row order (the N64's t grows the other way,
 # so they look upright to edit), with V flipped to match (v = 1 - t / h; Blender: t / h). Recorded
+# Texture files (manifest 'tex_layout'): 2 = one PNG per image / palette (<mat>.png, <mat>_img<i>.png,
+# <mat>_pal<p>.png), costumes show those; 1 (older exports) = <mat>_img<i>, _pal<p> and _c<costume> copies.
+TEX_LAYOUT = int(os.environ.get('N64_TEX_LAYOUT', 2))   # (1: the old layout, for comparisons)
 # as manifest 'tex_flip_v': the import flips them back (exports without it: the game's order).
 TEX_FLIP_V = True
 
@@ -236,7 +239,7 @@ class Exporter:
         self.manifest = dict(costumes=costumes, joints=[], materials={}, objects={}, model_parts=[],
                              expressions=[], attributes_offset=f.attr,
                              character_sha1=hashlib.sha1(bytes(f.char)).hexdigest(),
-                             tex_flip_v=self.flip_v)
+                             tex_flip_v=self.flip_v, tex_layout=TEX_LAYOUT)
         self.mat_index = {}
         self.mat_sig = {}
         self.mobj_name = {}
@@ -698,16 +701,47 @@ class Exporter:
                                 and not MT.uses_texel_alpha([v for _, v in state]))
             if self._opaque_tex:
                 entry['opaque_texels'] = True
-            entry['images'] = [self.save_tex(name, f'img{i}', im, fmt, siz, w, h, p0) for i, im in enumerate(imgs)]
-            entry['palettes'] = [self.save_tex(name, f'pal{i}', i0, fmt, siz, w, h, pl) for i, pl in enumerate(pals)]
-            # costume images (what Blender shows): past a clamped tile's extent, the edge
-            # texel (the game never draws what's there). The img / pal PNGs keep it all.
-            entry['costumes'] = [self.save_tex(name, f'c{c}', imgs[ti], fmt, siz, w, h, pals[pi] if pals else None,
-                                               fill=(entry['wrap'], (tile_w, tile_h)))
-                                 for c, (ti, pi) in enumerate(cmap)]
+            # one PNG per thing the material has (TEX_LAYOUT 2): <mat>.png = costume 0's image and
+            # palette; <mat>_img<i>.png its other images (with costume 0's palette), <mat>_pal<p>.png
+            # its other palettes (on costume 0's image). A costume shows the file of what it uses;
+            # only one using another image AND another palette gets a picture of its own, in
+            # textures/preview/ (painting it works like painting any costume)
+            ti0, pi0 = cmap[0]
+            if TEX_LAYOUT < 2:                  # (older layout: img / pal / costume copies)
+                entry['images'] = [self.save_tex(name, f'img{i}', im, fmt, siz, w, h, p0) for i, im in enumerate(imgs)]
+                entry['palettes'] = [self.save_tex(name, f'pal{i}', i0, fmt, siz, w, h, pl) for i, pl in enumerate(pals)]
+                entry['costumes'] = [self.save_tex(name, f'c{c}', imgs[ti], fmt, siz, w, h, pals[pi] if pals else None,
+                                                   fill=(entry['wrap'], (tile_w, tile_h)))
+                                     for c, (ti, pi) in enumerate(cmap)]
+            else:
+                self._save_layout2(entry, name, imgs, pals, cmap, i0, p0, fmt, siz, w, h)
         self.manifest['materials'][name] = entry
         m = {'name': name, 'pbrMetallicRoughness': {'metallicFactor': 0.0, 'roughnessFactor': 1.0},
              'doubleSided': True}
+        return self._material_gl(m, entry, name, key, locals().get('sig'))
+
+    def _save_layout2(self, entry, name, imgs, pals, cmap, i0, p0, fmt, siz, w, h):
+        """TEX_LAYOUT 2's files (see above): entry images / palettes / costumes."""
+        if True:
+            ti0, pi0 = cmap[0]
+            base_rel = self.save_tex(name, None, i0, fmt, siz, w, h, p0)
+            entry['images'] = [base_rel if i == ti0 and im is not None else
+                               self.save_tex(name, f'img{i}', im, fmt, siz, w, h, p0) for i, im in enumerate(imgs)]
+            entry['palettes'] = [base_rel if i == pi0 else self.save_tex(name, f'pal{i}', i0, fmt, siz, w, h, pl)
+                                 for i, pl in enumerate(pals)]
+            cos = []
+            for c, (ti, pi) in enumerate(cmap):
+                if ti == ti0 and (not pals or pi == pi0):
+                    cos.append(base_rel)
+                elif ti == ti0:
+                    cos.append(entry['palettes'][pi])
+                elif not pals or pi == pi0:
+                    cos.append(entry['images'][ti])
+                else:
+                    cos.append(self.save_tex(name, f'c{c}', imgs[ti], fmt, siz, w, h, pals[pi], sub='preview'))
+            entry['costumes'] = cos
+
+    def _material_gl(self, m, entry, name, key, sig):
         if entry['costumes'] and entry['costumes'][0]:
             self.gl['images'].append({'uri': entry['costumes'][0]})
             self.gl['textures'].append({'source': len(self.gl['images']) - 1,
@@ -724,7 +758,7 @@ class Exporter:
             self.mat_sig[sig] = self.mat_index[key]
         return self.mat_index[key]
 
-    def save_tex(self, name, suffix, img, fmt, siz, w, h, pal, fill=None):
+    def save_tex(self, name, suffix, img, fmt, siz, w, h, pal, fill=None, sub=None):
         if img is None:
             return None
         rgba = MF.decode_texture(self.f.char, img, fmt, siz, w, h, pal)
@@ -733,7 +767,9 @@ class Exporter:
         if getattr(self, '_opaque_tex', False):
             rgba = rgba.copy()
             rgba[..., 3] = 255
-        rel = f'textures/{name}_{suffix}.png'
+        rel = f'textures/{sub + "/" if sub else ""}{name}{"_" + suffix if suffix else ""}.png'
+        if sub:
+            os.makedirs(os.path.join(self.out, 'textures', sub), exist_ok=True)
         if self.flip_v:
             rgba = np.ascontiguousarray(rgba[::-1])
         Image.fromarray(rgba, 'RGBA').save(os.path.join(self.out, rel))
@@ -936,8 +972,10 @@ class Exporter:
 
 def costumes_in_scripts(f):
     """Costume count from the costume scripts (one frame per costume), when config.yaml
-    doesn't say: the longest script of the body's materials."""
-    best = 0
+    doesn't say: the length most of the body's material scripts have (not the longest: a
+    script may also time a texture change, e.g. Captain Falcon's head: 52 frames, 6 costumes)."""
+    from collections import Counter
+    lengths = Counter()
     for d in f.details.values():
         if d.get('matanim') is None:
             continue
@@ -946,8 +984,14 @@ def costumes_in_scripts(f):
             for i in range(len(lst)):
                 sc = f.char_int.get(an + 4 * i) if an is not None else None
                 if sc is not None:
-                    best = max(best, len(MF.decode_script(f.char, sc)))
-    return best
+                    try:
+                        lengths[len(MF.decode_script(f.char, sc))] += 1
+                    except ValueError:               # (not a costume script: NaN values)
+                        pass
+    if not lengths:
+        return 0
+    top = max(lengths.values())
+    return max(n for n, c in lengths.items() if c == top)
 
 
 def rom_external_data(entries, entry):
@@ -1162,9 +1206,10 @@ def main(argv=None):
             seen[gj] = occ + 1
             f.textureparts.append(dict(index=k, joint=gj - MF.JOINT_COMMON_START, mobj_hi=occ, mobj_lo=occ,
                                        source='config.yaml texture_forms'))
-    n = (a.costumes or cfg.get('num_costumes')
-         or (VANILLA_FIGHTER_COSTUMES.get(a.fighter, 4) if a.fighter else None)
-         or (1 if a.rom else costumes_in_scripts(f)) or 1)
+    # costumes: what the file's costume scripts hold first (config.yaml num_costumes can say less: the
+    # Ice Climbers' file has Popo's and Nana's, twice its num_costumes)
+    n = (a.costumes or costumes_in_scripts(f) or cfg.get('num_costumes')
+         or (VANILLA_FIGHTER_COSTUMES.get(a.fighter, 4) if a.fighter else None) or 1)
     ex = Exporter(f, out_dir, n)
     import legs
     _, _, _, note = legs.check(f)
@@ -1231,8 +1276,6 @@ def folder_animations(cfg, char_dir, f):
     """A character folder's animations/*.bin, with the flags main.asm gives the actions that
     play them (motions.py; -1: the base character's, from the original ROM)."""
     adir = os.path.join(char_dir, 'animations')
-    if not os.path.isdir(adir):
-        return []
     base = (cfg.get('definitions') or {}).get('base_character')
     name = os.path.basename(os.path.normpath(char_dir))
     try:
@@ -1241,7 +1284,8 @@ def folder_animations(cfg, char_dir, f):
         print(f'  note: action flags not read ({e}); guessing them from each file\'s joint count')
         mot, overridden = {}, set()
     out = []
-    for fn in sorted(os.listdir(adir), key=str.lower):
+    # (no animations/ folder yet, e.g. a new character: every action plays the parent's)
+    for fn in sorted(os.listdir(adir) if os.path.isdir(adir) else [], key=str.lower):
         if not fn.lower().endswith('.bin'):
             continue
         stem = fn[:-4]

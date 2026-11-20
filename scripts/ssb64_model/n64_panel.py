@@ -1462,6 +1462,9 @@ class N64_PT_material(bpy.types.Panel):
         m = context.material
         if m is None:
             return
+        base_name_ = re.sub(r'_c\d+$', '', m.name)
+        if base_name_ in _TEX_STATS:
+            draw_texture_stats(lay, base_name_)
         tex = _tex_node(m)
         box = lay.box()
         if tex is not None:
@@ -2047,8 +2050,101 @@ def _sync_bone_locks(scene):
         arm['n64_hidden_bones'] = sorted(n for n, h in want.items() if h)
 
 
+# ---- special joints in the viewport: bones the fighter attributes name get a color (pose bone
+# color, over the Left / Right / Center side colors) and the 'Special Joints' bone collection;
+# legend in Armature > N64 Fighter Joints. Follows edits (any depsgraph update; cheap when unchanged).
+SPECIAL_ROLES = (       # (key, legend, color): first matching role colors the bone
+    ('item', 'Item joints (light / heavy)', (0.25, 0.95, 0.35)),
+    ('foot', 'Slope foot IK thighs', (1.0, 0.55, 0.1)),
+    ('texpart', 'Alternate textures (expressions)', (0.1, 0.85, 0.95)),
+    ('effect', 'Effect joints', (0.95, 0.25, 0.9)),
+    ('access', 'Accessory part', (1.0, 0.9, 0.2)),
+    ('hidden', 'Hidden parts', (0.6, 0.6, 0.65)),
+)
+SPECIAL_COLLECTION = 'Special Joints'
+_SPECIAL_STATE = {}
+
+
+def special_roles(arm):
+    """{bone name: role key} of the joints the fighter attributes name."""
+    ad = arm.data
+    found = {}
+    names = dict(item=[ad.get('n64_item_light'), ad.get('n64_item_heavy')],
+                 foot=[ad.get('n64_foot_r'), ad.get('n64_foot_l')],
+                 texpart=[ad.get(f'n64_texpart_{k}_joint') for k in range(2)],
+                 effect=[ad.get(f'n64_effect_joint_{i}') for i in range(EFFECT_SLOTS)],
+                 access=[ad.get('n64_access_joint')] if 'n64_access_joint' in ad.keys() else [],
+                 hidden=[b.name for b in ad.bones if int(b.get('n64_hidden_index', -1)) >= 0])
+    for key, _, _ in SPECIAL_ROLES:
+        for n in names[key]:
+            if n and n in ad.bones and n not in found:
+                found[n] = key
+    return found
+
+
+def color_special_joints(arm, force=False):
+    roles = special_roles(arm)
+    sig = tuple(sorted(roles.items()))
+    if not force and _SPECIAL_STATE.get(arm.name) == sig:
+        return
+    _SPECIAL_STATE[arm.name] = sig
+    try:
+        coll = arm.data.collections.get(SPECIAL_COLLECTION) or arm.data.collections.new(SPECIAL_COLLECTION)
+    except AttributeError:          # Blender < 4: no bone collections / colors
+        return
+    color = {k: c for k, _, c in SPECIAL_ROLES}
+    for pb in arm.pose.bones:
+        key = roles.get(pb.name)
+        if key:
+            c = color[key]
+            pb.color.palette = 'CUSTOM'
+            pb.color.custom.normal = c
+            pb.color.custom.select = tuple(min(1.0, x * 0.6 + 0.4) for x in c)
+            pb.color.custom.active = (1.0, 1.0, 1.0)
+            coll.assign(pb.bone)
+        else:
+            if pb.color.palette == 'CUSTOM':
+                pb.color.palette = 'DEFAULT'
+            coll.unassign(pb.bone)
+
+
+_JOINT_SIG = {}
+
+
+def _sync_joint_edits(scene):
+    """Joint bones deleted / added with Blender's own tools (X, E, Shift+A in Edit Mode): once out of
+    Edit Mode, renumbered like Remove Joint / Add Joint (blend_joints.sync)."""
+    for ob in scene.objects:
+        if ob.type != 'ARMATURE' or ob.get('n64_reference') or not _has_joint_attrs(ob) or ob.mode == 'EDIT':
+            continue
+        sig = tuple(b.name for b in ob.data.bones)
+        if _JOINT_SIG.get(ob.name) == sig and 'n64_joint_state' in ob.data.keys():
+            continue
+        if _bj(bpy.context)._BUSY[0]:
+            continue                              # (a joint button at work: it records the state itself)
+        _JOINT_SIG[ob.name] = sig
+        try:
+            msg = _bj(bpy.context).sync(bpy.context, ob)
+        except Exception as e:                   # (never break the update handler)
+            msg = f'Joint renumbering failed: {e}'
+        if msg:
+            scene['n64_joint_msg'] = msg
+            print(msg)
+            _JOINT_SIG[ob.name] = tuple(b.name for b in ob.data.bones)
+            _LOCK_STATE.clear()
+            color_special_joints(ob, force=True)
+
+
+def _sync_special_joints(scene):
+    for ob in scene.objects:
+        if ob.type == 'ARMATURE' and _has_joint_attrs(ob) and not ob.get('n64_reference'):
+            color_special_joints(ob)
+
+
 def _sync_loops_on_update(scene, depsgraph):
     _sync_vs_screen(scene)
+    _sync_joint_edits(scene)
+    _sync_special_joints(scene)
     if depsgraph.id_type_updated('ACTION') or depsgraph.id_type_updated('OBJECT'):
         sync_loops()
         _follow_action_range(scene)
@@ -2477,8 +2573,8 @@ class N64_OT_anim_save_bin(bpy.types.Operator):
 
 def draw_motion_flags(lay, context):
     row = lay.row(align=True)
-    row.operator('n64.anim_load_bin', icon='IMPORT')
-    row.operator('n64.anim_save_bin', icon='EXPORT')
+    row.operator('n64.anim_load_bin', icon='FILE_FOLDER')
+    row.operator('n64.anim_save_bin', icon='FILE_TICK')
     lay.operator('n64.rest_pose', icon='ARMATURE_DATA')
     ob, act = _flags_owner(context)
     if act is None:
@@ -4316,6 +4412,210 @@ class N64_OT_hidden_part_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class N64_OT_joint_remove(bpy.types.Operator):
+    bl_idname = 'n64.joint_remove'
+    bl_label = 'Remove Joint'
+    bl_description = ('Remove this joint and every joint under it, with their meshes (all costumes, low detail, '
+                      'model parts, electric skeleton) and hurtboxes. The joints after it are renumbered (the game '
+                      'numbers joints in order): on import every animation, the shield pose, the attributes and '
+                      'the moveset\'s joint ids follow')
+    bl_options = {'UNDO'}
+
+    special: bpy.props.EnumProperty(
+        name='Special joints after it',
+        items=[('FOLLOW', 'Follow Their Bones', 'Item / foot IK / effect / expression joints stay on the same bones '
+                                                '(their numbers change with them): what the moves expect'),
+               ('KEEP', 'Keep Their Numbers', 'They keep their joint numbers, so they land on the bones that take '
+                                              'those numbers')],
+        default='FOLLOW')
+
+    @classmethod
+    def poll(cls, context):
+        b = _context_bone(context)
+        return b is not None and (_bone_joint(b.name) or 0) >= 4 and _fighter_armature(context) is not None
+
+    def _tools(self, context):
+        import sys
+        d = context.scene.get('n64_tools_dir') or os.path.dirname(os.path.abspath(__file__))
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import blend_joints as BJ
+        return BJ
+
+    def invoke(self, context, event):
+        BJ = self._tools(context)
+        arm = _fighter_armature(context)
+        name = _context_bone(context).name
+        self._gone = BJ.branch(arm, name)
+        self._affected = BJ.affected_specials(arm, name)
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def draw(self, context):
+        lay = self.layout
+        lay.label(text='Remove ' + ', '.join(getattr(self, '_gone', [])) + ' (and their meshes, hurtboxes)?',
+                  icon='TRASH')
+        aff = getattr(self, '_affected', [])
+        if not aff:
+            lay.label(text='No special joint comes after it.', icon='INFO')
+            return
+        box = lay.box()
+        box.label(text='Special joints after it (they get renumbered):', icon='COLOR')
+        for role, now, after in aff:
+            box.label(text=f'{role}: {now} -> {after}')
+        lay.prop(self, 'special', expand=True)
+
+    def execute(self, context):
+        BJ = self._tools(context)
+        arm = _fighter_armature(context)
+        ok, msg = BJ.remove(context, arm, _context_bone(context).name, keep_numbers=self.special == 'KEEP')
+        _LOCK_STATE.clear()
+        self.report({'INFO'} if ok else {'ERROR'}, msg)
+        return {'FINISHED'} if ok else {'CANCELLED'}
+
+
+def _bj(context):
+    import sys
+    d = context.scene.get('n64_tools_dir') or os.path.dirname(os.path.abspath(__file__))
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    import blend_joints as BJ
+    return BJ
+
+
+class N64_OT_joint_add(bpy.types.Operator):
+    bl_idname = 'n64.joint_add'
+    bl_label = 'Add Joint'
+    bl_description = ('A new joint under this one (at its head: move it in Edit Mode), stored after this joint\'s '
+                      'other descendants (the game keeps joints depth first): the joints after it are renumbered. '
+                      'Then put meshes on it (Put Selected Meshes Here). On import every animation, the shield pose, '
+                      'the attributes follow (moveset scripts naming joints after it are listed); its animations: none (it '
+                      'stays at rest on its parent)')
+    bl_options = {'UNDO'}
+
+    special: bpy.props.EnumProperty(
+        name='Special joints after it',
+        items=[('FOLLOW', 'Follow Their Bones', 'They stay on the same bones (their numbers change with them)'),
+               ('KEEP', 'Keep Their Numbers', 'They keep their joint numbers (landing on the bones that take them)')],
+        default='FOLLOW')
+
+    @classmethod
+    def poll(cls, context):
+        b = _context_bone(context)
+        return b is not None and (_bone_joint(b.name) or 0) >= 4 and _fighter_armature(context) is not None
+
+    def invoke(self, context, event):
+        BJ = _bj(context)
+        arm = _fighter_armature(context)
+        name = _context_bone(context).name
+        at = max(BJ.joint_index(x) for x in BJ.branch(arm, name)) + 1
+        ad = arm.data
+        self._at = at
+        self._affected = []
+        for p in BJ.ARM_BONE_PROPS:
+            v = ad.get(p) if p in ad.keys() else None
+            if v and (BJ.joint_index(v) or -1) >= at:
+                self._affected.append((BJ.ROLE_TEXT.get(p, p), v, f'joint_{BJ.joint_index(v) + 1:02d}'))
+        for b in ad.bones:
+            if int(b.get('n64_hidden_index', -1)) >= 0 and (BJ.joint_index(b.name) or -1) >= at:
+                self._affected.append((f'hidden part {b["n64_hidden_index"]}', b.name,
+                                       f'joint_{BJ.joint_index(b.name) + 1:02d}'))
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def draw(self, context):
+        lay = self.layout
+        lay.label(text=f'New joint_{getattr(self, "_at", 0):02d} under {_context_bone(context).name}', icon='BONE_DATA')
+        aff = getattr(self, '_affected', [])
+        if not aff:
+            lay.label(text='No special joint comes after it.', icon='INFO')
+            return
+        box = lay.box()
+        box.label(text='Special joints after it (they get renumbered):', icon='COLOR')
+        for role, now, after in aff:
+            box.label(text=f'{role}: {now} -> {after}')
+        lay.prop(self, 'special', expand=True)
+
+    def execute(self, context):
+        BJ = _bj(context)
+        arm = _fighter_armature(context)
+        ad = arm.data
+        before = {p: ad[p] for p in BJ.ARM_BONE_PROPS if p in ad.keys() and ad[p]}
+        ok, msg, new = BJ.add(context, arm, _context_bone(context).name)
+        if ok and self.special == 'KEEP':
+            for p, v in before.items():
+                ad[p] = v
+        if ok:
+            ad.bones.active = ad.bones[new]
+            color_special_joints(arm, force=True)
+        _LOCK_STATE.clear()
+        self.report({'INFO'} if ok else {'ERROR'}, msg)
+        return {'FINISHED'} if ok else {'CANCELLED'}
+
+
+class N64_OT_joint_put_meshes(bpy.types.Operator):
+    bl_idname = 'n64.joint_put_meshes'
+    bl_label = 'Put Selected Meshes Here'
+    bl_description = ('The selected meshes become this joint\'s body piece (hi_jNN in Costume 0, with a copy in every '
+                      'costume; a mesh in Low detail: lo_jNN), skinned to this joint only. A joint without a low detail '
+                      'piece gets a copy of the high one')
+    bl_options = {'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        b = _context_bone(context)
+        return b is not None and (_bone_joint(b.name) or 0) >= 4 and _fighter_armature(context) is not None
+
+    def execute(self, context):
+        BJ = _bj(context)
+        arm = _fighter_armature(context)
+        objs = [o for o in context.selected_objects if o.type == 'MESH']
+        ok, msg = BJ.put_meshes(context, arm, _context_bone(context).name, objs)
+        self.report({'INFO'} if ok else {'ERROR'}, msg)
+        return {'FINISHED'} if ok else {'CANCELLED'}
+
+
+class N64_OT_joint_set_parent(bpy.types.Operator):
+    bl_idname = 'n64.joint_set_parent'
+    bl_label = 'Set Parent'
+    bl_description = ('Move this joint (and its branch) under another joint, where it is (Keep Offset): it follows '
+                      'the new parent, or keeps its motion (re-expressed in every action); the joints are renumbered '
+                      '(the branch goes after the new parent\'s other children). Alt+P in Edit Mode = Follow')
+    bl_options = {'UNDO'}
+    parent: bpy.props.StringProperty(name='New parent')
+    mode: bpy.props.EnumProperty(
+        name='Its animation',
+        items=[('FOLLOW', 'Follow the New Parent', 'Its keys stay as they are (relative to its rest): it moves with '
+                                                  'the new parent (what Alt+P does)'),
+               ('KEEP', 'Keep Its Motion', 'Re-expressed under the new parent so it moves in the world as before '
+                                          '(a key per frame in every action)')],
+        default='FOLLOW')
+
+    @classmethod
+    def poll(cls, context):
+        b = _context_bone(context)
+        return b is not None and (_bone_joint(b.name) or 0) >= 5 and _fighter_armature(context) is not None
+
+    def invoke(self, context, event):
+        b = _context_bone(context)
+        self.parent = b.parent.name if b.parent else ''
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        arm = _fighter_armature(context)
+        self.layout.prop_search(self, 'parent', arm.data, 'bones')
+        self.layout.prop(self, 'mode', expand=True)
+
+    def execute(self, context):
+        BJ = _bj(context)
+        arm = _fighter_armature(context)
+        ok, msg = BJ.set_parent(context, arm, _context_bone(context).name, self.parent, self.mode)
+        if ok:
+            context.scene['n64_joint_msg'] = msg
+            color_special_joints(arm, force=True)
+        _LOCK_STATE.clear()
+        self.report({'INFO'} if ok else {'ERROR'}, msg)
+        return {'FINISHED'} if ok else {'CANCELLED'}
+
+
 class N64_PT_bone_joint(bpy.types.Panel):
     bl_label = 'N64 Joint'
     bl_space_type = 'PROPERTIES'
@@ -4335,6 +4635,11 @@ class N64_PT_bone_joint(bpy.types.Panel):
         b = arm.data.bones[name]
         g = _bone_joint(name)
         lay.label(text=f'Game joint {g}' + (f' (DObjDesc {g - 4})' if g >= 4 else ''), icon='BONE_DATA')
+        if context.scene.get('n64_joint_msg'):
+            lay.label(text=context.scene['n64_joint_msg'], icon='SORTALPHA')
+        if 'n64_joint_orig' in b.keys() and int(b['n64_joint_orig']) != g - 4:
+            lay.label(text=f'joint_{int(b["n64_joint_orig"]):02d} in the export (renumbered: joints removed)',
+                      icon='INFO')
         roles = joint_roles(arm, name)
         box = lay.box()
         if roles:
@@ -4370,6 +4675,13 @@ class N64_PT_bone_joint(bpy.types.Panel):
             draw_joint_materials(lay, context, arm, g - 4)
         if g >= 4 and bpy.data.collections.get('Model parts') is not None:
             draw_part_variants(lay, context.scene, g - 4)
+        if g >= 4:
+            r = lay.row()
+            r.enabled = arm.mode != 'EDIT'
+            r.operator('n64.joint_add', icon='ADD')
+            r.operator('n64.joint_set_parent', icon='CON_CHILDOF')
+            r.operator('n64.joint_remove', icon='TRASH')
+            lay.operator('n64.joint_put_meshes', icon='MESH_DATA')
 
 
 class N64_PT_fighter_joints(bpy.types.Panel):
@@ -4419,6 +4731,14 @@ class N64_PT_fighter_joints(bpy.types.Panel):
                     and int(b.get('n64_hidden_index', -1)) < 0]
         if withheld:
             lay.label(text='Never created: ' + ', '.join(withheld), icon='ERROR')
+        leg = lay.box()
+        leg.label(text='Viewport colors (bone collection \'Special Joints\')', icon='COLOR')
+        used = set(special_roles(context.object).values())
+        for key, text, c in SPECIAL_ROLES:
+            r = leg.row(align=True)
+            r.label(text='', icon='LAYER_ACTIVE' if key in used else 'LAYER_USED')
+            r.label(text=text)
+            r.label(text='#%02X%02X%02X' % tuple(round(x * 255) for x in c))
 
 
 # ---- fighter view: costume, model part variants, expressions (previews; the import resets them) ----
@@ -4466,9 +4786,30 @@ def _load_image(path):
     return game_alpha(bpy.data.images.load(path, check_existing=True))
 
 
+def costume_file(base_name, k, base_mat=None):
+    """The image file material `base_name` shows in costume k: Add Costume's pick
+    (n64_costume_files), else the export's (manifest costumes), else (older exports) the costume-0
+    image's `_c<k>.png` sibling. None: none."""
+    m = base_mat or bpy.data.materials.get(base_name)
+    if m is not None and 'n64_costume_files' in m.keys():
+        p = dict(m['n64_costume_files']).get(str(k))
+        if p:
+            return bpy.path.abspath(p)
+    rel = (((_manifest().get('materials') or {}).get(base_name) or {}).get('costumes') or [])
+    if k < len(rel) and rel[k]:
+        return _export_path(rel[k])
+    tex = _tex_node(m) if m is not None else None
+    if tex is not None and tex.image is not None and tex.image.filepath:
+        p = bpy.path.abspath(tex.image.filepath)
+        sib = re.sub(r'_c0\.png$', f'_c{k}.png', p)
+        if sib != p and os.path.exists(sib):
+            return sib
+    return None
+
+
 def _costume_mat(base, k):
-    """Costume k's copy of material `base` (the body's `<base>_c<k>`, else a copy with the image's
-    `_c<k>.png` sibling: how the import reads parts' / low detail's costumes)."""
+    """Costume k's copy of material `base` (the body's `<base>_c<k>`, else a copy showing the file
+    the import reads for that costume: costume_file)."""
     if k == 0:
         return base
     name = f'{base.name}_c{k}'
@@ -4478,13 +4819,269 @@ def _costume_mat(base, k):
     m = base.copy()
     m.name = name
     tex = _tex_node(m)
-    if tex is not None and tex.image is not None and tex.image.filepath:
-        p = bpy.path.abspath(tex.image.filepath)
-        sib = re.sub(r'_c0\.png$', f'_c{k}.png', p)
-        img = _load_image(sib) if sib != p else None
+    path = costume_file(base.name, k, base)
+    if tex is not None and path:
+        img = _load_image(path)
         if img is not None:
             tex.image = img
     return m
+
+
+# -- costumes: add (a copy of one, its own palette files to recolor) / remove the last
+
+def _base_materials():
+    """The fighter's materials (costume 0's: not the _c<k> copies, not helpers)."""
+    return [m for m in bpy.data.materials if not re.search(r'_c\d+$', m.name) and not m.get('n64_helper')
+            and m.users and not m.get('n64_reference') and not m.name.startswith(('Reference', 'Shield'))]
+
+
+def _next_entry_file(base_name, kind, entry):
+    """The next free textures/<base>_<kind><n>.png (kind 'pal' / 'img'): after the material's list and the
+    files already there."""
+    tdir = _export_path('textures')
+    n = len(entry.get('palettes' if kind == 'pal' else 'images') or [])
+    while os.path.exists(os.path.join(tdir, f'{base_name}_{kind}{n}.png')):
+        n += 1
+    return os.path.join(tdir, f'{base_name}_{kind}{n}.png')
+
+
+def add_costume(context, source):
+    """A new costume (the next number) copying costume `source`: its collection, materials and, per
+    paletted material, a new palette file (<mat>_pal<P>.png, a copy of the source costume's look:
+    recolor it). -> (new costume number, [notes])."""
+    import shutil
+    man = _manifest(context.scene)
+    mats_e = man.get('materials') or {}
+    n = _costume_count()
+    src_c = bpy.data.collections.get(f'Costume {source}')
+    c0 = bpy.data.collections.get('Costume 0')
+    if src_c is None or c0 is None:
+        raise RuntimeError(f'no Costume {source} collection')
+    notes, files = [], {}
+    for m in _base_materials():
+        e = mats_e.get(m.name) or {}
+        if e.get('untextured') or not e:
+            continue
+        src_file = costume_file(m.name, source, m) if source else None
+        if source == 0 or not src_file:
+            tex = _tex_node(m)
+            src_file = bpy.path.abspath(tex.image.filepath) if tex is not None and tex.image is not None else None
+        if not src_file or not os.path.exists(src_file):
+            continue
+        on_ref_image = os.path.basename(src_file) == f'{m.name}.png' or \
+            re.match(rf'{re.escape(m.name)}_pal\d+\.png$', os.path.basename(src_file))
+        if e.get('fmt') == 2 and e.get('palette_source') == 'list' and on_ref_image:
+            dst = _next_entry_file(m.name, 'pal', e)       # a palette of its own (recolor the file)
+        elif e.get('fmt') != 2 and e.get('image_source') == 'list':
+            dst = _next_entry_file(m.name, 'img', e)       # an image of its own
+        elif e.get('fmt') == 2 and e.get('palette_source') == 'list':
+            pdir = os.path.join(_export_path('textures'), 'preview')
+            os.makedirs(pdir, exist_ok=True)
+            dst = os.path.join(pdir, f'{m.name}_c{n}.png')  # another image + palette: a picture of its own
+        else:
+            files[m.name] = src_file                       # one palette / inline: shared with the source
+            notes.append(f'{m.name}: no palette list, shares costume {source}\'s texture')
+            continue
+        shutil.copyfile(src_file, dst)
+        files[m.name] = dst
+    # the collection: linked copies of costume 0's objects with costume n's materials
+    col = bpy.data.collections.new(f'Costume {n}')
+    parent = next((p for p in bpy.data.collections if c0.name in p.children), None)
+    (parent.children if parent is not None else context.scene.collection.children).link(col)
+    for o in c0.objects:
+        d = o.copy()
+        d.name = f'{o.name}_c{n}'
+        col.objects.link(d)
+        for i, slot in enumerate(d.material_slots):
+            base = o.data.materials[i] if i < len(o.data.materials) else slot.material
+            if base is None:
+                continue
+            src_m = bpy.data.materials.get(f'{base.name}_c{source}') if source else base
+            mm = (src_m or base).copy()
+            mm.name = f'{base.name}_c{n}'
+            tex = _tex_node(mm)
+            if tex is not None and base.name in files:
+                img = _load_image(files[base.name])
+                if img is not None:
+                    tex.image = img
+            slot.link = 'OBJECT'
+            slot.material = bpy.data.materials.get(f'{base.name}_c{n}') or mm
+    for name, path in files.items():
+        m = bpy.data.materials[name]
+        cf = dict(m.get('n64_costume_files') or {})
+        cf[str(n)] = bpy.path.relpath(path)
+        m['n64_costume_files'] = cf
+    # which costume it copies: what Blender doesn't show per costume (MObj env / blend / light colors,
+    # low detail / model part colors) comes from it on import
+    srcs = dict(context.scene.get('n64_costume_sources') or {})
+    srcs[str(n)] = int(srcs.get(str(source), source))
+    context.scene['n64_costume_sources'] = srcs
+    apply_costume(context.scene, n)
+    return n, notes
+
+
+def remove_last_costume(context):
+    """Remove the last costume: its collection, objects, materials, and the files Add Costume made for it."""
+    n = _costume_count()
+    if n <= 1:
+        raise RuntimeError('the fighter needs one costume')
+    k = n - 1
+    col = bpy.data.collections.get(f'Costume {k}')
+    man_mats = _manifest(context.scene).get('materials') or {}
+    removed_files = 0
+    for m in _base_materials():
+        cf = dict(m.get('n64_costume_files') or {})
+        p = cf.pop(str(k), None)
+        if p is not None:
+            m['n64_costume_files'] = cf
+            path = bpy.path.abspath(p)
+            listed = {_export_path(r) for r in ((man_mats.get(m.name) or {}).get('palettes') or []) +
+                      ((man_mats.get(m.name) or {}).get('images') or []) if r}
+            if path not in listed and os.path.exists(path) and path not in \
+                    {bpy.path.abspath(v) for v in cf.values()}:
+                for img in [i for i in bpy.data.images if i.filepath and bpy.path.abspath(i.filepath) == path]:
+                    bpy.data.images.remove(img)
+                os.remove(path)
+                removed_files += 1
+    if col is not None:
+        for o in list(col.objects):
+            bpy.data.objects.remove(o)
+        bpy.data.collections.remove(col)
+    for m in [m for m in bpy.data.materials if m.name.endswith(f'_c{k}') and m.users == 0]:
+        bpy.data.materials.remove(m)
+    srcs = dict(context.scene.get('n64_costume_sources') or {})
+    if srcs.pop(str(k), None) is not None:
+        context.scene['n64_costume_sources'] = srcs
+    if _costume_shown(context.scene) >= k:
+        apply_costume(context.scene, k - 1)
+    return k, removed_files
+
+
+class N64_OT_costume_add(bpy.types.Operator):
+    bl_idname = 'n64.costume_add'
+    bl_label = 'Add Costume'
+    bl_description = ('A new costume, a copy of the one shown: each paletted material gets a palette file of its own '
+                      '(textures/<mat>_pal<n>.png: recolor it in Blender or any editor); the import writes one more '
+                      'costume (config.yaml num_costumes follows)')
+    bl_options = {'UNDO'}
+
+    def execute(self, context):
+        try:
+            n, notes = add_costume(context, _costume_shown(context.scene))
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f'Costume {n} added' + (f' ({len(notes)} materials share their texture)' if notes else ''))
+        return {'FINISHED'}
+
+
+class N64_OT_costume_remove(bpy.types.Operator):
+    bl_idname = 'n64.costume_remove'
+    bl_label = 'Remove Last Costume'
+    bl_description = 'Remove the last costume (and the palette files Add Costume made for it)'
+    bl_options = {'UNDO'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        try:
+            k, nf = remove_last_costume(context)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f'Costume {k} removed ({nf} files)')
+        return {'FINISHED'}
+
+
+# -- textures: reload from disk, and what each material has (colors against its format, images, palettes)
+
+FORMAT_COLORS = {'CI4': 16, 'CI8': 256}
+
+
+def texture_stats(scene=None):
+    """{material: dict(format, colors (most in one of its files), limit, images, palettes, files, over)}
+    from the files on disk (what the import reads: extra _img / _pal files past the list included)."""
+    import numpy as np
+    man = _manifest(scene)
+    tdir = _export_path('textures')
+    out = {}
+    for name, e in sorted((man.get('materials') or {}).items()):
+        if e.get('untextured') or not e.get('images'):
+            continue
+        files = sorted({_export_path(r) for r in (e.get('images') or []) + (e.get('palettes') or []) +
+                        (e.get('costumes') or []) if r})
+        k = len(e.get('palettes') or [])
+        while os.path.exists(os.path.join(tdir, f'{name}_pal{k}.png')):
+            files.append(os.path.join(tdir, f'{name}_pal{k}.png'))
+            k += 1
+        i = len(e.get('images') or [])
+        while os.path.exists(os.path.join(tdir, f'{name}_img{i}.png')):
+            files.append(os.path.join(tdir, f'{name}_img{i}.png'))
+            i += 1
+        most = 0
+        for fp in files:
+            img = _load_image(fp)
+            if img is None or not img.size[0]:
+                continue
+            px = np.empty(img.size[0] * img.size[1] * 4, np.float32)
+            img.pixels.foreach_get(px)
+            q = np.round(px.reshape(-1, 4) * 255).astype(np.uint8)
+            most = max(most, len(np.unique(q.view(np.uint32))))
+        fmt = e.get('format', '?')
+        lim = FORMAT_COLORS.get(fmt)
+        out[name] = dict(format=fmt, colors=most, limit=lim, images=i, palettes=k, files=len(files),
+                         over=bool(lim and most > lim))
+    return out
+
+
+_TEX_STATS = {}
+
+
+class N64_OT_textures_reload(bpy.types.Operator):
+    bl_idname = 'n64.textures_reload'
+    bl_label = 'Reload Textures'
+    bl_description = ('Reload every texture file from disk (after editing them outside Blender) and count, per '
+                      'material, its colors (against what its format holds: CI4 16, CI8 256), images and palettes '
+                      '(extra <mat>_img<n> / <mat>_pal<n> files included: the import adds them)')
+
+    def execute(self, context):
+        tdir = os.path.normpath(_export_path('textures') or '')
+        n = 0
+        for img in bpy.data.images:
+            if img.filepath and os.path.normpath(bpy.path.abspath(img.filepath)).startswith(tdir):
+                img.reload()
+                n += 1
+        _TEX_STATS.clear()
+        _TEX_STATS.update(texture_stats(context.scene))
+        over = [k for k, v in _TEX_STATS.items() if v['over']]
+        self.report({'WARNING'} if over else {'INFO'},
+                    f'{n} images reloaded; {len(_TEX_STATS)} textured materials'
+                    + (f'; over their color count: {", ".join(over)}' if over else ''))
+        return {'FINISHED'}
+
+
+def _stat_text(nm, v):
+    lim = f'/{v["limit"]}' if v['limit'] else ''
+    return (f'{nm}: {v["format"]} {v["colors"]}{lim} colors, {v["images"]} image{"s" if v["images"] != 1 else ""}, '
+            f'{v["palettes"]} palette{"s" if v["palettes"] != 1 else ""}')
+
+
+def draw_texture_stats(lay, name=None):
+    """name: that material's line (its N64 Model panel). Else one summary line, and only the materials
+    over their color count."""
+    if not _TEX_STATS:
+        return
+    if name:
+        v = _TEX_STATS[name]
+        lay.label(text=_stat_text(name, v), icon='ERROR' if v['over'] else 'IMAGE_DATA')
+        return
+    over = [(nm, v) for nm, v in sorted(_TEX_STATS.items()) if v['over']]
+    multi = sum(1 for v in _TEX_STATS.values() if v['images'] > 1 or v['palettes'] > 1)
+    lay.label(text=f'{len(_TEX_STATS)} textures ({multi} with alternates)' +
+                   (f', {len(over)} with too many colors' if over else ''), icon='ERROR' if over else 'CHECKMARK')
+    for nm, v in over:
+        lay.label(text=_stat_text(nm, v), icon='ERROR')
 
 
 def _view_objects(coll_name):
@@ -4503,9 +5100,10 @@ def apply_costume(scene, k):
         if not m:
             continue
         lc = _find_layer_collection(vl.layer_collection, c.name)
+        off = int(m.group(1)) != k or _detail_shown(scene) != 'hi'   # (low detail / skeleton shown: none)
         if lc is not None:
-            lc.hide_viewport = int(m.group(1)) != k
-        c.hide_render = int(m.group(1)) != k
+            lc.hide_viewport = off
+        c.hide_render = off
     for ob in _view_objects('Model parts') + _view_objects('Low detail'):
         for i, slot in enumerate(ob.material_slots):
             base = ob.data.materials[i] if i < len(ob.data.materials) else None
@@ -4657,6 +5255,7 @@ def reset_previews():
     for m in bpy.data.materials:
         if 'n64_expr_orig' in m.keys():
             _set_tex_image(m, None)
+    bpy.context.scene.pop('n64_detail_shown', None) if 'n64_detail_shown' in bpy.context.scene.keys() else None
     for name in ('Costume 0', 'Model parts', 'Low detail'):
         for o in _view_objects(name):
             try:
@@ -4682,21 +5281,59 @@ def body_objects(j, detail='hi'):
     return [o for o in bpy.data.objects if o.type == 'MESH' and pat.match(o.name)]
 
 
+def _detail_shown(scene):
+    return str(scene.get('n64_detail_shown', 'hi'))
+
+
+DETAILS = (('hi', 'High', 'The high detail model (Costume N)'), ('lo', 'Low', 'The low detail model (Low detail)'),
+           ('skel', 'Skeleton', 'The electric-shock skeleton (Electric skeleton)'))
+
+
+def apply_detail(scene, d):
+    """Show the high detail model (the shown costume), the low detail one (in that costume's colors) or
+    the electric-shock skeleton; model part variants follow the detail."""
+    scene['n64_detail_shown'] = d
+    vl = bpy.context.view_layer
+    for name, det in (('Low detail', 'lo'), ('Electric skeleton', 'skel')):
+        lc = _find_layer_collection(vl.layer_collection, name)
+        if lc is not None:
+            lc.exclude = False
+            lc.hide_viewport = d != det
+    apply_costume(scene, _costume_shown(scene))
+    apply_parts(scene)
+
+
+class N64_OT_detail_show(bpy.types.Operator):
+    bl_idname = 'n64.detail_show'
+    bl_label = 'Show Detail'
+    bl_description = 'Show the high detail model, the low detail one or the electric-shock skeleton'
+    bl_options = {'UNDO'}
+    detail: bpy.props.StringProperty(default='hi')
+
+    def execute(self, context):
+        apply_detail(context.scene, self.detail)
+        return {'FINISHED'}
+
+
 def apply_parts(scene):
     """Each joint's shown piece (scene n64_parts_shown {joint: -2 body, -1 nothing, v variant}):
-    the body's piece, or the variant's objects in its place (like the game's model part events)."""
+    the body's piece, or the variant's objects in its place (like the game's model part events), in
+    the shown detail (high / low; the skeleton: none)."""
     shown = {int(k): int(v) for k, v in dict(scene.get('n64_parts_shown') or {}).items()}
+    det = _detail_shown(scene)
     vl = bpy.context.view_layer
     lc = _find_layer_collection(vl.layer_collection, 'Model parts')
     if lc is None:
         return
+    if det == 'skel':
+        shown = {}
     any_part = any(v >= 0 for v in shown.values())
     if any_part:
         if lc.hide_viewport:
             scene['n64_parts_auto'] = True
         lc.hide_viewport = False
         for o in _view_objects('Model parts'):
-            m = re.match(r'part(\d+)_hi_j(\d+)$', o.name)
+            m = re.match(rf'part(\d+)_{det}_j(\d+)$', o.name)
             o.hide_set(not (m and shown.get(int(m.group(2)), -2) == int(m.group(1))))
     elif scene.get('n64_parts_auto'):
         lc.hide_viewport = True
@@ -4704,8 +5341,9 @@ def apply_parts(scene):
             o.hide_set(False)
         del scene['n64_parts_auto']
     for j in set(shown) | set(int(k) for k in dict(scene.get('n64_parts_seen') or {})):
-        for o in body_objects(j):
-            o.hide_set(shown.get(j, -2) != -2)
+        for d_ in ('hi', 'lo'):
+            for o in body_objects(j, d_):
+                o.hide_set(d_ == det and shown.get(j, -2) != -2)
     scene['n64_parts_seen'] = {str(j): 1 for j in shown}
 
 
@@ -4764,17 +5402,42 @@ class N64_OT_part_add(bpy.types.Operator):
     def execute(self, context):
         j = self.joint
         have = part_objects(j)
+        if not have and self.source == -2:
+            # the game starts every joint with a body piece on model part id 0 (drawing the body's
+            # piece) and goes back to variant 0's mesh when parts reset: variant 0 must look like
+            # the body. So the first Add makes variant 0 = the body (keep it so) and variant 1 to edit.
+            r = self._add(context, j, 0, -2)
+            if r is not None:
+                return r
+            for o in part_objects(j).get(0, []):
+                o['n64_part_body'] = True
+            have = part_objects(j)
+            r = self._add(context, j, 1, -2)
+            if r is not None:
+                return r
+            bpy.ops.n64.part_select(joint=j, variant=1)
+            self.report({'INFO'}, f'joint_{j:02d}: variant 0 = the body\'s look (the game\'s starting id: keep it '
+                                  f'as it is), variant 1 added to edit (moveset event {part_event(j, 1)})')
+            return {'FINISHED'}
         v = max(have) + 1 if have else 0
+        r = self._add(context, j, v, self.source)
+        if r is not None:
+            return r
+        bpy.ops.n64.part_select(joint=j, variant=v)
+        self.report({'INFO'}, f'joint_{j:02d}: variant {v} added (moveset event {part_event(j, v)})')
+        return {'FINISHED'}
+
+    def _add(self, context, j, v, source):
         coll = bpy.data.collections.get('Model parts')
         if coll is None:
             self.report({'ERROR'}, 'No Model parts collection')
             return {'CANCELLED'}
         made = []
         for detail in ('hi', 'lo'):
-            if self.source == -2:
+            if source == -2:
                 src = next((o for o in body_objects(j, detail) if not re.search(r'_c\d+$', o.name)), None)
             else:
-                src = next(iter(part_objects(j, self.source, detail).get(self.source, [])), None)
+                src = next(iter(part_objects(j, source, detail).get(source, [])), None)
             if src is None and detail == 'lo' and made:
                 src = made[0]                    # no low detail piece: the high one, edit it down
             if src is None:
@@ -4783,6 +5446,7 @@ class N64_OT_part_add(bpy.types.Operator):
             o.data = src.data.copy()
             o.name = f'part{v}_{detail}_j{j:02d}'
             o.pop('n64_costume_preview', None)
+            o.pop('n64_part_body', None)
             for slot in o.material_slots:
                 slot.link = 'DATA'
             coll.objects.link(o)
@@ -4793,9 +5457,7 @@ class N64_OT_part_add(bpy.types.Operator):
             return {'CANCELLED'}
         if _costume_shown(context.scene):
             apply_costume(context.scene, _costume_shown(context.scene))
-        bpy.ops.n64.part_select(joint=j, variant=v)
-        self.report({'INFO'}, f'joint_{j:02d}: variant {v} added ({", ".join(o.name for o in made)})')
-        return {'FINISHED'}
+        return None
 
 
 class N64_OT_part_remove(bpy.types.Operator):
@@ -4841,7 +5503,8 @@ class N64_OT_expression_show(bpy.types.Operator):
                       'paint it in the Image Editor; other costumes: recolored preview)')
     bl_options = {'UNDO'}
     part: bpy.props.IntProperty()
-    image: bpy.props.IntProperty(default=-1, description='-1: the costume\'s own image')
+    image: bpy.props.IntProperty(default=-1, description='-1: no override (the costume\'s own image: the same as '
+                                                          'image 0 unless a costume script picks another)')
 
     def execute(self, context):
         shown = dict(context.scene.get('n64_expr_shown') or {})
@@ -4986,6 +5649,24 @@ def draw_joint_materials(lay, context, arm, j):
             op.joint, op.mobj = j, i
 
 
+def part_event(j, v):
+    """The moveset event that shows variant v on joint_j (FTMotionEventSetModelPartID: opcode 0x28,
+    7-bit game joint id, 19-bit variant) as main.asm's word."""
+    return f'dw 0x{(0x28 << 26) | ((j + 4) & 0x7F) << 19 | (v & 0x7FFFF):08X}'
+
+
+class N64_OT_copy_text(bpy.types.Operator):
+    bl_idname = 'n64.copy_text'
+    bl_label = 'Copy'
+    bl_description = 'Copy to the clipboard'
+    text: bpy.props.StringProperty()
+
+    def execute(self, context):
+        context.window_manager.clipboard = self.text
+        self.report({'INFO'}, f'Copied: {self.text}')
+        return {'FINISHED'}
+
+
 def draw_part_variants(lay, scene, j):
     """The joint's model part variants: show (body / nothing / each), select, add, remove."""
     have = part_objects(j)
@@ -5003,6 +5684,13 @@ def draw_part_variants(lay, scene, j):
         op.joint, op.variant = j, v
         if v == max(have):
             r.operator('n64.part_remove', text='', icon='X').joint = j
+        r2 = box.row(align=True)
+        ev = part_event(j, v)
+        r2.label(text=f'   moveset: {ev}' + ('   (the body\'s look: the game starts with it)' if v == 0 else ''))
+        r2.operator('n64.copy_text', text='', icon='COPYDOWN').text = ev
+    if have and 0 in have:
+        box.label(text='Variant 0 is what the joint starts with and goes back to: keep it the body\'s look',
+                  icon='INFO')
     r = box.row(align=True)
     op = r.operator('n64.part_add', text='Add (copy body)', icon='ADD')
     op.joint, op.source = j, -2
@@ -5235,10 +5923,22 @@ class N64_PT_fighter_view(bpy.types.Panel):
         sc = context.scene
         n = _costume_count()
         cur = _costume_shown(sc)
+        lay.label(text='Detail', icon='MESH_DATA')
+        r = lay.row(align=True)
+        det = _detail_shown(sc)
+        for key, text, _ in DETAILS:
+            if key == 'skel' and bpy.data.collections.get('Electric skeleton') is None:
+                continue
+            r.operator('n64.detail_show', text=text, depress=det == key).detail = key
         lay.label(text=f'Costume ({n})', icon='MATERIAL')
         grid = lay.grid_flow(row_major=True, columns=8, align=True)
         for k in range(n):
             grid.operator('n64.costume_show', text=str(k), depress=k == cur).costume = k
+        r = lay.row(align=True)
+        r.operator('n64.costume_add', text=f'Add (copy {cur})', icon='ADD')
+        r.operator('n64.costume_remove', text='Remove Last', icon='X')
+        lay.operator('n64.textures_reload', icon='FILE_REFRESH')
+        draw_texture_stats(lay)
         man = _manifest(sc)
         tps = texture_parts(sc) if man else []
         if tps:
@@ -5251,11 +5951,17 @@ class N64_PT_fighter_view(bpy.types.Panel):
                 row.label(text=f'{tp["index"] + 1}: joint_{tp["joint"]:02d} material {tp["mobj_hi"]}'
                                + (f' ({mats[0]})' if mats else ''))
                 cur_i = int(shown.get(str(tp['index']), -1))
-                op = row.operator('n64.expression_show', text='Own', depress=cur_i < 0)
-                op.part, op.image = tp['index'], -1
+                # 'Own': no override, what the costume's own script gives the material. The same as
+                # image 0 unless a costume picks another image (most only change palettes): then only 0
+                own_differs = any(cm[0] != 0 for b in mats
+                                  for cm in ((man['materials'].get(b) or {}).get('costume_map') or []))
+                if own_differs:
+                    op = row.operator('n64.expression_show', text='Own', depress=cur_i < 0)
+                    op.part, op.image = tp['index'], -1
                 for i in range(n_img if n_img > 1 else 0):
-                    op = row.operator('n64.expression_show', text=str(i), depress=cur_i == i)
-                    op.part, op.image = tp['index'], i
+                    op = row.operator('n64.expression_show', text=str(i),
+                                      depress=cur_i == i or (i == 0 and cur_i < 0 and not own_differs))
+                    op.part, op.image = tp['index'], (-1 if i == 0 and not own_differs else i)
                 r = lay.row(align=True)
                 r.operator('n64.alt_texture_add', text='Add', icon='ADD').part = tp['index']
                 if any(len(frame_nodes(bpy.data.materials[b])) > len((man['materials'].get(b) or {}).get('images') or [])
@@ -5461,10 +6167,10 @@ class N64_PT_game_files(bpy.types.Panel):
         sc = context.scene
         if not _deps_ok():
             lay.label(text='Blender\'s Python needs Pillow + PyYAML', icon='ERROR')
-            lay.operator('n64.install_tools', icon='IMPORT')
+            lay.operator('n64.install_tools', icon='PLUGIN')
         lay.prop(sc, 'n64ui_build_dir', text='Folder')
         col = lay.column(align=True)
-        col.operator('n64.write_game_files', icon='EXPORT').everything = False
+        col.operator('n64.write_game_files', icon='FILE_TICK').everything = False
         col.operator('n64.write_game_files', text='Write All (Every Animation)', icon='PACKAGE').everything = True
         b = _BUILD
         if b['status'] == 'running':
@@ -6158,7 +6864,7 @@ class N64_PT_stage_joint(bpy.types.Panel):
             box.label(text=f'  {o.name}  ({len(o.data.polygons)} faces)')
         if len(meshes) > 6:
             box.label(text=f'  +{len(meshes) - 6} more')
-        op = box.operator('n64.stage_assign', text='Put Selected Meshes Here', icon='IMPORT')
+        op = box.operator('n64.stage_assign', text='Put Selected Meshes Here', icon='MESH_DATA')
         op.joint = name
         box = lay.box()
         if pb is not None and 'n64_anim_frames' in pb.keys():
@@ -6194,7 +6900,7 @@ class N64_PT_stage_joint(bpy.types.Panel):
         op.joint = name
 
 
-CLASSES = (N64_OT_vs_view, N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
+CLASSES = (N64_OT_detail_show, N64_OT_costume_add, N64_OT_costume_remove, N64_OT_textures_reload, N64_OT_joint_set_parent, N64_OT_copy_text, N64_OT_joint_add, N64_OT_joint_put_meshes, N64_OT_joint_remove, N64_OT_vs_view, N64_OT_joint_anim_set, N64_OT_joint_anim_remove, N64_PT_joint, N64_OT_anim_add, N64_OT_anim_remove, N64_OT_anim_settings, N64_OT_frame_add, N64_OT_frame_remove,
            N64_OT_texture_add, N64_OT_texture_remove, N64_OT_state_add, N64_OT_state_edit, N64_OT_state_remove, N64_PT_material, N64_PT_scene, N64_PT_gamedata,
            N64_OT_hurtbox_add, N64_OT_hurtbox_remove, N64_OT_hurtbox_select, N64_PT_bone_hurtboxes,
            N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools,
@@ -6438,5 +7144,28 @@ def unregister():
         handlers.remove(h)
 
 
+def _refresh_from_tools():
+    """A .blend keeps its own copy of this panel (the n64_panel.py text, run when the file opens): when
+    the tools' n64_panel.py (scene n64_tools_dir) is different, the text takes it and that runs instead,
+    so a .blend built earlier gets the current panel without rebuilding. -> True when it did."""
+    try:
+        txt = bpy.data.texts.get('n64_panel.py')
+        sc = bpy.context.scene
+        d = sc.get('n64_tools_dir') if sc is not None else None
+        src = os.path.join(d, 'n64_panel.py') if d else None
+        if txt is None or not src or not os.path.exists(src):
+            return False
+        new = open(src, encoding='utf-8').read()
+        if new == txt.as_string():
+            return False
+        txt.from_string(new)
+    except Exception:                    # (never keep the panel from loading)
+        return False
+    print(f'n64_panel: updated from {src}')
+    exec(compile(new, src, 'exec'), {'__name__': '__main__', '__file__': src})
+    return True
+
+
 if __name__ == '__main__':
-    register()
+    if not _refresh_from_tools():
+        register()

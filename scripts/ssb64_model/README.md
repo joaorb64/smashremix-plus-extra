@@ -57,6 +57,12 @@ harmless.
 ```
 python3 appender/scripts/ssb64_model/ssb64_model.py export extra_characters/<Name> OUT_DIR
 ```
+A new character starts from a vanilla fighter: `ssb64_model.py new CAPTAIN extra_characters/<Name>
+[--name "Display Name"]` (`new_character.py`) writes its main.bin / character.bin (the ROM's),
+reqlists, config.yaml (offsets, base_character, costumes counted from the costume scripts, files
+6..9) and an empty main.asm scope; every action plays the base's animations and moves until the
+import gives it its own. Then export that folder.
+
 To export a Remix fighter directly from `original_extra.z64`, select it by the
 constant name from `appender/smashremix/src/File.asm`:
 ```
@@ -480,13 +486,48 @@ Blender compute them. Scene custom properties `n64_light_color` / `n64_shadow_co
 
 ### Textures (`OUT_DIR/textures/`, referenced relatively from the .blend)
 
+One file per thing a material has (`tex_layout` 2):
+
 | File | What | Edit it to |
 |---|---|---|
-| `<mat>_c<N>.png` | costume N as it looks in game (what the Costume N material shows) | paint costume N in Blender: a recolor of the same drawing changes only costume N's palette; a repaint changes the image (shared by the costumes using it) |
-| `<mat>_img<i>.png` | image list entry i (facial expressions, alternate textures), drawn with costume 0's palette | redraw an expression. CI images keep their palette's colors (new colors map to the nearest one) |
-| `<mat>_pal<p>.png` | palette list entry p, shown on the costume-0 image | recolor: each pixel's color becomes that palette slot's color |
+| `<mat>.png` | the material's image with its palette as costume 0 draws it (always there) | paint costume 0 / the base drawing: a recolor changes costume 0's palette, a repaint the image |
+| `<mat>_pal<p>.png` | palette p (p >= 1), shown on that image: what a costume using it looks like | recolor: each pixel's color becomes that palette slot's color |
+| `<mat>_img<i>.png` | image i (i >= 1: facial expressions, alternate textures), drawn with costume 0's palette | redraw it. CI images keep their palette's colors (new colors map to the nearest one) |
+| `preview/<mat>_c<N>.png` | only for a costume using another image AND another palette: its picture | paint it like any costume |
 
-The img/pal PNGs are loaded in the .blend as images (Image Editor) to paint.
+A costume shows the file of what it uses (costume 3 = `<mat>_pal3.png` for most fighters), so
+painting a costume in Blender edits that file; the import takes each costume's image / palette
+from the file it shows. More `<mat>_pal<n>.png` / `<mat>_img<n>.png` files numbered past the list
+are added to it (made in any editor; **Reload Textures** shows them). Older exports
+(`<mat>_c<N>.png` copies besides `_img` / `_pal`) import as before.
+
+A .blend runs its own copy of this panel; when the tools' `n64_panel.py` is newer it updates
+itself as the file opens. Older .blends: `ssb64_model.py update-panel OUT_DIR` (nothing else changes;
+reopen the file).
+
+**N64 Fighter > Detail: High / Low / Skeleton** shows the high detail model (the shown costume),
+the low detail one (in that costume's colors) or the electric-shock skeleton; model part
+variants follow the detail.
+
+**N64 Fighter > Costume: Add (copy N)** makes the next costume, a copy of the shown one: its
+collection and materials, and per material with a palette list a new `<mat>_pal<n>.png` to
+recolor (a material without a palette list shares the source costume's texture; a non-CI one
+gets a new `_img<n>`). What Blender doesn't show per costume comes from the costume it copied
+(scene `n64_costume_sources`): MObj env / blend / light colors, and the colors of materials only
+used by the low detail model or model parts; the prim color (a color-only material's color in
+Blender) is the new costume material's, editable like any costume's. **Remove Last** removes the last costume and the files Add made for it. The
+export takes the costume count from the file's costume scripts (config.yaml `num_costumes` only when
+they don't say: it can count differently, e.g. the Ice Climbers' file holds Popo's and Nana's, twice
+it). The import writes as many costumes as the .blend has (config.yaml `num_costumes` follows when
+it matched the file's count, else it's left alone; it notes
+`default_costumes` past the last costume and missing `stock_icon_<n>.png`). The Kirby hat .blend
+keeps its own costumes.
+
+**Reload Textures** (N64 Fighter) reloads every texture from disk (after editing outside Blender)
+and counts, per material, its colors (most in one file, against its format: CI4 16, CI8 256),
+images and palettes: listed under the button when there's more than one or too many colors, and in
+the material's N64 Model panel.
+
 Unedited entries keep their exact original bytes. PNG dimensions follow the
 texture's render-tile masks; the render-tile extents are kept separately so
 rebuilding preserves repeated or clamped sampling.
@@ -666,7 +707,9 @@ to `shield_size` (attributes + 0x74) when it changed.
   low detail its colors (object-linked `<material>_c<k>` copies: the body's, else one with the
   image's `_c<k>.png`).
 - **Alternate textures** (texture parts: facial expressions, or any material whose image moveset
-  events switch): per part, **Own** (the costume's image) or an image of its list, on every
+  events switch): per part, an image of its list (**Own**, shown only when a costume's script picks another image
+  than 0: no override, the costume's own image; the game goes back to image 0 after an expression
+  event resets), on every
   material the part switches (the joint's MObj at its index: body, low detail, model part
   variants; the part's joint / material index are Armature > N64 Fighter Joints', followed live).
   In costume 0 it's the list image itself (`textures/<mat>_img<i>.png`: paint it in the Image
@@ -686,6 +729,11 @@ to `shield_size` (attributes + 0x74) when it changed.
   Costumes should change palettes only: a costume script that picks the image too
   (Cloud's did) fights the alternate textures.
 - **Model parts**: per joint, what it shows: **Body** (the body's piece), **None**, or a variant
+  (variant 0 is what the game starts the joint with and goes back to when parts reset - it draws
+  the body's piece at first, so a moveset event picking 0 changes nothing: variant 0 must look
+  like the body. The first **Add (copy body)** on a joint makes variant 0 = the body and variant 1
+  to edit; the import warns when variant 0 differs from the body. Each variant row shows its
+  moveset event word, `dw 0xA0..`, with a copy button)
   (in the body piece's place, like the game's model part event / `ftParamSetModelPartID`).
 
 **Bone > N64 Joint > Model parts** (the selected joint): the same picker, each variant's objects
@@ -734,6 +782,102 @@ The N64 Animation panel's hidden-part checkboxes and the bone locks follow the e
 Load / Save Animation .bin read the joint tree from the export's files: after changing what's
 created or the hidden parts, import, then export again before saving animations with them.
 The import writes only what changed (`joint attributes: unchanged` otherwise).
+
+The special joints are colored in the viewport (pose bone colors over the side colors, bone
+collection **Special Joints**): items green, slope foot IK thighs orange, alternate textures
+cyan, effect joints magenta, accessory yellow, hidden parts gray (legend in Armature > N64
+Fighter Joints). The colors follow the edits.
+
+#### Removing joints
+
+**Bone > N64 Joint > Remove Joint** removes the joint and every joint under it, with their meshes
+(all costumes, low detail, model part variants, electric skeleton), vertex groups and hurtboxes.
+It refuses while the joint is a hidden part, a hidden part's parent, a special joint (Armature >
+N64 Fighter Joints: point it elsewhere first) or while another mesh has vertices weighted to it.
+The game numbers joints in DObjDesc order, so the joints after it move down: the bones are
+renamed to their new numbers (what moveset events use), each keeping its export number in
+`n64_joint_orig` (Bone > N64 Joint shows it). The dialog lists the special joints after it and
+asks: **Follow Their Bones** (the same bones, new numbers: what the moves expect) or **Keep
+Their Numbers** (they land on the bones that take those numbers). The removed joints' animation
+curves stay (renamed `n64_removed_joint_NN`), so unedited actions still match the export.
+Deleting a bone by hand works too (no renumbering in Blender then).
+
+On import (`blend_to_gltf.py` renames everything back to the export's numbers in memory and
+reports the missing joints as `fighter_joints`; `jointmap.py` renumbers):
+
+- character.bin: the DObjDesc arrays (hi, lo) and the per-joint material / costume script arrays
+  lose the entries; main.bin: the model part container and electric skeleton tables (entries
+  move up; the pointer chains and `main_reqlist.txt` are rebuilt in field order);
+- joint attributes: setup / animlock bits compacted, effect / item / foot IK / expression /
+  accessory / hidden part ids renumbered; hurtboxes renumbered (same order);
+- every animation: the removed joints' entries go (the scripts byte for byte; edited actions are
+  encoded, then the same): own files are rewritten, the base character's become the
+  character's own files (`animations/`, main.asm `edit_action_parameters` /
+  `edit_menu_action_parameters` lines with `-1` flags). Files whose entries end before the
+  removed joint stay the parent's;
+- the shield pose: the neutral array, the 8 sector arrays and guard animations inside it
+  (shield-pose motions) lose the entries in place (offsets kept); written to `shield_pose.bin`
+  (config.yaml `shield_pose`, `${SHIELD_POSE}` reqlist lines);
+- moveset events (hitboxes, effects, hurtbox parts, model parts: 7-bit joint ids) aren't
+  rewritten: the actions still run the base character's scripts (`-1` in main.asm), so the import
+  lists the ones whose scripts name joints whose number changed (or are gone) - give those their
+  own scripts in main.asm where it matters - and the same for the character's `moveset/*.bin`.
+  ASM code naming joints by number isn't read: the renumbering is printed.
+
+Only whole branches go (a joint whose children stay would need its transform pushed into them);
+hidden part joints can't be removed. After the import, export again before more joint edits or
+Load / Save Animation .bin.
+
+#### Adding joints
+
+**Bone > N64 Joint > Add Joint** adds a joint under the selected one, stored after that joint's
+other descendants (joints are kept depth first), so the joints after it move up one (same
+dialog for the special joints after it). It starts at its parent's head: move it in Edit Mode
+(its rest position is what the import uses; its rotation is the parent's). **Put Selected Meshes
+Here** makes the selected meshes its body piece: `hi_jNN` in Costume 0 with a copy in every
+other costume, skinned to the joint only; a mesh in Low detail becomes `lo_jNN`, and a joint
+without one gets a copy of the high piece. The import (temporary numbers after the export's,
+`fighter_joints.order` / `added`) gives it a DObjDesc entry (depth, translation from the
+parent), setup bit on, no animation in any file (NULL entries: it stays at rest on its parent),
+a rest entry in the shield pose; the tables that grow (main.bin's model part container and
+electric skeleton tables, the shield pose's arrays) are rebuilt at the end of their file and
+re-pointed (config.yaml `offsets: main` follows when the chain head moves). New joints can have
+model part variants (their list goes to their slot of the rebuilt container) and animations:
+Blender samples them with their parent's axes at their own position (what the import gives them),
+and an edited action is encoded straight in the new joint order. Existing joints keep their
+parents (no reparenting yet).
+
+An added joint can be a hidden part (**Make Hidden Part** on it: the next motion flag bit adds it;
+turn that bit on in an action's flags in the N64 Animation panel): the import puts it in the hidden
+part table (grown into character.bin), leaves its setup bit off, and every animation with that flag
+gets its entry (an edited one its script; NULL: it stays at rest on its parent).
+
+#### Moving joints to another parent
+
+**Bone > N64 Joint > Set Parent** (or Alt+P > Keep Offset in Edit Mode) moves a joint and its branch
+under another joint, where it is (its world rest stays). The branch goes after the new parent's
+other children (depth first), the joints are renumbered. Its animation:
+
+- **Follow the New Parent** (default; what Alt+P does): its keys stay as they are, relative to
+  its rest, so it moves with the new parent (a gun moved to a hand goes with the hand). Import:
+  each script becomes new rest x old rest^-1 x old local; not animated: it stays at its new rest.
+- **Keep Its Motion**: its keys are re-expressed in every action (a key per frame) so it moves
+  in the world as before; the import recomputes its script from both parents' poses. Where the
+  new parent scales unevenly the exact motion would need a shear the game can't store: the
+  closest pose is written and the import names those animations.
+
+Either way only the moved joint's scripts are recomputed (in the file's own format, 16- or 32-bit);
+every other joint's stays byte for byte, and actions not edited before stay unedited (their
+signatures follow). Its DObjDesc entry gets the rest relative to the new parent and the moved
+branch new depths; the shield pose's neutral entry and sector scripts follow the same way. The
+root joint and hidden part joints stay where they are (a hidden part's parent is its Bone > N64
+Joint setting); a joint can't go under its own branch or into a hidden part's branch.
+
+Blender's own tools work too: deleting a joint bone (X) or adding a bone (E, Shift+A, then parent it
+to a joint) in Edit Mode is renumbered like the buttons once the armature leaves Edit Mode (the
+panel's update handler, `blend_joints.sync`; the result shows in Bone > N64 Joint): a deleted
+joint's meshes, vertex groups and hurtboxes go, a new bone becomes the next joint of its parent's
+branch, the others are renamed.
 
 #### Slope foot IK (legs)
 

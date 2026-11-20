@@ -30,6 +30,11 @@ PANEL.reset_previews()      # costume / expression / model part previews: back t
 import blend_gamedata as GDB  # noqa: E402
 from blend_gamespace import sample_action  # noqa: E402
 import blend_gamespace as BGS  # noqa: E402
+import blend_joints as BJ  # noqa: E402
+# fighters: joints removed / renumbered in Blender (Bone > N64 Joint > Remove Joint): everything
+# back to the export's joint names (in memory) - the import renumbers the files
+_FIGHTER_ARM = BJ.fighter_armature()
+_FIGHTER_JOINTS = BJ.restore_export_names(_FIGHTER_ARM) if _FIGHTER_ARM is not None else None
 
 
 def image_path(img):
@@ -143,8 +148,15 @@ for coll in bpy.data.collections:
             info = mat_info(slot.material)
             if info and slot.material:
                 costumes.setdefault(base_name(slot.material.name), {})[k] = info
-# materials only used outside the costume collections (low detail, model parts):
-# costume k's image is the costume-0 image's sibling <mat>_c<k>.png
+# materials only used outside the costume collections (low detail, model parts): costume k's
+# image is the file the export gave it (manifest), or the one Add Costume picked (n64_costume_files);
+# older exports: the costume-0 image's sibling <mat>_c<k>.png
+_exp_dir = os.path.normpath(bpy.path.abspath(bpy.context.scene.get('n64_export_dir',
+                                                                     bpy.context.scene.get('fighter_export_dir', '//'))))
+try:
+    _man_mats = json.load(open(os.path.join(_exp_dir, 'manifest.json'))).get('materials') or {}
+except (OSError, ValueError):
+    _man_mats = {}
 for m in bpy.data.materials:
     name = base_name(m.name)
     if name in costumes or m.users == 0 or m.get('n64_helper'):
@@ -152,12 +164,24 @@ for m in bpy.data.materials:
     info = mat_info(m)
     costumes[name] = {0: info}
     img = info.get('image') if info else None
+    for k, rel in enumerate((_man_mats.get(name) or {}).get('costumes') or []):
+        if k and rel and os.path.exists(os.path.join(_exp_dir, rel)):
+            costumes[name][k] = dict(image=os.path.join(_exp_dir, rel), color=info.get('color'))
     if img and re.search(r'_c0\.png$', img):
         for k in range(1, 32):
             sib = re.sub(r'_c0\.png$', f'_c{k}.png', img)
             if not os.path.exists(sib):
                 break
             costumes[name][k] = dict(image=sib, color=info.get('color'))
+# costumes added in Blender (N64 Fighter > Add Costume): every material's file for them
+for m in bpy.data.materials:
+    if 'n64_costume_files' in m.keys() and not m.get('n64_helper'):
+        name = base_name(m.name)
+        for k, path in dict(m['n64_costume_files']).items():
+            if int(k) not in costumes.setdefault(name, {}) and os.path.exists(bpy.path.abspath(path)):
+                costumes[name][int(k)] = dict(image=os.path.normpath(bpy.path.abspath(path)))
+# how many costumes the .blend has (Costume N collections): the import writes that many
+COSTUME_COUNT = len([c for c in bpy.data.collections if re.match(r'Costume \d+$', c.name)]) or None
 # N64 settings (custom properties) per material; costume copies inherit costume 0's
 props, anims = {}, {}
 for m in bpy.data.materials:
@@ -241,6 +265,42 @@ def joint_map():
     for rows in out.values():
         rows.sort(key=lambda r: r['index'])
     return out
+
+
+def fighter_joints():
+    """Fighters: the export's joints that have no bone anymore (removed) -> dict(removed=[DObjDesc
+    indices]); import_fighter.py renumbers everything indexed by joint (jointmap.py)."""
+    if _FIGHTER_ARM is None:
+        return None
+    have = {int(m.group(1)) for n in export_joint_names() for m in [re.match(r'joint_(\d+)$', n or '')] if m}
+    now = {BJ.joint_index(b.name) for b in _FIGHTER_ARM.data.bones} - {None}
+    gone = sorted(have - now)
+    if gone:
+        print('fighter joints removed: ' + ', '.join(f'joint_{i:02d}' for i in gone))
+    info = dict(removed=gone)
+    fj = _FIGHTER_JOINTS or {}
+    # every joint's parent now (export / temporary numbers; None: not under a joint) against the export's
+    parents = {}
+    for b in _FIGHTER_ARM.data.bones:
+        i = BJ.joint_index(b.name)
+        if i is not None:
+            parents[i] = BJ.joint_index(b.parent.name) if b.parent is not None else None
+    try:
+        man_joints = json.load(open(os.path.join(export_dir, 'manifest.json'))).get('joints') or []
+    except (OSError, ValueError):
+        man_joints = []
+    moved = {j['index']: parents[j['index']] for j in man_joints
+             if j['index'] in parents and parents[j['index']] != j.get('parent')}
+    if moved:
+        print('fighter joints moved: ' + ', '.join(f'joint_{x:02d} -> under joint_{p:02d}' for x, p in moved.items()))
+    if fj.get('added') or moved or [x for x in fj.get('order', []) if x in have] != sorted(have - set(gone)):
+        modes = {str(BJ.joint_index(b.name)): str(b.get('n64_reparent_mode', 'FOLLOW'))
+                 for b in _FIGHTER_ARM.data.bones if BJ.joint_index(b.name) in moved}
+        info.update(order=fj['order'], added={str(k): v for k, v in fj['added'].items()},
+                    parents={str(k): v for k, v in parents.items()}, moved_modes=modes)
+        if fj.get('added'):
+            print(f"fighter joints added: {len(fj['added'])}")
+    return info
 
 
 def new_joints():
@@ -429,8 +489,9 @@ def shield_pose():
 # hurtboxes / stage collision (gamedata.py applies them)
 open(os.path.join(OUT, 'gamedata.json'), 'w').write(json.dumps(GDB.collect(), indent=1))
 json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims,
-               joint_anims=joint_anims(), new_joints=new_joints(), joint_map=joint_map(),
-               fighter_anims=fighter_anims(),
+               joint_anims=joint_anims(), new_joints=new_joints(), joint_map=joint_map(), fighter_joints=fighter_joints(),
+               fighter_anims=fighter_anims(), costume_count=COSTUME_COUNT,
+               costume_sources={str(k): int(v) for k, v in dict(bpy.context.scene.get('n64_costume_sources') or {}).items()},
                shield_pose=shield_pose()),
           open(os.path.join(OUT, 'costumes.json'), 'w'), indent=1)
 

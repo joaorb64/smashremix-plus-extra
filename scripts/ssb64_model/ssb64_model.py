@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Edit Smash 64 models in Blender: fighters, items / projectiles and stages.
 
+    ssb64_model.py new BASE FOLDER                   a new character folder from a vanilla fighter (new_character.py)
     ssb64_model.py export SOURCE [NAME] OUT_DIR     game files -> OUT_DIR/model.blend
     ssb64_model.py import OUT_DIR [TARGET]           edited model.blend -> game files
     ssb64_model.py blend OUT_DIR                     (re)build only the .blend of an export
+    ssb64_model.py update-panel OUT_DIR              the current N64 panel into OUT_DIR's .blend (nothing else)
     ssb64_model.py preview OUT_DIR                   (re)render only OUT_DIR/previews/
     ssb64_model.py flip-textures OUT_DIR             an older export's textures -> upright (flip_textures.py)
 
@@ -224,6 +226,12 @@ def main(argv=None):
         p.add_argument('--blender', metavar='CMD', help='Blender command (e.g. "flatpak run org.blender.Blender")')
         p.add_argument('--kind', choices=KINDS, help='what it is, when it can\'t be told')
 
+    p = sub.add_parser('new', help='a new character folder from a vanilla fighter (then export it)')
+    p.add_argument('base', metavar='BASE', help='vanilla fighter (CAPTAIN, MARIO, FOX...)')
+    p.add_argument('folder', metavar='FOLDER', help='extra_characters/<Name>')
+    p.add_argument('--name', help='display name')
+    p.add_argument('--force', action='store_true', help='overwrite an existing folder\'s config.yaml')
+
     p = sub.add_parser('export', help='game files -> OUT_DIR/model.blend')
     p.add_argument('source', metavar='SOURCE', help='fighter / stage folder, or a ROM')
     p.add_argument('rest', nargs='+', metavar='[NAME] OUT_DIR',
@@ -257,6 +265,12 @@ def main(argv=None):
     p.add_argument('out_dir', metavar='OUT_DIR')
     p.add_argument('--blender', metavar='CMD')
 
+    p = sub.add_parser('update-panel', help="put the tools' current N64 panel in OUT_DIR/model.blend (nothing "
+                                            "else changes; reopen the file in Blender)")
+    p.add_argument('out_dir', metavar='OUT_DIR')
+    p.add_argument('--blend', help='the .blend (default: OUT_DIR/model.blend)')
+    p.add_argument('--blender', metavar='CMD')
+
     p = sub.add_parser('flip-textures', help="an export made before textures were upright: flip its PNGs, "
                                              "UVs and .blend (once)")
     p.add_argument('out_dir', metavar='OUT_DIR')
@@ -274,7 +288,11 @@ def main(argv=None):
         v = getattr(a, opt, None)                       # the common options of the scripts below
         if v not in (None, False):
             extra = ['--' + opt.replace('_', '-')] + ([] if v is True else [str(v)]) + extra
-    if a.cmd == 'export':
+    if a.cmd == 'new':
+        import new_character
+        new_character.main([a.base, a.folder] + (['--name', a.name] if a.name else [])
+                           + (['--force'] if a.force else []))
+    elif a.cmd == 'export':
         if len(a.rest) > 2:
             ap.error('export: SOURCE [NAME] OUT_DIR')
         a.name, a.out_dir = (a.rest if len(a.rest) == 2 else [None, a.rest[0]])
@@ -286,6 +304,8 @@ def main(argv=None):
         blend = a.blend or find_blend(a.out_dir)
         flip_textures.convert_files(a.out_dir)
         run_blender(blender_cmd(a.blender), 'flip_textures.py', a.out_dir, blend)
+    elif a.cmd == 'update-panel':
+        run_blender(blender_cmd(a.blender), 'update_panel.py', a.out_dir, a.blend or find_blend(a.out_dir))
     elif a.cmd == 'blend':
         run_blender(blender_cmd(a.blender), 'build_blend.py', a.out_dir)
     else:

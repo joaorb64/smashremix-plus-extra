@@ -199,7 +199,7 @@ def vanilla_order(boxes, joints):
     return sorted(boxes, key=key)
 
 
-def apply_hurtboxes(f, main, cfg, work, man, cfg_path, write_cfg):
+def apply_hurtboxes(f, main, cfg, work, man, cfg_path, write_cfg, jm=None):
     """gamedata.json hurtboxes -> main (bytearray, in place) and config.yaml's list when it has
     one. Unchanged boxes keep their exact values. Returns a message or None."""
     gd = _load_work(work)
@@ -211,7 +211,8 @@ def apply_hurtboxes(f, main, cfg, work, man, cfg_path, write_cfg):
     boxes = []
     for h in gd['hurtboxes']:
         j = h['joint']
-        W = joints[j].world if 0 <= j < len(joints) else np.eye(4)
+        W = joints[j].world if 0 <= j < len(joints) else \
+            (jm.worlds[j] if jm is not None and j in getattr(jm, 'worlds', {}) else np.eye(4))
         L = np.linalg.inv(W) @ C_inv @ np.array(h['matrix'])
         axes = L[:3, :3]
         half = np.linalg.norm(axes, axis=0)
@@ -241,6 +242,13 @@ def apply_hurtboxes(f, main, cfg, work, man, cfg_path, write_cfg):
         boxes = by_orig                       # nothing edited: as it was (a few fighters aren't vanilla-ordered)
     else:                                     # the order the game expects: torso, head, arms, legs
         boxes = vanilla_order(boxes, joints)
+    if jm is not None:                        # removed joints (jointmap.py): the boxes' joints renumbered
+        for b in boxes:
+            n = jm.idx(b['joint'])
+            if n is None:
+                raise SystemExit(f'hurtbox {b["name"]} is on joint_{b["joint"]:02d}, which is removed: '
+                                 'move or delete it')
+            b['joint'] = n
     after = [tup(b) for b in boxes]
 
     attr = f.attr

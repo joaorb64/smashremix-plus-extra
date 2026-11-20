@@ -132,7 +132,7 @@ def plan(f, new, orig):
     """new / orig: joint_attrs dicts (Blender's, the export's) -> Plan. Only what changed."""
     P = Plan()
     a, m = f.attr, f.main
-    nj = orig.get('joints') or len(f.details['hi']['joints'])
+    nj = new.get('joints') or orig.get('joints') or len(f.details['hi']['joints'])   # (joints added / removed: the new count)
 
     def valid(g, what, allow_none=False):
         if g is None and allow_none:

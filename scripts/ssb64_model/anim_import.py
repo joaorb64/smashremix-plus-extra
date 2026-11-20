@@ -59,16 +59,78 @@ def _action_ref(label, scope):
     return None, None
 
 
-def apply(char_dir, out_dir, changed, manifest, cfg, f):
-    """Write the changed animations (blend_to_gltf.py fighter_anims) for fighter f (the
-    character's model_files.load) into out_dir (the character folder, or --out)."""
-    if not changed:
+def _source_bytes(info, char_dir):
+    """An exported animation's file bytes and internal head (manifest 'source': its own file, or a
+    ROM file) -> (data, head) or (None, None)."""
+    src = info.get('source') or ''
+    if src.startswith('animations/'):
+        p = os.path.join(char_dir, src)
+        return (open(p, 'rb').read(), None) if os.path.exists(p) else (None, None)
+    m = re.search(r'ROM file 0x([0-9A-Fa-f]+)', src)
+    if not m:
+        return None, None
+    from SSB import SSBtbl, N64
+    global _ROM
+    if _ROM is None:
+        _ROM = SSBtbl.fromROM(N64(open(MO.ORIGINAL_ROM, 'rb').read()))
+    e = _ROM[int(m.group(1), 16)]
+    return e.extract('data'), (e.tbl if e.tbl is not None else None)
+
+
+_ROM = None
+
+
+def apply(char_dir, out_dir, changed, manifest, cfg, f, jm=None):
+    """Write the changed animations (blend_to_gltf.py fighter_animations) for fighter f (the
+    character's model_files.load) into out_dir (the character folder, or --out). jm (jointmap):
+    joints were removed, so EVERY animation is written: the edited ones encoded, the others
+    their file without the removed joints' entries (scripts byte for byte); the base
+    character's become the character's own files (main.asm lines for their actions)."""
+    import jointmap as JM
+    infos = (manifest or {}).get('fighter_animations') or {}
+    jobs = []
+    for c in changed or []:
+        info = infos.get(c['export_name']) or {}
+        flags = int(str(c['flags']), 16)
+        written = FT.written_flags(flags)
+        loops = {b: True for b in c['values']} if c.get('loop') else None
+        # (joints added / removed: encoded straight in the new joint order, added joints' keys included)
+        data = FT.encode_animation(f, written, c['values'], c['frames'], loops=loops, candidates=c.get('keys'),
+                                   jm=jm if jm else None)
+        jobs.append(dict(name=c['name'], info=info, data=data, written=written, flags=flags,
+                         flags_before=c.get('flags_before'), why='edited in Blender'))
+    if jm:
+        done = {c['export_name'] for c in changed or []}
+        n_missing = n_same = 0
+        for name, info in infos.items():
+            if name in done:
+                continue
+            data, head = _source_bytes(info, char_dir)
+            if data is None:
+                n_missing += 1
+                print(f'  warning: animation {name}: its file ({info.get("source")}) wasn\'t found: '
+                      'not renumbered (the game would play it on the wrong joints)')
+                continue
+            flags = int(str(info.get('flags') or '0'), 16)
+            new = JM.remap_animation(f, data, flags, jm, head, name=name)
+            if new is data:                # (no removed joint in its entries: the file stays as it is)
+                n_same += 1
+                continue
+            jobs.append(dict(name=name, info=info, data=new,
+                             written=flags, flags=flags, flags_before=info.get('flags'),
+                             why=f'joints {jm.describe()}', quiet=True))
+        for x, names_ in sorted(jm.notes.items()):
+            print(f'  note: joint_{jm.idx(x):02d} (moved): in {len(names_)} animation(s) its new parent scales unevenly, '
+                  'so its exact motion would need a shear the game can\'t store: the closest pose is written ('
+                  + ', '.join(names_[:5]) + (' ...' if len(names_) > 5 else '') + ')')
+        print(f'  animations: {len(jobs)} written: joints {jm.describe()}'
+              + (f'; {n_same} untouched (their entries end before it)' if n_same else ''))
+    if not jobs:
         return
     char = os.path.basename(os.path.normpath(char_dir))
     base = (cfg.get('definitions') or {}).get('base_character')
     cid = MO.CHAR_IDS.get(str(base).upper()) if base else None
     scope = MO.SCOPE_OF.get(cid)
-    infos = (manifest or {}).get('fighter_animations') or {}
     adir_in = os.path.join(char_dir, 'animations')
     adir = os.path.join(out_dir, 'animations')
     os.makedirs(adir, exist_ok=True)
@@ -78,12 +140,10 @@ def apply(char_dir, out_dir, changed, manifest, cfg, f):
     asm_changed = False
     new_lines = []
     existing = {x.lower() for d in (adir_in, adir) if os.path.isdir(d) for x in os.listdir(d)}
-    for c in changed:
-        info = infos.get(c['export_name']) or {}
-        flags = int(str(c['flags']), 16)
-        written = FT.written_flags(flags)
-        loops = {b: True for b in c['values']} if c.get('loop') else None
-        data = FT.encode_animation(f, written, c['values'], c['frames'], loops=loops, candidates=c.get('keys'))
+    n_new = n_own = 0
+    for c in jobs:
+        info, data, written, flags = c['info'], c['data'], c['written'], c['flags']
+        quiet = c.get('quiet')
         src = info.get('source') or ''
         if src.startswith('animations/'):                 # its own file
             stem = os.path.splitext(src[len('animations/'):])[0]
@@ -98,7 +158,9 @@ def apply(char_dir, out_dir, changed, manifest, cfg, f):
                 msg += f'; flags {written:08X} on {n} main.asm line(s)'
             elif written != flags:
                 msg += f' (written in the 16-bit format: flags {written:08X} instead of {flags:08X})'
-            print(msg)
+            n_own += 1
+            if not quiet:
+                print(msg)
             continue
         # the parent's (or a ROM fighter's): a new file, and main.asm lines for its actions
         stem = _stem_of(c['name'])
@@ -109,22 +171,31 @@ def apply(char_dir, out_dir, changed, manifest, cfg, f):
         open(os.path.join(adir, stem + '.bin'), 'wb').write(data)
         const = f'File.{char.upper()}_ANIM_{stem.upper()}'
         lines = []
+        fl = '-1' if quiet else f'0x{written:08X}'       # (unedited: each action keeps its own flags)
         for label in info.get('actions') or []:
             kind, ref = _action_ref(label, scope)
             if kind == 'menu':
                 lines.append(f'    Character.edit_menu_action_parameters({char.upper()}, {ref}, {const}, -1, '
-                             f'0x{written:08X})')
+                             f'{fl})')
             elif kind == 'action':
                 lines.append(f'    Character.edit_action_parameters({char.upper()}, {ref}, {const}, -1, '
-                             f'0x{written:08X})')
+                             f'{fl})')
             else:
                 print(f'  note: {stem}: action {label!r} has no name main.asm can use; add its line by hand')
-        new_lines += [f'    // {c["name"]} (edited in Blender: ssb64_model import)'] + lines
-        print(f'  animation {stem}: new file ({len(data)} bytes) for {len(lines)} action(s) of {base}')
+        new_lines += [f'    // {c["name"]} ({c["why"]}: ssb64_model import)'] + lines
+        n_new += 1
+        if not quiet:
+            print(f'  animation {stem}: new file ({len(data)} bytes) for {len(lines)} action(s) of {base}')
+    if jm:
+        print(f'  animations: {n_own} own files rewritten, {n_new} new files ({base}\'s)')
     if new_lines and asm_text is not None:
         calls = list(re.finditer(r'[^\n]*Character\.(edit_action_parameters|edit_menu_action_parameters)\([^\n]*\n',
                                  asm_text))
-        at = calls[-1].end() if calls else len(asm_text)
+        if calls:
+            at = calls[-1].end()
+        else:                          # (none yet: inside the character's scope, before its closing brace)
+            close = asm_text.rstrip().rfind('}')
+            at = asm_text.rfind('\n', 0, close) + 1 if close >= 0 else len(asm_text)
         nl = '\r\n' if '\r\n' in asm_text else '\n'
         asm_text = asm_text[:at] + nl.join(new_lines) + nl + asm_text[at:]
         asm_changed = True

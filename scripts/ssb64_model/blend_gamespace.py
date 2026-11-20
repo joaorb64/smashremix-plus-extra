@@ -51,10 +51,23 @@ class _GameSpace:
         self.A = Matrix(((1, 0, 0, 0), (0, 0, -1, 0), (0, 1, 0, 0), (0, 0, 0, 1)))     # glTF (Y up) -> Blender
         self.Ai = self.A.inverted()
         self.corr = {}
+        j_rests = {}
         for b in arm.data.bones:
             if b.name in self.by_name:
                 j_rest = (self.A @ node_world(self.by_name[b.name]) @ self.Ai).to_3x3().normalized()
+                j_rests[b.name] = j_rest
                 self.corr[b.name] = (j_rest.inverted() @ b.matrix_local.to_3x3().normalized()).to_4x4()
+        # joints added in Blender (Bone > N64 Joint > Add Joint; not in the export): the import gives
+        # them their parent's axes at their own position, so their rest axes are their parent's
+        self.added_parent = {}
+        for b in arm.data.bones:                   # (parents come before children)
+            if b.name in self.corr or not re.match(r'joint_\d+$', b.name) or b.parent is None:
+                continue
+            if b.parent.name not in j_rests:
+                continue
+            j_rests[b.name] = j_rests[b.parent.name]
+            self.corr[b.name] = (j_rests[b.name].inverted() @ b.matrix_local.to_3x3().normalized()).to_4x4()
+            self.added_parent[b.name] = b.parent.name
         self.bones = [b for b in self.corr if re.match(r'joint_\d+$|TransN$|XRotN$|YRotN$', b)]
         # A game joint scales only along its own axes; the bones' axes needn't be those (the armature's
         # bones point at their children: bone_heuristic TEMPERANCE). A non-uniform bone scale is stored
@@ -81,8 +94,14 @@ class _GameSpace:
         G = {b: Ai @ pb[b].matrix @ corr[b].inverted() @ A for b in self.bones}
         out = {}
         for b in self.bones:
-            pi = self.parent.get(self.by_name[b])
-            pname = self.nodes[pi].get('name') if pi is not None else None
+            bp = self.arm.data.bones[b].parent
+            if bp is not None and bp.name in G:
+                pname = bp.name            # (Blender's parent: a joint moved to another parent follows it)
+            elif b in self.added_parent:
+                pname = self.added_parent[b]
+            else:
+                pi = self.parent.get(self.by_name[b])
+                pname = self.nodes[pi].get('name') if pi is not None else None
             out[b] = np.array(G[pname].inverted() @ G[b] if pname in G else G[b])
         from mathutils import Matrix
         for b in self.bones:

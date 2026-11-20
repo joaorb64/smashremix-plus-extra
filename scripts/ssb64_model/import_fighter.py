@@ -112,6 +112,11 @@ def load_gltf(path):
     return objs
 
 
+def GD_set_yaml(text, key, lines):
+    import gamedata as GD
+    return GD.set_yaml(text, key, lines)
+
+
 def base_mat(name):
     return re.sub(r'(_c\d+)?(\.\d+)?$', '', name or 'flat')
 
@@ -126,6 +131,8 @@ class Materials:
         if 'materials' in tab and 'export_dir' in tab:
             self.table, self.props, root = tab['materials'], tab.get('props', {}), tab['export_dir']
             self.lights = tab.get('lights') or {}
+            # costumes added in Blender: the costume each copies ({new: source})
+            self.sources = {int(k): int(v) for k, v in (tab.get('costume_sources') or {}).items()}
             self.anims = tab.get('anims')        # material animations (None: older blend_to_gltf.py)
         else:                                                           # older costumes.json: table only
             self.table, self.props, root = tab, {}, None
@@ -176,17 +183,27 @@ class Materials:
             raise SystemExit(f'material {name}: not in costumes.json')
         first = per.get('0') or (next(iter(per.values())) if per else None)
         textured = bool(entry) and not entry.get('untextured')    # untextured: Blender's colors count
+        sources = getattr(self, 'sources', {}) or {}
+
         def costume_info(c):
             if str(c) in per:
                 return per[str(c)]
-            # a costume Blender has no material for: the costume-0 image's sibling <mat>_c<c>.png
-            sib = re.sub(r'_c0\.png$', f'_c{c}.png', (first or {}).get('image') or '')
-            return dict(first, image=sib) if sib and os.path.exists(sib) else first
-        imgs = [self.image(costume_info(c), textured) for c in range(self.costumes)]
+            if c in sources and str(sources[c]) in per:     # an added costume: the one it copies
+                return per[str(sources[c])]
+            # a costume Blender has no material for (low detail, model parts): the file the export
+            # gave that costume (the manifest's)
+            cos_ = (entry or {}).get('costumes') or []
+            c_ = c if c < len(cos_) else sources.get(c, c)
+            rel = cos_[c_] if c_ < len(cos_) else None
+            p_ = os.path.join(self.root, rel) if rel and self.root else None
+            return dict(first or {}, image=p_) if p_ and os.path.exists(p_) else first
+        infos = [costume_info(c) for c in range(self.costumes)]
+        imgs = [self.image(i_, textured) for i_ in infos]
         if not entry and imgs[0] is None:
             raise SystemExit(f'material {name}: no image or color')
         m = MAT.Material(name, entry, self.base, self.root, imgs, self.props.get(name, {}), self.costumes,
-                         cloak_safe=self.cloak_safe)
+                         cloak_safe=self.cloak_safe, layout=int(self.manifest.get('tex_layout') or 1),
+                         costume_paths=[(i_ or {}).get('image') for i_ in infos], sources=sources)
         for w in dict.fromkeys(m.warnings):
             print(f'  warning: {name}: {w}')
         self.mat[name] = m
@@ -476,10 +493,39 @@ def main(argv=None):
             f = MF.load(main_path, tmp_char, mi_head, me_head, ci_head, char_ext)
     else:
         f = MF.load(main_path, char_path, mi_head, me_head, ci_head)
-    N = a.costumes or cfg.get('num_costumes') or 1
-    textures = Materials(a.work_dir, N, f.char, a.manifest)
-    if not (a.costumes or cfg.get('num_costumes')) and textures.manifest.get('costumes'):
-        N = textures.costumes = textures.manifest['costumes']        # what the export found
+    try:
+        blend_n = json.load(open(os.path.join(a.work_dir, 'costumes.json'))).get('costume_count')
+    except (OSError, ValueError):
+        blend_n = None
+    # costumes: the .blend's (Costume N collections: what the export found in the file's costume scripts,
+    # plus / minus N64 Fighter > Add / Remove Costume), else the export's, else config.yaml's
+    textures = Materials(a.work_dir, a.costumes or blend_n or cfg.get('num_costumes') or 1, f.char, a.manifest)
+    man_n = textures.manifest.get('costumes')
+    N = textures.costumes = a.costumes or blend_n or man_n or cfg.get('num_costumes') or 1
+    costumes_changed = None
+    if blend_n and man_n and blend_n != man_n and not a.costumes:
+        cfg_n = cfg.get('num_costumes')
+        if cfg_n is None or int(cfg_n) == man_n:
+            costumes_changed = (man_n, blend_n)
+        else:                   # (config.yaml counts differently: e.g. the Ice Climbers' half)
+            print(f'  costumes: {man_n} -> {blend_n} in the file; config.yaml num_costumes ({cfg_n}) counts them '
+                  'differently: not changed (update it by hand if needed)')
+    if costumes_changed:
+        old_n, new_n = costumes_changed
+        line = f'num_costumes: {new_n}'
+        if a.cfg_out:
+            raw_ = open(a.cfg_out, encoding='utf-8', newline='').read()
+            nl_ = '\r\n' if '\r\n' in raw_ else '\n'
+            open(a.cfg_out, 'w', encoding='utf-8', newline='').write(
+                GD_set_yaml(raw_.replace('\r\n', '\n'), 'num_costumes', [line]).replace('\n', nl_))
+        print(f'  costumes: {old_n} -> {new_n} (config.yaml {line})')
+        dc = cfg.get('default_costumes') or []
+        if any(int(x) >= new_n for x in dc):
+            print(f'  note: config.yaml default_costumes {dc} names costumes past the last one ({new_n - 1})')
+        missing = [k for k in range(new_n) if not os.path.exists(os.path.join(a.char_dir, f'stock_icon_{k}.png'))]
+        if any(os.path.exists(os.path.join(a.char_dir, f'stock_icon_{k}.png')) for k in range(new_n)) and missing:
+            print(f'  note: no stock_icon_{missing[0]}.png' + (f' ... ({len(missing)})' if len(missing) > 1 else '')
+                  + ': the build uses the stock icon from the files for those costumes')
     textures.cloak_safe = not a.keep_render_modes
     joints = f.details['hi']['joints']
     W = [j.world for j in joints]
@@ -497,7 +543,36 @@ def main(argv=None):
     import jointattrs as JAT
     gd_ = GD._load_work(a.work_dir) or {}
     orig_ja = (getattr(textures, 'manifest', None) or {}).get('joint_attrs')
-    ja_plan = JAT.plan(f, gd_['joint_attrs'], orig_ja) if gd_.get('joint_attrs') and orig_ja else JAT.Plan()
+    # joints removed in Blender (Bone > N64 Joint > Remove Joint): everything indexed by joint is
+    # renumbered (jointmap.py); the model is built in the old numbering, then compacted
+    import jointmap as JM
+    try:
+        fj = json.load(open(os.path.join(a.work_dir, 'costumes.json'))).get('fighter_joints') or {}
+    except (OSError, ValueError):
+        fj = {}
+    added = {int(t): v for t, v in (fj.get('added') or {}).items()}
+    parents = {int(x): (None if p is None else int(p)) for x, p in (fj.get('parents') or {}).items()}
+    if fj.get('order'):                       # joints added / moved (and maybe removed) in Blender
+        jm = JM.make_order(f, fj['order'], added, parents=parents,
+                           modes={int(x): m for x, m in (fj.get('moved_modes') or {}).items()})
+    elif fj.get('removed'):
+        jm = JM.make(f, fj['removed'])
+    else:
+        jm = JM.JointMap(len(joints))
+    if jm:
+        print(f'  joints {jm.describe()} ({jm.n_old} -> {jm.n_new} joints; '
+              + ', '.join(f'joint_{o:02d} -> joint_{n:02d}' for o, n in jm.renumbered()[:4])
+              + (' ...' if len(jm.renumbered()) > 4 else '') + ')')
+    new_bits = {k: {t: v[k] for t, v in added.items()} for k in ('setup', 'animlock')}
+    new_ja = JM.remap_attrs(gd_.get('joint_attrs'), jm, new_bits) if jm else gd_.get('joint_attrs')
+    if jm and new_ja and new_ja.get('setup'):
+        jm.tree, jm.depth = jm.tree_data(f, new_ja['setup'], new_ja.get('hidden'))  # (Blender's setup bits / hidden parts)
+    elif jm and not hasattr(jm, 'tree'):
+        jm.tree, jm.depth = jm.tree_data(f, JM.remap_bits([0xFFFFFFFF, 0xFFFFFFFF], jm))
+    # the added joints' rest matrices after the old ones (the meshes are built in the old numbering,
+    # added joints at their temporary numbers)
+    W_ext = [j.world for j in joints] + [jm.worlds[t] for t in sorted(added)] if added else None
+    ja_plan = JAT.plan(f, new_ja, orig_ja) if new_ja and orig_ja else JAT.Plan()
 
     # model part variants: joints whose variant count changed (or whose list the import already
     # moved to character.bin) get a new list in character.bin; the others keep theirs, re-pointed
@@ -514,7 +589,9 @@ def main(argv=None):
     if part_rebuild and (mp_ is None or mp_[0] != 'main'):
         raise SystemExit('model parts: the fighter has no model part container in main.bin; new variants '
                          f'(joints {sorted(part_rebuild)}) need one')
-    part_unlink = [mp_[1] + 4 * j for j in sorted(part_rebuild) if mp_[1] + 4 * j in f.main_int]
+    n_old_joints = len(joints)
+    part_unlink = [mp_[1] + 4 * j for j in sorted(part_rebuild) if j < n_old_joints and mp_[1] + 4 * j in f.main_int]
+    new_joint_parts = {}            # added joint (temporary index) -> its variant list (character.bin)
 
     def build(base_len, quiet=False):
         """The new model as data appended at base_len -> (blob, {main.bin field: new target})."""
@@ -594,9 +671,15 @@ def main(argv=None):
             return mobj_of[name]
 
         def lists_for(mats_per_joint, nj):
+            nj = jm.n_new if jm else nj
             p_ms = blob.add(b'\0' * (4 * nj), 4)
             p_an = blob.add(b'\0' * (4 * nj), 4)
-            for j, names in mats_per_joint.items():
+            for j_old, names in mats_per_joint.items():
+                j = jm.idx(j_old)
+                if j is None:
+                    if names:
+                        raise SystemExit(f'joint_{j_old:02d} is removed but still has meshes ({detail})')
+                    continue
                 lst = blob.add(b'\0' * (4 * (len(names) + 1)), 4)
                 an = blob.add(b'\0' * (4 * len(names)), 4)
                 for i, n in enumerate(names):
@@ -615,16 +698,30 @@ def main(argv=None):
                 continue
             objs = load_gltf(path)
             order = {int(j): v for j, v in (textures.manifest.get('mobj_order') or {}).get(detail, {}).items()}
-            dls, mats = build_joints(objs, [j.world for j in d['joints']], textures, blob, prologue, store,
-                                     mobj_order=order)
+            dls, mats = build_joints(objs, W_ext or [j.world for j in d['joints']], textures, blob, prologue,
+                                     store, mobj_order=order)
             p_ms, p_an = lists_for(mats, len(d['joints']))
             body_mats[detail] = mats
             arr = bytearray(f.char[d['dobjdesc']:d['dobjdesc'] + MF.DOBJDESC_SIZE * len(d['joints']) + 4])
             for j in range(len(d['joints'])):
                 struct.pack_into('>I', arr, MF.DOBJDESC_SIZE * j + 4, 0)
+            if jm:                                # the new order: removed entries out, added ones in
+                def entry(x, k):
+                    if x < len(d['joints']):
+                        e = bytearray(arr[MF.DOBJDESC_SIZE * x:MF.DOBJDESC_SIZE * (x + 1)])
+                        struct.pack_into('>I', e, 0, jm.depth[k])             # (moved branches: new depths)
+                        if x in jm.moved:                                    # its rest under the new parent
+                            r_ = jm.moved_rest[x]
+                            struct.pack_into('>9f', e, 8, r_['tx'], r_['ty'], r_['tz'], r_['rx'], r_['ry'], r_['rz'],
+                                             r_['sx'], r_['sy'], r_['sz'])
+                        return bytes(e)
+                    return struct.pack('>II9f', jm.depth[k], 0, *jm.added[x]['t'], 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+                arr = b''.join(entry(x, k) for k, x in enumerate(jm.order)) + arr[-4:]
             do = blob.add(bytes(arr), 8)
             for j, dl in dls.items():
-                blob.ptr(do + MF.DOBJDESC_SIZE * j + 4, dl)
+                if jm.idx(j) is None:
+                    raise SystemExit(f'joint_{j:02d} is removed but still has a mesh ({detail})')
+                blob.ptr(do + MF.DOBJDESC_SIZE * jm.idx(j) + 4, dl)
             base = cp + 0x10 * k
             retarget[base] = do
             retarget[base + 4] = p_ms
@@ -648,7 +745,7 @@ def main(argv=None):
                     if v < len(slots) and joint not in part_rebuild else None
                 part_info = next((p for p in textures.manifest.get('model_parts', [])
                                   if p['joint'] == joint and p['variant'] == v and p['detail'] == detail), {})
-                dls, mats = build_joints([o], W, textures, blob, prologue, store, only_joint=joint,
+                dls, mats = build_joints([o], W_ext or W, textures, blob, prologue, store, only_joint=joint,
                                          mobj_order={joint: part_info.get('mobj_order') or []})
                 lst = blob.add(b'\0' * (4 * (len(mats[joint]) + 1)), 4)
                 an = blob.add(b'\0' * (4 * len(mats[joint])), 4)
@@ -667,6 +764,21 @@ def main(argv=None):
                         retarget[fld + 8] = an                              # costume scripts, by material index
                 n_parts += 1
             say(f'  model parts: {n_parts} rebuilt')
+            # variant 0 is what a joint starts with (the game sets model part id 0 at creation, and goes
+            # back to variant 0's mesh when parts reset): it has to look like the body's piece
+            if not quiet and os.path.exists(os.path.join(a.work_dir, 'body.gltf')):
+                body_ = {o['name']: o for o in load_gltf(os.path.join(a.work_dir, 'body.gltf'))}
+                for o in load_gltf(parts_path):
+                    m0 = re.match(r'part0_hi_j(\d+)$', o['name'])
+                    if not m0:
+                        continue
+                    b_ = body_.get(f'hi_j{m0.group(1)}')
+                    sig = lambda x: sorted(tuple(round(float(c), 1) for c in p) for p in x['pos'])
+                    if b_ is not None and sig(b_) != sig(o):
+                        say(f"  warning: joint_{int(m0.group(1)):02d}'s model part variant 0 differs from its body piece: "
+                            'the fighter starts with the body piece as model part id 0, so an event picking variant 0 '
+                            'changes nothing, and resetting parts shows variant 0. Keep variant 0 = the body; put the '
+                            'new look in variant 1+')
             # new variant lists (FTModelPartDesc: [variant][hi, lo] FTModelPart, 0x14 bytes each:
             # dl, mobjsubs, costume scripts, main matanim (unused), u8 flags), an empty pair after
             for joint in sorted(part_rebuild):
@@ -689,7 +801,10 @@ def main(argv=None):
                         for o_, t_ in zip((0, 4, 8), got):
                             if t_ is not None:
                                 blob.ptr(e + o_, t_)
-                retarget[mp_[1] + 4 * joint] = desc
+                if joint >= n_old_joints:      # an added joint: its container slot exists after the rebuild
+                    new_joint_parts[joint] = desc
+                else:
+                    retarget[mp_[1] + 4 * joint] = desc
                 old_n = len(slots)
                 say(f'  model parts: joint {joint}: {old_n} -> {n} variants (list written to character.bin)')
 
@@ -789,6 +904,26 @@ def main(argv=None):
                 MF.u32(f.main, fld_) == 0:
             f.main_ext.pop(fld_, None)
 
+    # ---- removed joints: main.bin's per-joint tables lose their entries (the chains and
+    # main_reqlist.txt follow)
+    if jm:
+        req_idx = [i for i, ln in enumerate(reqlist_lines) if not ln.startswith('END OF')]
+        n_ext = len(MF.chain(bytes(main), me_head))
+        ext_lines = [reqlist_lines[i] for i in req_idx[:n_ext]]
+        reloc = JM.Relocator(main, mi_head, me_head, ext_lines)
+        what, at_ = JM.main_tables(f, jm, reloc)
+        for t, desc in sorted(new_joint_parts.items()):          # added joints' variant lists
+            if 'modelparts' not in at_:
+                raise SystemExit('model parts on an added joint: the fighter has no model part container')
+            reloc.add_ext(at_['modelparts'] + 4 * jm.idx(t), desc, '${CHARACTER}')
+            what.append(f'joint_{jm.idx(t):02d} model parts')
+        main_, mi_head, me_head, ext_lines = reloc.finish()
+        main = bytearray(main_)
+        rest = [reqlist_lines[i] for i in req_idx[n_ext:]]
+        tail = reqlist_lines[req_idx[-1] + 1:] if req_idx else reqlist_lines
+        reqlist_lines = ext_lines + rest + tail
+        print('  main.bin per-joint tables: ' + (', '.join(what) or 'none'))
+
     # ---- remove what nothing reaches anymore (roots: main.bin's pointers into character.bin)
     if not a.no_gc:
         char_fields = char_fields_of(main, reqlist_lines)
@@ -828,16 +963,18 @@ def main(argv=None):
         print('  joint attributes: unchanged')
     # hurtboxes (the .blend's Hurtboxes): main.bin, and config.yaml's list when it has one
     msg = GD.apply_hurtboxes(f, main, cfg, a.work_dir, getattr(textures, 'manifest', None) or {},
-                             a.cfg_out, write_cfg=True)
+                             a.cfg_out, write_cfg=True, jm=jm if jm else None)
     if msg:
         print('  ' + msg)
     import legs
-    _, _, _, note = legs.check(f, main)   # slope foot IK: ids that don't point at legs (not changed)
+    # slope foot IK: ids that don't point at legs (not changed); (joints removed: the ids are the
+    # new numbering, f the old - checked before, in Blender's bones)
+    note = None if jm else legs.check(f, main)[3]
     if note:
         print('  note: ' + note)
     out = a.out or a.char_dir
     os.makedirs(out, exist_ok=True)
-    shield = apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines)
+    shield = apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines, jm=jm if jm else None)
     open(os.path.join(out, 'character.bin'), 'wb').write(newc)
     open(os.path.join(out, 'main.bin'), 'wb').write(main)
     if char_ext:   # the external chain is gone (its data copied in): no external head, no reqlist
@@ -881,11 +1018,15 @@ def main(argv=None):
         changed = json.load(open(os.path.join(a.work_dir, 'costumes.json'))).get('fighter_anims') or []
     except (OSError, ValueError):
         changed = []
-    if changed:
+    if changed or jm:
         import anim_import
-        anim_import.apply(a.char_dir, out, changed, getattr(textures, 'manifest', None) or {}, cfg, f)
+        anim_import.apply(a.char_dir, out, changed, getattr(textures, 'manifest', None) or {}, cfg, f,
+                          jm=jm if jm else None)
     else:
         print('  animations: none changed')
+    if jm:
+        import moveset_remap
+        moveset_remap.apply(a.char_dir, out, cfg, jm)
     built = MF.load(os.path.join(out, 'main.bin'), os.path.join(out, 'character.bin'), mi_head, me_head, ci_head)
     check_cloaking(cfg, built)
     if a.preview:                     # what was built, read back like any fighter: export it, render that
@@ -903,7 +1044,7 @@ def main(argv=None):
 
 
 
-def apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines):
+def apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines, jm=None):
     """The .blend's shield pose (blend_to_gltf.shield_pose) -> a new shield_pose.bin
     (shieldpose.build_file) when it changed: main.bin's 0x2D8..0x2F8 pointers (in place) point
     into it, their main_reqlist.txt lines become ${SHIELD_POSE} (the build's ID for the
@@ -911,12 +1052,14 @@ def apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines):
     Bubble's size -> shield_size (attr + 0x74). Returns the new file's dict or None."""
     import export_model as EX
     import shieldpose as SP
+    import jointmap as JM
     try:
         blend = json.load(open(os.path.join(a.work_dir, 'costumes.json'))).get('shield_pose')
     except (OSError, ValueError):
         blend = None
-    if not blend:
+    if not blend and not jm:
         return None
+    blend = blend or {}
     r = blend.get('radius')
     old_r = MF.f32(main, f.attr + SP.A_SHIELD_SIZE)
     in_cfg = (cfg.get('attributes') or {}).get('shield_size')
@@ -942,7 +1085,35 @@ def apply_shield_pose(f, main, cfg, a, out, me_head, reqlist_lines):
         print('  shield pose: no file to start from (config.yaml shield_pose / the original ROM): not written')
         return None
     sp = SP.load(f, *old[:2])
-    res = SP.build_file(sp, blend, old[0])
+    if jm is not None and jm.moved:
+        # moved joints: their shield pose relative to the new parent (unless edited in Blender: then
+        # Blender's, already relative to it)
+        mv = JM.shield_moved(f, jm, sp)
+        ed = {tuple(e) for e in (blend.get('edited') or [])}
+        blend = dict(blend, turn=dict(blend.get('turn') or {}), neutral=dict(blend.get('neutral') or {}),
+                     edited=list(blend.get('edited') or []))
+        for nm in mv['turn']:
+            if ('turn', nm) not in ed:
+                blend['turn'][nm] = mv['turn'][nm]
+                blend['neutral'][nm] = mv['neutral'][nm]
+                blend['edited'] += [['turn', nm], ['neutral', nm]]
+    res = SP.build_file(sp, blend, old[0]) if blend.get('turn') else None
+    if jm:
+        # removed joints: the file's per-joint arrays lose their entries in place (the offsets main.bin
+        # and the motion table use stay)
+        import jointmap as JM
+        import motions as MO
+        import figatree as FT_
+        base = res or dict(data=old[0], int_head=old[1], lookup=f.main_ext[f.attr + SP.A_LOOKUP],
+                           sectors=[f.main_ext[f.attr + SP.A_SECTORS + 4 * k] for k in range(SP.N_SECTORS)],
+                           changed=[], notes=[])
+        cid = MO.CHAR_IDS.get(str((cfg.get('definitions') or {}).get('base_character')).upper())
+        guard = [(m['file_id'], m['flags']) for m in (MO.rom_motions(cid).values() if cid is not None else [])
+                 if m['flags'] & FT_.FLAG_SHIELDPOSE]
+        data_, ih_, look_, secs_ = JM.remap_shield_pose(f, base['data'], base['int_head'], jm, guard,
+                                                         base['lookup'], base['sectors'])
+        res = dict(base, data=data_, int_head=ih_, lookup=look_, sectors=secs_,
+                   changed=list(base['changed']) + [f'joints {jm.describe()}'])
     if res is None and a.all and old[2] == 'shield_pose.bin':
         print('  shield pose: unchanged (its file written as it is: --all)')
         return dict(data=old[0])
