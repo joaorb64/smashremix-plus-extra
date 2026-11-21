@@ -612,6 +612,16 @@ reduced if there are more), with a palette per costume.
 - **Normals**: imported models carry their original normals (custom normals); new
   meshes use Blender's. After reshaping existing ones: Mesh > Clean Up > Clear Custom
   Split Normals Data.
+- **Modifiers** (Mirror, Solidify...) are applied on import: the game gets what
+  Blender shows.
+- **Joining meshes in** (Ctrl+J): Blender gives the joined geometry color (0, 0, 0, 0)
+  when it had no `Color` attribute, and keeps a differently named UV map apart. The
+  import fixes both (white vertex colors; faces with no UVs in the first map take the
+  other map's) and says so. Model parts don't need vertex groups (they're drawn on
+  their joint); body meshes do.
+- **Object names**: the import reads `part3_hi_j08` and `part3_hi_j08.001` as one
+  piece (drawn together). Meshes outside `Costume 0` / `Low detail` / `Model parts`
+  are not imported (a warning lists the ones on the armature).
 
 ## 2. Import
 

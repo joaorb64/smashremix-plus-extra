@@ -42,9 +42,10 @@ MIN_FREE_SLOTS = 9
 
 
 # ---------------------------------------------------------------- glTF
-def load_gltf(path):
+def load_gltf(path, one_joint=False):
     """[{name, pos, nrm, uv, joint, tris: [(material, (i, j, k))]}] with joint = bone
-    index from the 'joint_NN' node names."""
+    index from the 'joint_NN' node names. one_joint: objects drawn on one joint whatever their
+    weights (model parts, skeleton pieces): vertices in no vertex group are fine (joint -1)."""
     gl = json.load(open(path))
     bufs = [open(os.path.join(os.path.dirname(path), b['uri']), 'rb').read() for b in gl['buffers']]
     ct = {5126: 'f4', 5123: 'u2', 5125: 'u4', 5121: 'u1'}
@@ -96,20 +97,47 @@ def load_gltf(path):
             else:
                 c = np.ones((len(P), 4))
             col.append(c)
-            J, W = acc(at['JOINTS_0']), acc(at['WEIGHTS_0'])
-            jj = [bone[int(J[k][np.argmax(W[k])])] for k in range(len(J))]
+            if 'JOINTS_0' in at:
+                J, W = acc(at['JOINTS_0']), acc(at['WEIGHTS_0'])
+                free = W.max(axis=1) <= 0          # in no vertex group (e.g. a mesh joined in)
+                jj = [None if free[k] else bone[int(J[k][np.argmax(W[k])])] for k in range(len(J))]
+            else:
+                free = np.ones(len(P), bool)
+                jj = [None] * len(P)
             if None in jj:
-                raise SystemExit(f"{nd.get('name')}: vertices on a bone that isn't joint_NN")
+                if one_joint:
+                    jj = [-1 if x is None else x for x in jj]
+                else:
+                    n_free = int(free.sum())
+                    raise SystemExit(f"{nd.get('name')}: {jj.count(None)} vertices aren't weighted to a joint_NN bone"
+                                     + (f" ({n_free} are in no vertex group: a mesh joined in? assign them to the"
+                                        " joint's vertex group)" if n_free else ''))
             jnt.append(np.array(jj))
             idx = acc(prim['indices']).astype(int).reshape(-1, 3) if 'indices' in prim else \
                 np.arange(len(P)).reshape(-1, 3)
             mat = mats[prim['material']] if 'material' in prim else None
             tris += [(mat, t + base) for t in idx]
-        objs.append(dict(name=re.sub(r'\.\d+$', '', nd.get('name', '')), pos=np.vstack(pos).astype(float),
+        objs.append(dict(uid=len(objs), name=re.sub(r'\.\d+$', '', nd.get('name', '')), pos=np.vstack(pos).astype(float),
                          nrm=np.vstack(nrm).astype(float), uv=np.vstack(uv).astype(float),
                          col=np.vstack(col).astype(float),
                          joint=np.concatenate(jnt), tris=tris))
     return objs
+
+
+def merge_same_name(objs):
+    """Objects with one name (Blender's part3_hi_j08 and part3_hi_j08.001) -> one object each."""
+    out = {}
+    for o in objs:
+        m = out.get(o['name'])
+        if m is None:
+            out[o['name']] = dict(o)
+            continue
+        base = len(m['pos'])
+        for k in ('pos', 'nrm', 'uv', 'col'):
+            m[k] = np.vstack([m[k], o[k]])
+        m['joint'] = np.concatenate([m['joint'], o['joint']])
+        m['tris'] = m['tris'] + [(mat, t + base) for mat, t in o['tris']]
+    return list(out.values())
 
 
 def GD_set_yaml(text, key, lines):
@@ -278,7 +306,7 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
                 ln /= np.linalg.norm(ln) or 1
                 tv = o['uv'][v][1]
                 st = (o['uv'][v][0] * tex.w, (1 - tv if getattr(textures, 'flip_v', False) else tv) * tex.h)
-                k = (o['name'], int(v), name)
+                k = (o.get('uid', o['name']), int(v), name)     # (two objects may share a name)
                 # unlit materials (lighting off): the vertex carries a color instead of a normal
                 rgba = None if tex.lit else o['col'][v]
                 wedge[k] = (j, GW.vertex(lp, ln, st, rgba))
@@ -738,7 +766,7 @@ def main(argv=None):
         built_parts = {}                                      # (joint, variant, detail) -> (dl, mobjsubs, scripts)
         if os.path.exists(parts_path):
             n_parts = 0
-            for o in load_gltf(parts_path):
+            for o in merge_same_name(load_gltf(parts_path, one_joint=True)):
                 m = re.match(r'part(\d+)_(hi|lo)_j(\d+)$', o['name'])
                 if not m:
                     say(f"  warning: {o['name']}: not a part<variant>_<hi|lo>_j<joint> object, skipped")
@@ -772,7 +800,7 @@ def main(argv=None):
             # back to variant 0's mesh when parts reset): it has to look like the body's piece
             if not quiet and os.path.exists(os.path.join(a.work_dir, 'body.gltf')):
                 body_ = {o['name']: o for o in load_gltf(os.path.join(a.work_dir, 'body.gltf'))}
-                for o in load_gltf(parts_path):
+                for o in merge_same_name(load_gltf(parts_path, one_joint=True)):
                     m0 = re.match(r'part0_hi_j(\d+)$', o['name'])
                     if not m0:
                         continue
@@ -816,7 +844,7 @@ def main(argv=None):
         skel_path = os.path.join(a.work_dir, 'skeleton.gltf')
         if os.path.exists(skel_path):
             n_skel = 0
-            for o in load_gltf(skel_path):
+            for o in merge_same_name(load_gltf(skel_path, one_joint=True)):
                 m = re.match(r'skel(\d+)_j(\d+)$', o['name'])
                 ent = f.skeletons.get(int(m.group(1)), {}).get(int(m.group(2))) if m else None
                 if ent is None:

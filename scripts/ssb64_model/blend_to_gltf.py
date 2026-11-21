@@ -514,10 +514,57 @@ for ob in bpy.data.objects:
     for md in [md for md in ob.modifiers if md.name == 'N64 Layer Order']:
         ob.modifiers.remove(md)
 
-# vertex colors (unlit materials): the glTF exporter's color handling loses some (alpha 0,
-# corner colors), so they travel as two extra UV maps (R,G) and (B,A): exact, per corner.
-# Values are the game's (sRGB) bytes / 255. In memory only.
+def _export_zero_color_objects():
+    """The export's objects (model.gltf) that have corners with color (0, 0, 0, 0): those are the
+    game's (Meta Knight's skeleton); anywhere else such a corner is Blender's fill for geometry
+    joined in from a mesh without the color attribute."""
+    import numpy as np
+    gl_path = os.path.join(export_dir, 'model.gltf')
+    if not os.path.exists(gl_path):
+        return set()
+    gl = json.load(open(gl_path))
+    bufs, out = {}, set()
+    for nd in gl['nodes']:
+        for prim in gl['meshes'][nd['mesh']]['primitives'] if 'mesh' in nd else []:
+            i = prim['attributes'].get('COLOR_0')
+            a = gl['accessors'][i] if i is not None else None
+            if a is None or a['type'] != 'VEC4':
+                continue
+            bv = gl['bufferViews'][a['bufferView']]
+            uri = gl['buffers'][bv['buffer']]['uri']
+            raw = bufs.setdefault(uri, open(os.path.join(export_dir, uri), 'rb').read())
+            dt = np.dtype('<' + {5126: 'f4', 5123: 'u2', 5121: 'u1'}[a['componentType']])
+            stride = bv.get('byteStride', 0) or dt.itemsize * 4
+            start = bv.get('byteOffset', 0) + a.get('byteOffset', 0)
+            if any(not np.frombuffer(raw, dt, 4, start + k * stride).any() for k in range(a['count'])):
+                out.add(base_name(nd.get('name', '')))
+    return out
+
+
+EXPORTED_COLLECTIONS = ('Costume 0', 'Low detail', 'Model parts', 'Electric skeleton')
+ZERO_COLOR_OBJECTS = _export_zero_color_objects()
 for me in {o.data for o in bpy.data.objects if o.type == 'MESH'}:      # (costumes share meshes)
+    names = sorted({base_name(o.name) for o in bpy.data.objects if o.data == me})
+    # UV maps: the glTF's TEXCOORD_0 is the first one. A mesh joined in with a differently named
+    # UV map brings its own map, and its faces are all (0, 0) in the first: one texel of the
+    # texture in game. Faces with nothing in the first map take the other maps' UVs; one map left.
+    uvs = [u for u in me.uv_layers if not u.name.startswith('N64_')]
+    if len(uvs) > 1:
+        main = uvs[0]
+        moved = 0
+        for poly in me.polygons:
+            lis = list(poly.loop_indices)
+            if any(main.data[li].uv.length_squared > 0 for li in lis):
+                continue
+            src = next((u for u in uvs[1:] if any(u.data[li].uv.length_squared > 0 for li in lis)), None)
+            if src is not None:
+                for li in lis:
+                    main.data[li].uv = src.data[li].uv
+                moved += 1
+        print(f"  note: {', '.join(names)}: {len(uvs)} UV maps ({', '.join(u.name for u in uvs)}): the game has one; "
+              f"using {main.name!r}" + (f', {moved} faces without UVs in it took theirs from the others' if moved else ''))
+        for u in uvs[1:]:
+            me.uv_layers.remove(me.uv_layers[u.name])
     attr = me.color_attributes.active_color or (me.color_attributes[0] if me.color_attributes else None)
     if attr is None or 'N64_RG' in me.uv_layers:
         continue
@@ -531,12 +578,46 @@ for me in {o.data for o in bpy.data.objects if o.type == 'MESH'}:      # (costum
         continue
     cols = [tuple(attr.data[li if corner else loop.vertex_index].color_srgb)
             for li, loop in enumerate(me.loops)]
+    # geometry joined in from a mesh without this color attribute gets (0, 0, 0, 0): black and
+    # see-through on unlit materials (texture x vertex color) - white, as the vertex had no color
+    if not ZERO_COLOR_OBJECTS & set(names):
+        blank = [li for li, c in enumerate(cols) if not any(c)]
+        if blank:
+            print(f"  note: {', '.join(names)}: {len(blank)} corners have no vertex color (0, 0, 0, 0: geometry "
+                  f"joined in from a mesh without the {attr.name!r} color attribute?): exported white")
+            for li in blank:
+                cols[li] = (1.0, 1.0, 1.0, 1.0)
     me.uv_layers.new(name='N64_RG')
     me.uv_layers.new(name='N64_BA')
     uv_rg, uv_ba = me.uv_layers['N64_RG'], me.uv_layers['N64_BA']
     for li, c in enumerate(cols):
         uv_rg.data[li].uv = (c[0], c[1])
         uv_ba.data[li].uv = (c[2], c[3])
+
+# meshes that won't be in the game: not in a collection the import reads
+_known = re.compile(r'(Costume \d+|Layer \d+.*|Room .*|Hurtboxes|Reference|Shield.*|VS Screen|Collision.*|Stage objects.*)$')
+for ob in bpy.data.objects:
+    if ob.type != 'MESH' or ob.get('n64_reference') or bpy.context.scene.get('n64_kind') == 'stage':
+        continue
+    colls = [c.name for c in ob.users_collection]
+    if any(c in EXPORTED_COLLECTIONS for c in colls):
+        continue
+    rigs = [md.object for md in ob.modifiers if md.type == 'ARMATURE' and md.object is not None] + \
+        ([ob.parent] if ob.parent is not None and ob.parent.type == 'ARMATURE' else [])
+    deforms = any(not r.get('n64_reference') for r in rigs)        # (not the reference opponent's)
+    if deforms and not any(_known.match(c) for c in colls):
+        print(f"  warning: {ob.name}: in {', '.join(colls) or 'no collection'}, not in "
+              f"{' / '.join(EXPORTED_COLLECTIONS)}: not imported (move it into one of those)")
+# the import goes by object name (without Blender's .001): two objects with one name are one piece
+for coll_name in EXPORTED_COLLECTIONS:
+    c = bpy.data.collections.get(coll_name)
+    seen = {}
+    for ob in (c.all_objects if c else []):
+        if ob.type == 'MESH':
+            seen.setdefault(re.sub(r'\.\d+$', '', ob.name), []).append(ob.name)
+    for n, obs in seen.items():
+        if len(obs) > 1:
+            print(f"  note: {coll_name}: {', '.join(sorted(obs))} are all {n!r} for the import: drawn together")
 
 arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
 LAYERS = []
@@ -570,7 +651,8 @@ for coll_name, out in (('Costume 0', 'body.gltf'), ('Low detail', 'lo.gltf'), ('
             ob.select_set(True)
     opts = dict(filepath=os.path.join(OUT, out), export_format='GLTF_SEPARATE',
                 use_active_collection=not stage_layer, export_image_format='NONE',
-                export_animations=False, export_yup=True, export_materials='EXPORT')
+                export_animations=False, export_yup=True, export_materials='EXPORT',
+                export_apply=True)        # modifiers (Mirror, Solidify...): what Blender shows
     if stage_layer:
         opts['use_selection'] = True
     try:      # vertex colors go as UV maps (above)

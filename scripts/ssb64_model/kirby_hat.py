@@ -437,7 +437,7 @@ def import_blend(work_dir, export_dir, hat_bin, rom_path=None):
     n_body = len(MF.pointer_run(f.char_int, body_fields(f)['hi'][1]))
     body = {name for p in man.get('model_parts') or [] if p['joint'] == HAT_JOINT and p['variant'] >= kh['hat_variant']
             for name in (p.get('mobj_order') or [])[:n_body] if name}
-    objs = {o['name']: o for o in IF.load_gltf(os.path.join(work_dir, 'parts.gltf'))} \
+    objs = {o['name']: o for o in IF.merge_same_name(IF.load_gltf(os.path.join(work_dir, 'parts.gltf'), one_joint=True))} \
         if os.path.exists(os.path.join(work_dir, 'parts.gltf')) else {}
 
     body_order = {(p['variant'], p['detail']): (p.get('mobj_order') or [])[:n_body]
