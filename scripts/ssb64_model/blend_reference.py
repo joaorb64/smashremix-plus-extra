@@ -5,7 +5,7 @@
     Heavy item joint (joint_NN)
     Items > Ray Gun, Beam Sword...  each in its own collection: show the one to check
     Opponent                       Mario (armature 'Opponent'), with his grabbed / thrown animations
-                                   (Opponent: CapturePulled, Thrown1...: pick one in its Action
+                                   (Opponent: CapturePulled, Thrown2...: pick one in its Action
                                    Editor; which ones a throw plays: the thrower's thrown_status)
 
 Held items follow the hold joint like in the game: its matrix without scale (a Child Of
@@ -328,8 +328,8 @@ def _opponent(folder, op, hold, coll):
         act.use_fake_user = True
         for fc in [fc for fc in _fcurves(act) if fc.data_path.startswith('pose.bones["TransN"].location')]:
             _remove_fcurve(act, fc)
-        if first is None or act.name.endswith(': Thrown1'):
-            first = act                             # (shown: Thrown1, else the first one)
+        if first is None or act.name.endswith(': Thrown2'):
+            first = act                             # (shown: Thrown2, else the first one)
     ad = arm.animation_data_create()
     for tr in list(ad.nla_tracks):
         ad.nla_tracks.remove(tr)

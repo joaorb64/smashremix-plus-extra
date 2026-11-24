@@ -204,6 +204,9 @@ for m in bpy.data.materials:
             p['n64_palettes'] = a['palettes']
         if a['tracks']:
             p['n64_animated'] = sorted(a['tracks'])
+    if 'n64_image_order' in m.keys():        # alternate textures removed / moved (N64 sidebar)
+        p['n64_image_order'] = [int(x) for x in m['n64_image_order']]
+        p['n64_image_known'] = int(m.get('n64_image_known', 0))       # (entries past it: appended)
     if p:
         props[name] = p
 # images painted in Blender but not saved yet (expressions, palettes)
@@ -491,6 +494,9 @@ open(os.path.join(OUT, 'gamedata.json'), 'w').write(json.dumps(GDB.collect(), in
 json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=lights, anims=anims,
                joint_anims=joint_anims(), new_joints=new_joints(), joint_map=joint_map(), fighter_joints=fighter_joints(),
                fighter_anims=fighter_anims(), costume_count=COSTUME_COUNT,
+               # model part variants renumbered in Blender (removed / moved): object -> its export variant
+               part_origins={base_name(o.name): int(o['n64_part_orig']) for o in bpy.data.objects
+                             if o.type == 'MESH' and 'n64_part_orig' in o.keys()},
                costume_sources={str(k): int(v) for k, v in dict(bpy.context.scene.get('n64_costume_sources') or {}).items()},
                shield_pose=shield_pose()),
           open(os.path.join(OUT, 'costumes.json'), 'w'), indent=1)

@@ -614,9 +614,20 @@ def main(argv=None):
             m_ = re.match(r'part(\d+)_(hi|lo)_j(\d+)$', nd.get('name', ''))
             if m_ and 'mesh' in nd:
                 part_counts[int(m_.group(3))] = max(part_counts.get(int(m_.group(3)), 0), int(m_.group(1)) + 1)
+    # variants renumbered in Blender (removed / moved): object name -> the export's variant (its
+    # material order, flags); such a joint gets a new list
+    try:
+        part_origins = json.load(open(os.path.join(a.work_dir, 'costumes.json'))).get('part_origins') or {}
+    except (OSError, ValueError):
+        part_origins = {}
+    part_moved = set()
+    for name_, v0 in part_origins.items():
+        m_ = re.match(r'part(\d+)_(hi|lo)_j(\d+)$', name_)
+        if m_ and int(m_.group(1)) != int(v0):
+            part_moved.add(int(m_.group(3)))
     mp_ = f.ptr_main(f.attr + MF.A_MODELPARTS)
     part_rebuild = {j for j, n in part_counts.items()
-                    if len(f.modelparts.get(j, [])) != n or
+                    if len(f.modelparts.get(j, [])) != n or j in part_moved or
                     any(p['field'] is None for pair in f.modelparts.get(j, []) for p in pair)}
     if part_rebuild and (mp_ is None or mp_[0] != 'main'):
         raise SystemExit('model parts: the fighter has no model part container in main.bin; new variants '
@@ -775,8 +786,9 @@ def main(argv=None):
                 slots = f.modelparts.get(joint, [])
                 fld = slots[v][0 if detail == 'hi' else 1]['field'] \
                     if v < len(slots) and joint not in part_rebuild else None
+                v0 = int(part_origins.get(o['name'], v))            # (renumbered in Blender: the export's)
                 part_info = next((p for p in textures.manifest.get('model_parts', [])
-                                  if p['joint'] == joint and p['variant'] == v and p['detail'] == detail), {})
+                                  if p['joint'] == joint and p['variant'] == v0 and p['detail'] == detail), {})
                 dls, mats = build_joints([o], W_ext or W, textures, blob, prologue, store, only_joint=joint,
                                          mobj_order={joint: part_info.get('mobj_order') or []})
                 lst = blob.add(b'\0' * (4 * (len(mats[joint]) + 1)), 4)
@@ -818,8 +830,9 @@ def main(argv=None):
                 slots = f.modelparts.get(joint, [])
                 raw = bytearray(MF.MODELPART_SIZE * 2 * (n + 1))
                 for v in range(n):
+                    v0 = int(part_origins.get(f'part{v}_hi_j{joint:02d}', v))
                     for k in range(2):
-                        src = slots[v][k] if v < len(slots) else (slots[0][k] if slots else None)
+                        src = slots[v0][k] if 0 <= v0 < len(slots) else (slots[0][k] if slots else None)
                         raw[MF.MODELPART_SIZE * (2 * v + k) + 0x10] = src['flags'] if src else 0
                 desc = blob.add(bytes(raw), 4)
                 for v in range(n):

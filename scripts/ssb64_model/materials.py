@@ -449,6 +449,24 @@ class Material:
             imgs.append(nearest_index(im, pals[ref_p])[0] if self.ci else im)
             img_raw.append(b'')
             self.warnings.append(f'image {i} added to the list')
+        # the list's order in Blender (alternate textures removed / moved: n64_image_order, the
+        # indices of the list above in their new order); the costumes follow their images
+        order = props.get('n64_image_order')
+        if order is not None:
+            known = int(props.get('n64_image_known') or len(imgs))
+            order = list(dict.fromkeys([int(x) for x in order if 0 <= int(x) < len(imgs)] +
+                                       list(range(known, len(imgs)))))
+            kept = sorted({ti for ti, _ in self.costume_map} - set(order))
+            if kept:
+                self.warnings.append(f'images {kept} are drawn by costumes: kept (at the end of the list)')
+                order += kept
+            if order != list(range(len(imgs))):
+                at = {o: k for k, o in enumerate(order)}
+                gone = [i for i in range(len(imgs)) if i not in at]
+                imgs, img_raw = [imgs[o] for o in order], [img_raw[o] for o in order]
+                self.costume_map = [[at[ti], pi] for ti, pi in self.costume_map]
+                self.warnings.append(f'image list reordered: {order}' + (f' (removed {gone})' if gone else '')
+                                     + ': moveset events picking its images by number follow the new order')
         # encode (unchanged entries keep their exact bytes)
         if self.ci:
             self.images = [self.pad(pack(ix, bpp)) if ix is not None else None for ix in imgs]

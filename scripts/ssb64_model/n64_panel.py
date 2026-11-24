@@ -5176,9 +5176,9 @@ def joint_image_lists(man, j):
             if n and len((man['materials'].get(n) or {}).get('images') or []) > 1]
 
 
-def list_images(man, base):
-    """Material `base`'s image list: the export's entries (paths), then the ones added in Blender
-    (its 'N64 Frame <i>' nodes past them: the import appends them to the list)."""
+def raw_images(man, base):
+    """Material `base`'s image list before reordering: the export's entries (paths), then the ones
+    added in Blender (its 'N64 Frame <i>' nodes past them: the import appends them to the list)."""
     out = [_export_path(r) for r in (man['materials'].get(base) or {}).get('images') or []]
     m = bpy.data.materials.get(base)
     if m is not None:
@@ -5186,6 +5186,21 @@ def list_images(man, base):
             if i >= len(out) and n.image is not None:
                 out.append(os.path.normpath(bpy.path.abspath(n.image.filepath, library=n.image.library)))
     return out
+
+
+def image_order(m, n_raw):
+    """The list's order (indices into raw_images) after removing / moving images: the material's
+    n64_image_order, then the entries added after it was set (n64_image_known: the count then)."""
+    if m is None or 'n64_image_order' not in m.keys():
+        return list(range(n_raw))
+    order = [int(x) for x in m['n64_image_order'] if 0 <= int(x) < n_raw]
+    return order + list(range(int(m.get('n64_image_known', n_raw)), n_raw))
+
+
+def list_images(man, base):
+    """Material `base`'s image list as the import writes it (raw_images in image_order)."""
+    raw = raw_images(man, base)
+    return [raw[i] for i in image_order(bpy.data.materials.get(base), len(raw))]
 
 
 def expression_images(man, tp):
@@ -5447,6 +5462,7 @@ class N64_OT_part_add(bpy.types.Operator):
             o.name = f'part{v}_{detail}_j{j:02d}'
             o.pop('n64_costume_preview', None)
             o.pop('n64_part_body', None)
+            o['n64_part_orig'] = -1              # (new: not one of the export's variants)
             for slot in o.material_slots:
                 slot.link = 'DATA'
             coll.objects.link(o)
@@ -5460,27 +5476,94 @@ class N64_OT_part_add(bpy.types.Operator):
         return None
 
 
+def _renumber_parts(scene, j, mapping):
+    """Rename joint_j's variants {old: new} (objects part<v>_<hi|lo>_jNN), each keeping the
+    export's variant it came from (n64_part_orig: the import takes its material order from it)."""
+    man = _manifest(scene)
+    exported = {(p['variant'], p['detail']) for p in man.get('model_parts') or [] if p['joint'] == j}
+    have = part_objects(j)
+    moving = []
+    for old, new in mapping.items():
+        if old == new:
+            continue
+        for o in have.get(old, []):
+            det = '_hi_' if '_hi_' in o.name else '_lo_'
+            if 'n64_part_orig' not in o.keys():
+                o['n64_part_orig'] = old if (old, det.strip('_')) in exported else -1
+            o.name = f'__n64_part_tmp_{len(moving)}'
+            moving.append((o, f'part{new}{det}j{j:02d}'))
+    for o, name in moving:
+        o.name = name
+    shown = dict(scene.get('n64_parts_shown') or {})
+    if str(j) in shown and int(shown[str(j)]) in mapping:
+        shown[str(j)] = mapping[int(shown[str(j)])]
+        scene['n64_parts_shown'] = shown
+
+
+def _event_changes(j, mapping):
+    return ', '.join(f'{part_event(j, o)} -> {part_event(j, n)}' for o, n in sorted(mapping.items()) if o != n)
+
+
 class N64_OT_part_remove(bpy.types.Operator):
     bl_idname = 'n64.part_remove'
     bl_label = 'Remove Model Part Variant'
-    bl_description = ('Delete the joint\'s last variant (only the last: the others keep their ids, which '
-                      'moveset events and code use)')
+    bl_description = ('Delete this variant; the ones after it move down a number (moveset events / code '
+                      'picking them by number: change them, the Info report lists the events)')
     bl_options = {'UNDO'}
     joint: bpy.props.IntProperty()
+    variant: bpy.props.IntProperty(default=-1, description='-1: the last')
 
     def execute(self, context):
-        have = part_objects(self.joint)
+        j = self.joint
+        have = part_objects(j)
         if not have:
             return {'CANCELLED'}
-        v = max(have)
+        v = max(have) if self.variant < 0 else self.variant
+        if v not in have:
+            return {'CANCELLED'}
+        if v == 0 and len(have) > 1:
+            self.report({'ERROR'}, 'Variant 0 is the body\'s look the joint starts with: remove the others first')
+            return {'CANCELLED'}
         for o in have[v]:
             bpy.data.objects.remove(o)
         shown = dict(context.scene.get('n64_parts_shown') or {})
-        if shown.get(str(self.joint)) == v:
-            shown.pop(str(self.joint))
+        if shown.get(str(j)) == v:
+            shown.pop(str(j))
             context.scene['n64_parts_shown'] = shown
+        mapping = {w: w - 1 for w in sorted(have) if w > v}
+        _renumber_parts(context.scene, j, mapping)
         apply_parts(context.scene)
-        self.report({'INFO'}, f'joint_{self.joint:02d}: variant {v} removed (moveset events using it: change them)')
+        msg = f'joint_{j:02d}: variant {v} removed (moveset events using it: change them)'
+        if mapping:
+            msg += '; renumbered, update moveset events: ' + _event_changes(j, mapping)
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class N64_OT_part_move(bpy.types.Operator):
+    bl_idname = 'n64.part_move'
+    bl_label = 'Move Model Part Variant'
+    bl_description = ('Swap this variant with the one before / after it (their numbers: moveset events / code '
+                      'picking them change, the Info report lists the events). Variant 0 stays the body\'s look')
+    bl_options = {'UNDO'}
+    joint: bpy.props.IntProperty()
+    variant: bpy.props.IntProperty()
+    direction: bpy.props.IntProperty(default=1, description='-1: up (a lower number), 1: down')
+
+    def execute(self, context):
+        j, v = self.joint, self.variant
+        w = v + self.direction
+        have = part_objects(j)
+        if v not in have or w not in have:
+            return {'CANCELLED'}
+        if 0 in (v, w):
+            self.report({'ERROR'}, 'Variant 0 is the body\'s look the joint starts with: it stays variant 0')
+            return {'CANCELLED'}
+        mapping = {v: w, w: v}
+        _renumber_parts(context.scene, j, mapping)
+        apply_parts(context.scene)
+        self.report({'INFO'}, f'joint_{j:02d}: variants {v} and {w} swapped; update moveset events: '
+                              + _event_changes(j, mapping))
         return {'FINISHED'}
 
 
@@ -5537,23 +5620,28 @@ class N64_OT_alt_texture_add(bpy.types.Operator):
         made, new_i = [], None
         for base in _expr_materials(man, tp):
             m = bpy.data.materials.get(base)
+            raw = raw_images(man, base)
             imgs = list_images(man, base)
             if m is None or len(imgs) < 1:
                 continue
-            for i, path in enumerate(imgs):            # the list as Frame nodes (the import reads them)
+            for i, path in enumerate(raw):             # the list as Frame nodes (the import reads them)
                 n = frame_node(m, 'Frame', i)
                 if n.image is None:
                     n.image = _load_image(path)
-            i = len(imgs)
+            r = len(raw)
             src = imgs[min(src_i, len(imgs) - 1)]
-            dst = os.path.join(os.path.dirname(src), f'{base}_img{i}.png')
+            dst = os.path.join(os.path.dirname(src), f'{base}_img{r}.png')
             k = 1
             while os.path.exists(dst):                 # (an earlier add's file)
-                dst = os.path.join(os.path.dirname(src), f'{base}_img{i}_{k}.png')
+                dst = os.path.join(os.path.dirname(src), f'{base}_img{r}_{k}.png')
                 k += 1
             shutil.copyfile(src, dst)
             img = _load_image(dst)
-            frame_node(m, 'Frame', i).image = img
+            frame_node(m, 'Frame', r).image = img
+            if 'n64_image_order' in m.keys():         # reordered: the new one at the end
+                m['n64_image_order'] = image_order(m, r) + [r]
+                m['n64_image_known'] = r + 1
+            i = len(imgs)
             made.append(f'{base} image {i}')
             new_i = i if new_i is None else min(new_i, i)
         if not made:
@@ -5593,35 +5681,59 @@ class N64_OT_alt_texture_slot(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class N64_OT_alt_texture_remove(bpy.types.Operator):
-    bl_idname = 'n64.alt_texture_remove'
-    bl_label = 'Remove Alternate Texture'
-    bl_description = 'Remove the last image added in Blender (the list\'s exported images stay: moveset events use their numbers)'
+class N64_OT_alt_texture_edit(bpy.types.Operator):
+    bl_idname = 'n64.alt_texture_edit'
+    bl_label = 'Edit Alternate Texture List'
+    bl_description = ('Remove this image from the list this texture part switches, or swap it with the one '
+                      'before / after (every material it switches). The images after it change numbers: '
+                      'moveset events (0x2B) picking them, change them')
     bl_options = {'UNDO'}
     part: bpy.props.IntProperty()
+    image: bpy.props.IntProperty()
+    action: bpy.props.EnumProperty(items=[('REMOVE', 'Remove', ''), ('UP', 'Move Up', ''), ('DOWN', 'Move Down', '')])
 
     def execute(self, context):
         sc = context.scene
         man = _manifest(sc)
         tp = next((t for t in texture_parts(sc) if t['index'] == self.part), None)
-        done = []
-        for base in _expr_materials(man, tp) if tp else []:
-            m = bpy.data.materials.get(base)
-            n_exp = len((man['materials'].get(base) or {}).get('images') or [])
-            nodes = frame_nodes(m) if m is not None else []
-            if len(nodes) > n_exp:
-                m.node_tree.nodes.remove(nodes[-1])
-                done.append(base)
-                if len(frame_nodes(m)) <= n_exp:        # back to the export's list: no Frame nodes needed
-                    for n in frame_nodes(m):
-                        m.node_tree.nodes.remove(n)
-        if not done:
-            self.report({'ERROR'}, 'Only images added in Blender can be removed')
+        if tp is None:
             return {'CANCELLED'}
+        i = self.image
+        to = i - 1 if self.action == 'UP' else i + 1
+        plans = []
+        for base in _expr_materials(man, tp):
+            m = bpy.data.materials.get(base)
+            n_raw = len(raw_images(man, base))
+            order = image_order(m, n_raw)
+            if m is None or i >= len(order):
+                continue
+            if self.action == 'REMOVE':
+                drawn = {int(cm[0]) for cm in (man['materials'].get(base) or {}).get('costume_map') or []}
+                if order[i] in drawn or len(order) < 2:
+                    self.report({'ERROR'}, f'{base}: image {i} is the one a costume draws: it can\'t be removed')
+                    return {'CANCELLED'}
+                order.pop(i)
+            elif 0 <= to < len(order):
+                order[i], order[to] = order[to], order[i]
+            else:
+                continue
+            plans.append((m, order, n_raw))
+        if not plans:
+            return {'CANCELLED'}
+        for m, order, n_raw in plans:
+            m['n64_image_order'] = order
+            m['n64_image_known'] = n_raw
         shown = dict(sc.get('n64_expr_shown') or {})
-        shown.pop(str(self.part), None)
+        if self.action == 'REMOVE':
+            shown.pop(str(self.part), None)
+            msg = f'image {i} removed; images after it moved down a number'
+        else:
+            shown[str(self.part)] = to
+            msg = f'images {i} and {to} swapped'
         sc['n64_expr_shown'] = shown
         apply_expressions(sc)
+        self.report({'INFO'}, f'Alternate texture {self.part + 1}: {msg} (moveset events 0x2B picking them: '
+                              'change their numbers)')
         return {'FINISHED'}
 
 
@@ -5682,8 +5794,18 @@ def draw_part_variants(lay, scene, j):
         r.label(text=f'Variant {v}: ' + ', '.join(o.name for o in have[v]))
         op = r.operator('n64.part_select', text='', icon='RESTRICT_SELECT_OFF')
         op.joint, op.variant = j, v
-        if v == max(have):
-            r.operator('n64.part_remove', text='', icon='X').joint = j
+        sub = r.row(align=True)
+        sub.enabled = v >= 2
+        op = sub.operator('n64.part_move', text='', icon='TRIA_UP')
+        op.joint, op.variant, op.direction = j, v, -1
+        sub = r.row(align=True)
+        sub.enabled = 1 <= v < max(have)
+        op = sub.operator('n64.part_move', text='', icon='TRIA_DOWN')
+        op.joint, op.variant, op.direction = j, v, 1
+        sub = r.row(align=True)
+        sub.enabled = v > 0 or len(have) == 1
+        op = sub.operator('n64.part_remove', text='', icon='X')
+        op.joint, op.variant = j, v
         r2 = box.row(align=True)
         ev = part_event(j, v)
         r2.label(text=f'   moveset: {ev}' + ('   (the body\'s look: the game starts with it)' if v == 0 else ''))
@@ -5953,8 +6075,12 @@ class N64_PT_fighter_view(bpy.types.Panel):
                 cur_i = int(shown.get(str(tp['index']), -1))
                 # 'Own': no override, what the costume's own script gives the material. The same as
                 # image 0 unless a costume picks another image (most only change palettes): then only 0
-                own_differs = any(cm[0] != 0 for b in mats
-                                  for cm in ((man['materials'].get(b) or {}).get('costume_map') or []))
+                own_differs = False
+                for b in mats:
+                    order_b = image_order(bpy.data.materials.get(b), len(raw_images(man, b)))
+                    pos_b = {r: k for k, r in enumerate(order_b)}
+                    own_differs |= any(pos_b.get(int(cm[0]), 0) != 0
+                                       for cm in ((man['materials'].get(b) or {}).get('costume_map') or []))
                 if own_differs:
                     op = row.operator('n64.expression_show', text='Own', depress=cur_i < 0)
                     op.part, op.image = tp['index'], -1
@@ -5964,9 +6090,15 @@ class N64_PT_fighter_view(bpy.types.Panel):
                     op.part, op.image = tp['index'], (-1 if i == 0 and not own_differs else i)
                 r = lay.row(align=True)
                 r.operator('n64.alt_texture_add', text='Add', icon='ADD').part = tp['index']
-                if any(len(frame_nodes(bpy.data.materials[b])) > len((man['materials'].get(b) or {}).get('images') or [])
-                       for b in mats if b in bpy.data.materials):
-                    r.operator('n64.alt_texture_remove', text='Remove Last Added', icon='X').part = tp['index']
+                sel = cur_i if cur_i >= 0 else (None if own_differs else 0)
+                if n_img > 1 and sel is not None:     # the shown image: move / remove it
+                    r.label(text=f'Image {sel}:')
+                    for action, icon, ok in (('UP', 'TRIA_LEFT', sel > 0), ('DOWN', 'TRIA_RIGHT', sel < n_img - 1),
+                                             ('REMOVE', 'X', True)):
+                        sub = r.row(align=True)
+                        sub.enabled = ok
+                        op = sub.operator('n64.alt_texture_edit', text='', icon=icon)
+                        op.part, op.image, op.action = tp['index'], sel, action
                 if n_img == 1:
                     lay.label(text='One image: Add makes more (the import gives the material an image list)',
                               icon='INFO')
@@ -6906,8 +7038,8 @@ CLASSES = (N64_OT_detail_show, N64_OT_costume_add, N64_OT_costume_remove, N64_OT
            N64_OT_coll_apply, N64_OT_coll_group, N64_OT_coll_add, N64_PT_collision_tools,
            N64_PT_motion_flags, N64_OT_anim_load_bin, N64_OT_anim_save_bin, N64_OT_rest_pose,
            N64_OT_hidden_part_add, N64_OT_hidden_part_remove, N64_PT_bone_joint, N64_PT_fighter_joints,
-           N64_OT_part_show, N64_OT_part_select, N64_OT_part_add, N64_OT_part_remove, N64_OT_costume_show,
-           N64_OT_expression_show, N64_OT_alt_texture_add, N64_OT_alt_texture_remove, N64_OT_alt_texture_slot,
+           N64_OT_part_show, N64_OT_part_select, N64_OT_part_add, N64_OT_part_remove, N64_OT_part_move, N64_OT_costume_show,
+           N64_OT_expression_show, N64_OT_alt_texture_add, N64_OT_alt_texture_edit, N64_OT_alt_texture_slot,
            N64_OT_ref_item_show,
            N64_OT_ref_opponent_toggle, N64_OT_ref_select_hold, N64_OT_ref_hold_sync, N64_PT_fighter_view,
            N64_OT_stage_joint_add, N64_OT_stage_assign, N64_OT_stage_linear, N64_OT_stage_select,
