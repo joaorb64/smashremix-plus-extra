@@ -108,7 +108,8 @@ class ItemProcessor(ExtraImportProcessor):
         sprites = [
             name_images.sprite_asm("item_switch", name_images.item_switch_image(display, src("item_switch")), "i4"),
             name_images.sprite_asm("training", name_images.training_image(str(config.get("training_name", display)), src("training")), "ia8"),
-            name_images.sprite_asm("training_hud", name_images.training_hud_image(display, src("training_hud")), "ia8"),
+            name_images.sprite_asm("training_hud", name_images.training_hud_image(display, src("training_hud")), "ia8",
+                                  name_images.TRAINING_HUD_TINT),
         ]
         with open(f"{output_path}/generated.asm", "a", encoding="utf-8") as f:
             f.write("\n// Name sprites\nscope NAME {\n" + "\n".join(sprites) + "\n}\n")

@@ -35,6 +35,7 @@ ROW_HEIGHT = 12            # item switch row image
 LIST_WIDTH = 112           # Remix's list image width
 LEFT_MARGIN = 1            # Remix's rows start 1 px in
 TRAINING_HEIGHT = 16
+TRAINING_HUD_TINT = (0x6C, 0xFF, 0x6C, 0xFF)   # green, as Remix's own HUD names (file 0x1D)
 TRAINING_MAX_WIDTH = 100
 TWO_LINE_WIDTH = 86        # vanilla MotionSensor Bomb / Remix's two-line names
 TWO_LINE_HEIGHT = 17
@@ -47,7 +48,7 @@ TWO_LINE_PHASE = 0.375     # source rows the squash is shifted by (fit to vanill
 # left in final px, contrast on the coverage).
 SWITCH_STYLE = dict(cap=7.25, stretch=1.1, gap=0.75, space=2.5, bold=0.3,
                     x=LEFT_MARGIN, y=1.5, contrast=3.15)    # vanilla I4 rows are crisp
-MENU_STYLE = dict(cap=9.0, stretch=1.1, gap=0.75, space=3.0, bold=0.1,
+MENU_STYLE = dict(cap=9.0, stretch=0.975, gap=1.75, space=3.0, bold=0.1,
                   x=2.0, y=2.75, contrast=1.05)
 
 
@@ -214,8 +215,9 @@ def encode_ia8(img):
     return _swap_odd_rows(rows), wi
 
 
-def sprite_asm(label, img, fmt):
-    """Bass source for a one-bitmap Sprite named `label` (+ its texels)."""
+def sprite_asm(label, img, fmt, rgba=(0xFF, 0xFF, 0xFF, 0xFF)):
+    """Bass source for a one-bitmap Sprite named `label` (+ its texels).
+    `rgba` = sprite tint (the IA texture is multiplied by it)."""
     if fmt == "i4":
         texels, wi = encode_i4(img)
         bmfmt, bmsiz, attr, ndisplist = 4, 0, 0x0240, 60       # as Remix's item list
@@ -237,7 +239,7 @@ def sprite_asm(label, img, fmt):
         "float32 1.0, 1.0                       // scale",
         "dh 0, 0                                // expx, expy",
         f"dh 0x{attr:04X}, 0x1234                // attr, zdepth",
-        "db 0xFF, 0xFF, 0xFF, 0xFF              // rgba",
+        "db " + ", ".join(f"0x{c:02X}" for c in rgba) + "              // rgba",
         "dh 0, 0                                // startTLUT, nTLUTs",
         "dw 0                                   // LUT",
         "dh 0, 1                                // istart, istep",

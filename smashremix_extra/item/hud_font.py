@@ -7,6 +7,7 @@ shadow up-left and a black outline with a soft outer ring. This redoes that at
 SS x resolution and box-downsamples it. The constants were fitted against the ROM's
 HUD name sprites (MAXIM TOMATO, BEAM SWORD, ATTACK, CLOAKING DEVICE, ...):
 same cap height, widths within a few px. M and W are drawn double width as in vanilla.
+Quartz's segment gaps are cut wider (SEG_GAP) so they show as dark notches like vanilla's.
 """
 import os
 
@@ -21,15 +22,17 @@ SIZE = 14.375       # font px at 1x
 X_SCALE = 0.92      # glyphs narrowed
 WIDE = {"M": 1.75, "W": 1.75}   # vanilla M/W take two cells
 BOLD = 1            # body dilation (SS px)
-SHADOW = (-2, -3)   # shadow offset (dy, dx) in SS px
-SHADOW_GREY = 0.15
+SHADOW = (-2, -5)   # shadow offset (dy, dx) in SS px
+SHADOW_GREY = 0.5
 OUTLINE = 8         # black outline radius (SS px)
 RING = 3            # soft ring past it (SS px)
-RING_ALPHA = 0.525
+RING_ALPHA = 0.425
 TOP = 2.9375        # cap top row
-PAD = 1.0           # left margin (px)
+PAD = 1.25          # left margin (px)
 GAP = 1.75          # px between glyph bodies
 SPACE = 4.0         # px for a space
+SEG_GAP = 2         # widen the LCD segment gaps (SS px); Quartz's own (~0.3 px) vanish when downsampled
+SEG_CLOSE = 5       # closing radius (SS px) that finds those gaps
 
 _font = None
 
@@ -61,6 +64,20 @@ def _dilate(a, r):
     return out
 
 
+def _erode(a, r):
+    return ~_dilate(~a, r)
+
+
+def _widen_gaps(a):
+    """Cut Quartz's thin segment gaps wider so they survive the downsample."""
+    if not SEG_GAP:
+        return a
+    p = SEG_CLOSE + 1
+    padded = np.pad(a, p)
+    gaps = (_erode(_dilate(padded, SEG_CLOSE), SEG_CLOSE) & ~padded)[p:-p, p:-p]
+    return a & ~_dilate(gaps, SEG_GAP)
+
+
 def _glyph(ch):
     """Glyph body mask at SS x, trimmed to its ink columns; rows from the font's ascent."""
     f = _get_font()
@@ -69,7 +86,7 @@ def _glyph(ch):
     ImageDraw.Draw(im).text((-left + 2, 0), ch, font=f, fill=255)
     xs = X_SCALE * WIDE.get(ch, 1)
     im = im.resize((max(1, round(im.width * xs)), im.height), Image.BILINEAR)
-    a = np.array(im) > 127
+    a = _widen_gaps(np.array(im) > 127)
     cols = np.nonzero(a.any(0))[0]
     return a[:, cols[0]:cols[-1] + 1] if len(cols) else None
 
