@@ -14,7 +14,8 @@ scope Item {
 
     // @ Description
     // Number of standard custom items
-    constant NUM_STANDARD_ITEMS(13)
+    constant NUM_STANDARD_ITEMS(13)         // the appender adds its extra items (extra_items/) here
+    constant REMIX_NUM_STANDARD_ITEMS(13)   // Remix's own; extra items' training sprites come from ExtraItems after these
     constant MAX_NUM_STANDARD_ITEMS(12)     // max number of custom items before vanilla bitmask janks out
 
     // @ Description
@@ -301,6 +302,13 @@ scope Item {
         addiu   t7, t9, TRAINING_MENU_IMAGE_TABLE // t7 = address of custom item name image table
         addiu   t8, t8, -0x0011                 // t8 = index in custom item name image table
 
+        // extra items (appender extra_items/): their own Sprite* table
+        sltiu   t9, t8, REMIX_NUM_STANDARD_ITEMS
+        bnez    t9, _menu_image_return          // a Remix item
+        nop
+        li      t7, ExtraItems.training_menu_sprites
+        addiu   t8, t8, -REMIX_NUM_STANDARD_ITEMS
+
         _menu_image_return:
         j       _return_get_custom_menu_image
         nop
@@ -359,6 +367,12 @@ scope Item {
         lw      t8, 0x0024(a0)                  // t8 = file 0xFE address
         addiu   t8, t8, TRAINING_HUD_IMAGE_TABLE // t8 = address of custom item name image table
         addiu   t0, t9, -0x002A                 // t0 = index in custom item name image table
+        sltiu   t2, t0, REMIX_NUM_STANDARD_ITEMS
+        bnez    t2, _remix_hud_image            // a Remix item
+        nop
+        li      t8, ExtraItems.training_hud_sprites // extra items (appender extra_items/)
+        addiu   t0, t0, -REMIX_NUM_STANDARD_ITEMS
+        _remix_hud_image:
         sll     t0, t0, 0x0002                  // t0 = offset to item name image
         addu    t1, t8, t0                      // t1 = address of item name image pointer
         lw      t2, 0x0000(t1)                  // t2 = custom item image footer
@@ -589,6 +603,8 @@ scope Item {
 
             // switch to extended bitmask here
             OS.read_word(EXTENDED_ENABLED_BITMASK, v0) // v0 = extended bit mask
+            addiu   at, v1, -(0x14 + MAX_NUM_STANDARD_ITEMS) // at = how many extended items we're past (the loop shifts the
+            srlv    v0, v0, at                    // mask once per item: keep this item's bit at bit 0)
 
             _continue:
             li      a0, Stages.custom_item_spawn_rate_table
@@ -627,6 +643,8 @@ scope Item {
 
             // switch to extended bitmask here
             OS.read_word(EXTENDED_ENABLED_BITMASK, a0) // a0 = extended bit mask
+            addiu   at, v1, -(0x14 + MAX_NUM_STANDARD_ITEMS) // at = how many extended items we're past (the loop shifts the
+            srlv    a0, a0, at                    // mask once per item: keep this item's bit at bit 0)
 
             _continue:
             li      a3, Stages.custom_item_spawn_rate_table
@@ -679,6 +697,8 @@ scope Item {
 
             // switch to extended bitmask here
             OS.read_word(EXTENDED_ENABLED_BITMASK, a0) // a0 = extended bit mask
+            addiu   at, v1, -(0x2D + MAX_NUM_STANDARD_ITEMS) // at = how many extended items we're past (the loop shifts the
+            srlv    a0, a0, at                    // mask once per item: keep this item's bit at bit 0)
 
             _continue:
             j       0x8016EED0                      // original line 1, modified to be a jump
@@ -706,6 +726,8 @@ scope Item {
 
             // switch to extended bitmask here
             OS.read_word(EXTENDED_ENABLED_BITMASK, v0) // v0 = extended bit mask
+            addiu   at, v1, -(0x14 + MAX_NUM_STANDARD_ITEMS) // at = how many extended items we're past (the loop shifts the
+            srlv    v0, v0, at                    // mask once per item: keep this item's bit at bit 0)
 
             _continue:
             li      a1, Stages.custom_item_spawn_rate_table
@@ -744,6 +766,8 @@ scope Item {
 
             // switch to extended bitmask here
             OS.read_word(EXTENDED_ENABLED_BITMASK, a0) // a0 = extended bit mask
+            addiu   at, v1, -(0x14 + MAX_NUM_STANDARD_ITEMS) // at = how many extended items we're past (the loop shifts the
+            srlv    a0, a0, at                    // mask once per item: keep this item's bit at bit 0)
 
             _continue:
             li      t1, Stages.custom_item_spawn_rate_table
@@ -797,6 +821,8 @@ scope Item {
 
             // switch to extended bitmask here
             OS.read_word(EXTENDED_ENABLED_BITMASK, a0) // a0 = extended bit mask
+            addiu   at, v1, -(0x2D + MAX_NUM_STANDARD_ITEMS) // at = how many extended items we're past (the loop shifts the
+            srlv    a0, a0, at                    // mask once per item: keep this item's bit at bit 0)
 
             _continue:
             // first check if item is on
@@ -930,16 +956,24 @@ scope Item {
     }
 
     // @ Description
-    // Item Switch page - use free space
-    constant ITEM_SWITCH_PAGE(0x80133470)
+    // Item Switch pages: page 0 = vanilla items, then 15 custom items per page.
+    // The page state and the custom items' ON/OFF values live here (not in the
+    // screen's free space) so there's room for any number of pages.
+    constant ITEM_SWITCH_ROWS(15)
+    constant ITEM_SWITCH_PAGES(1 + (NUM_STANDARD_ITEMS + ITEM_SWITCH_ROWS - 1) / ITEM_SWITCH_ROWS)
+    OS.align(4)
+    ITEM_SWITCH_PAGE:; dw 0                 // current page
+    ITEM_SWITCH_PAGE_ROWS:; dw ITEM_SWITCH_ROWS // items on the current page
+    ITEM_SWITCH_PAGE_DELTA:; dw 0           // current page's ON/OFF values - VANILLA_ON_OFF_ARRAY
 
     // @ Description
     // Custom item list image pointer - use free space
     constant CUSTOM_ITEM_IMAGE(0x80133474)
 
     // @ Description
-    // Custom item on/off value array - use free space
-    constant CUSTOM_ON_OFF_ARRAY(0x80133478)
+    // Custom item on/off value array (15 per page; the display always reads 15)
+    CUSTOM_ON_OFF_ARRAY:
+    fill 4 * ITEM_SWITCH_ROWS * (ITEM_SWITCH_PAGES - 1)
 
     // @ Description
     // Vanilla item on/off value array
@@ -974,6 +1008,16 @@ scope Item {
         sw      v0, 0x0000(at)                      // save pointer
         lli     at, 0x0001                          // at = 1 (display off)
         sw      at, 0x007C(v0)                      // initialize display off
+
+        jal     ExtraItems.item_switch_setup_       // extra items' name rows (appender extra_items/)
+        nop
+
+        // start on page 0
+        li      at, ITEM_SWITCH_PAGE
+        sw      r0, 0x0000(at)                      // page = 0
+        lli     t0, ITEM_SWITCH_ROWS
+        sw      t0, 0x0004(at)                      // rows = 15
+        sw      r0, 0x0008(at)                      // ON/OFF delta = 0 (vanilla values)
 
         lw      ra, 0x0004(sp)                      // restore ra
         addiu   sp, sp, 0x0030                      // deallocate stack space
@@ -1083,6 +1127,7 @@ scope Item {
             sw      a0, 0x000C(v0)                      // save mask
 
             _extended:
+            or      t9, at, r0                          // t9 = item frequency (at is reused by the loop below)
             // loop over custom item on/off values and update bitmask
             li      t6, EXTENDED_ENABLED_BITMASK        //
             lw      a0, 0x0000(t6)                      //
@@ -1095,7 +1140,7 @@ scope Item {
             nop                                         // otherwise, we just or it in
 
             // if here, then item is on
-            sb      at, 0x001C(v0)                      // save frequency
+            sb      t9, 0x001C(v0)                      // save frequency
             lw      t8, 0x000C(v0)                      // t8 = vanilla item bitmask
             ori     t8, t8, 0x000F                      // enable crates, barrels etc
             sw      t8, 0x000C(v0)                      // ~
@@ -1153,11 +1198,33 @@ scope Item {
 
             li      at, ITEM_SWITCH_PAGE
             lw      t0, 0x0000(at)                      // t0 = page
-            xori    t0, t0, 0x0001                      // t0 = 0 -> 1, 1 -> 0
+            addiu   t0, t0, 0x0001                      // next page...
+            sltiu   t1, t0, ITEM_SWITCH_PAGES
+            beqzl   t1, pc() + 8                        // ...or back to page 0
+            or      t0, r0, r0
             sw      t0, 0x0000(at)                      // update page
+            sw      a1, 0x0018(sp)                      // save row
 
             beqz    t0, _default                        // if on page 0 now, draw original stuff
             nop
+
+            // this page's ON/OFF values and item count
+            addiu   t1, t0, -0x0001                     // t1 = custom page index
+            lli     t2, ITEM_SWITCH_ROWS
+            multu   t1, t2
+            mflo    t2                                  // t2 = first custom item on this page
+            lli     t4, NUM_STANDARD_ITEMS
+            subu    t4, t4, t2                          // t4 = items left from here
+            sltiu   t3, t4, ITEM_SWITCH_ROWS + 1
+            beqzl   t3, pc() + 8
+            lli     t4, ITEM_SWITCH_ROWS                // t4 = items on this page (max 15)
+            sw      t4, 0x0004(at)                      // ITEM_SWITCH_PAGE_ROWS
+            sll     t2, t2, 2                           // t2 = offset of its first ON/OFF value
+            li      t3, CUSTOM_ON_OFF_ARRAY
+            addu    t3, t3, t2
+            li      t2, VANILLA_ON_OFF_ARRAY
+            subu    t3, t3, t2
+            sw      t3, 0x0008(at)                      // ITEM_SWITCH_PAGE_DELTA
 
             // hide vanilla item list image
             li      t0, Render.GROUP_TABLE
@@ -1166,38 +1233,55 @@ scope Item {
             lli     t1, 0x0001                          // t1 = 0x0001 (display off)
             sw      t1, 0x007C(t0)                      // hide
 
-            // show custom image list
+            // Remix's custom item list image: page 1 only
+            li      at, ITEM_SWITCH_PAGE
+            lw      a0, 0x0000(at)                      // a0 = page
+            xori    t1, a0, 0x0001
+            sltu    t1, r0, t1                          // t1 = 0 (show) on page 1, else 1 (hide)
             li      at, CUSTOM_ITEM_IMAGE
             lw      at, 0x0000(at)                      // at = custom item image object
-            sw      r0, 0x007C(at)                      // show
-
-            // hide unneeded ON/OFF images
-            li      t0, 0x801333E4                      // t0 = address of pointer to first ON/OFF object
-            addiu   t2, t0, NUM_STANDARD_ITEMS * 4               // t2 = address of pointer to first ON/OFF object that should be hidden
-            _loop:
-            lw      t3, 0x0000(t2)                      // t3 = ON/OFF object to hide
-            sw      t1, 0x007C(t3)                      // hide ON/OFF object
-            addiu   t2, t2, 0x0004                      // t2 = address of pointer to next ON/OFF object to hide
-            lbu     t3, 0x0000(t2)                      // t3 = 0 if we're at the values, 0x80 otherwise
-            bnez    t3, _loop                           // loop while there is a next ON/OFF object
+            sw      t1, 0x007C(at)
+            jal     ExtraItems.item_switch_display_     // extra items' rows on this page (a0 = page)
             nop
 
+            // ON/OFF images: shown for this page's items, hidden for the empty rows
+            li      t4, ITEM_SWITCH_PAGE_ROWS
+            lw      t4, 0x0000(t4)                      // t4 = items on this page
+            li      t0, 0x801333E4                      // t0 = address of pointer to first ON/OFF object
+            lli     t2, 0x0000                          // t2 = row index
+            _loop:
+            lw      t3, 0x0000(t0)                      // t3 = ON/OFF object
+            sltu    t1, t2, t4                          // t1 = 1 if this row has an item
+            xori    t1, t1, 0x0001                      // t1 = 0 (show) / 1 (hide)
+            sw      t1, 0x007C(t3)
+            addiu   t2, t2, 0x0001
+            sltiu   t1, t2, ITEM_SWITCH_ROWS
+            bnez    t1, _loop
+            addiu   t0, t0, 0x0004                      // next ON/OFF object
+
             // ensure cursor is not past last row
-            sltiu   t1, a1, NUM_STANDARD_ITEMS + 1               // t1 = 1 if valid row
-            beqzl   t1, pc() + 8                        // if not a valid row, set to last row
-            lli     a1, NUM_STANDARD_ITEMS
+            lw      a1, 0x0018(sp)                      // a1 = row
+            sltu    t1, t4, a1                          // t1 = 1 if past this page's last item
+            bnezl   t1, pc() + 8
+            or      a1, t4, r0                          // last row
             lui     t1, 0x8013
             sw      a1, 0x33D8(t1)                      // update row
 
             // initialize ON/OFF display
-            li      a0, CUSTOM_ON_OFF_ARRAY             // a0 = address of first on/off value
+            li      a0, VANILLA_ON_OFF_ARRAY
+            li      t0, ITEM_SWITCH_PAGE_DELTA
+            lw      t0, 0x0000(t0)
             jal     initialize_on_off_display_
-            nop
+            addu    a0, a0, t0                          // a0 = this page's first on/off value
 
             b       _end
             nop
 
             _default:
+            lli     t1, ITEM_SWITCH_ROWS
+            sw      t1, 0x0004(at)                      // ITEM_SWITCH_PAGE_ROWS = 15
+            sw      r0, 0x0008(at)                      // ITEM_SWITCH_PAGE_DELTA = 0
+
             // show all vanilla images
             lli     a0, 0x0003                          // a0 = group 3
             jal     Render.toggle_group_display_
@@ -1208,6 +1292,8 @@ scope Item {
             lw      at, 0x0000(at)                      // at = custom item image object
             lli     v0, 0x0001                          // v0 = 1 (display off)
             sw      v0, 0x007C(at)                      // hide
+            jal     ExtraItems.item_switch_display_     // hide the extra items' rows
+            or      a0, r0, r0                          // a0 = page 0
 
             // initialize ON/OFF display
             li      a0, 0x80133424                      // a0 = address of first on/off value
@@ -1253,10 +1339,12 @@ scope Item {
             jal     0x800269C0
             addiu   a0, r0, FGM.menu.TOGGLE
 
-            // refresh list
-            li      a0, VANILLA_ON_OFF_ARRAY            // a0 = address of first on/off value
+            // refresh list (this page's values)
+            li      a0, VANILLA_ON_OFF_ARRAY
+            li      t0, ITEM_SWITCH_PAGE_DELTA
+            lw      t0, 0x0000(t0)
             jal     initialize_on_off_display_
-            nop
+            addu    a0, a0, t0                          // a0 = this page's first on/off value
 
             _return:
             lw      ra, 0x0014(sp)                      // original line 1
@@ -1311,21 +1399,16 @@ scope Item {
             lui     t8, 0x8013                          // original line 2
             OS.patch_end()
 
+            // last row = items on this page (15 on page 0 = original line 1)
             _up:
-            li      t8, ITEM_SWITCH_PAGE
-            lw      t8, 0x0000(t8)                      // t8 = page
-            beqzl   t8, _return                         // if normal list, use original line
-            addiu   t8, r0, 0x000F                      // original line 1
-            b       _return                             // otherwise use the number of custom items
-            addiu   t8, r0, NUM_STANDARD_ITEMS                   // set max NUM_STANDARD_ITEMS
+            li      t8, ITEM_SWITCH_PAGE_ROWS
+            b       _return
+            lw      t8, 0x0000(t8)                      // t8 = last row
 
             _down:
-            li      at, ITEM_SWITCH_PAGE
-            lw      at, 0x0000(at)                      // at = page
-            beqzl   at, _return                         // if normal list, use original line
-            addiu   at, r0, 0x000F                      // original line 1
-            b       _return                             // otherwise use the number of custom items
-            addiu   at, r0, NUM_STANDARD_ITEMS                   // set max NUM_STANDARD_ITEMS
+            li      at, ITEM_SWITCH_PAGE_ROWS
+            b       _return
+            lw      at, 0x0000(at)                      // at = last row
 
             _return:
             jr      ra
@@ -1365,37 +1448,33 @@ scope Item {
             OS.patch_end()
 
             _off:
-            li      t4, ITEM_SWITCH_PAGE
-            lw      t4, 0x0000(t4)                      // t4 = page
-            bnezl   t4, pc() + 8                        // if not page 0, then adjust to store in free space
-            addiu   t5, t5, CUSTOM_ON_OFF_ARRAY - VANILLA_ON_OFF_ARRAY
+            li      t4, ITEM_SWITCH_PAGE_DELTA
+            lw      t4, 0x0000(t4)                      // t4 = this page's values - vanilla values
+            addu    t5, t5, t4
 
             jr      ra
             addu    at, at, t5                          // original line 2
 
             _on:
-            li      t6, ITEM_SWITCH_PAGE
-            lw      t6, 0x0000(t6)                      // t6 = page
-            bnezl   t6, pc() + 8                        // if not page 0, then adjust to store in free space
-            addiu   t4, t4, CUSTOM_ON_OFF_ARRAY - VANILLA_ON_OFF_ARRAY
+            li      t6, ITEM_SWITCH_PAGE_DELTA
+            lw      t6, 0x0000(t6)                      // t6 = this page's values - vanilla values
+            addu    t4, t4, t6
 
             jr      ra
             addu    at, at, t4                          // original line 2
 
             _precheck:
-            li      t6, ITEM_SWITCH_PAGE
-            lw      t6, 0x0000(t6)                      // t6 = page
-            bnezl   t6, pc() + 8                        // if not page 0, then adjust to store in free space
-            addiu   t3, t3, CUSTOM_ON_OFF_ARRAY - VANILLA_ON_OFF_ARRAY
+            li      t6, ITEM_SWITCH_PAGE_DELTA
+            lw      t6, 0x0000(t6)                      // t6 = this page's values - vanilla values
+            addu    t3, t3, t6
 
             jr      ra
             lw      t3, 0x3420(t3)                      // original line 2
 
             _a_button:
-            li      t6, ITEM_SWITCH_PAGE
-            lw      t6, 0x0000(t6)                      // t6 = page
-            bnezl   t6, pc() + 8                        // if not page 0, then adjust to store in free space
-            addiu   t3, t3, CUSTOM_ON_OFF_ARRAY - VANILLA_ON_OFF_ARRAY
+            li      t6, ITEM_SWITCH_PAGE_DELTA
+            lw      t6, 0x0000(t6)                      // t6 = this page's values - vanilla values
+            addu    t3, t3, t6
 
             jr      ra
             addu    v1, t3, t5                          // original line 2

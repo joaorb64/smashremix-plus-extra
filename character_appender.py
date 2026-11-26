@@ -19,6 +19,7 @@ from smashremix_extra.character.processor import CharacterProcessor
 from smashremix_extra.character.bio_overflow import apply_bio_overflow_patches, write_bio_overflow_asm
 from smashremix_extra.stage.processor import StageProcessor
 from smashremix_extra.extra_import.processor import ExtraImportProcessor, EXTRA_IMPORTS_ASM
+from smashremix_extra.item.processor import ItemProcessor, EXTRA_ITEMS_ASM
 from smashremix_extra.audio.processor import AudioProcessor
 from smashremix_extra.injector import ROMInjector, MODIFIED_FILES
 
@@ -138,6 +139,11 @@ class CharacterAppender:
         self.stage_proc = StageProcessor()
         self.import_proc = ExtraImportProcessor()
 
+        # Remix's own standard items (extra items are numbered after them)
+        with open(os.path.join(smashremix_path, "src/Item.asm"), encoding="utf-8") as f:
+            m = re.search(r"constant NUM_STANDARD_ITEMS\((\d+)\)", f.read())
+        self.item_proc = ItemProcessor(remix_standard_items=int(m.group(1)))
+
         # Delete the build folder if it exists and create a new one
         if os.path.exists("build"):
             shutil.rmtree("build")
@@ -194,9 +200,14 @@ class CharacterAppender:
         for stage_folder in self.stage_folders:
             self._process_stage(stage_folder)
 
-        # Extra imports' files and sounds (extra_imports/<Name>/config.yaml).
+        # Extra items (extra_items/<Name>/): files, sounds, name images.
         # Their sound ids continue after the stage sounds.
-        self.import_proc.LAST_SFX_ID = self.stage_proc.LAST_SFX_ID
+        self.item_proc.LAST_SFX_ID = self.stage_proc.LAST_SFX_ID
+        self.item_proc.process_all()
+
+        # Extra imports' files and sounds (extra_imports/<Name>/config.yaml).
+        # Their sound ids continue after the extra items' sounds.
+        self.import_proc.LAST_SFX_ID = self.item_proc.LAST_SFX_ID
         self.import_proc.process_all()
 
     def _process_character(self, character_folder):
@@ -778,7 +789,7 @@ class CharacterAppender:
             filepath="src/FGM.asm",
             line="\t"+"\n\t".join(
                 self.char_proc.sound_add_list + self.stage_proc.sound_add_list +
-                self.import_proc.sound_add_list),
+                self.item_proc.sound_add_list + self.import_proc.sound_add_list),
             inserter=lineinfile.AfterLast(
                 r"^\s*(add_sound|add_fgm|add_sound_advanced)\(.*")
         )
@@ -1262,6 +1273,61 @@ class CharacterAppender:
         with open("src/Toggles.asm", 'w', encoding='utf-8') as f:
             f.write(toggles)
 
+    def _patch_extra_items(self):
+        """Registers extra_items/ as standard items right after Remix's own:
+        item code, add_item, item counts, default ON bits, spawn rates."""
+        items = self.item_proc.items
+        if not items:
+            return
+        remix_n = self.item_proc.remix_standard_items
+
+        with open("src/Item.asm", encoding="utf-8") as f:
+            item_asm = f.read()
+
+        item_asm, n = re.subn(r"constant NUM_STANDARD_ITEMS\((\d+)\)",
+                              f"constant NUM_STANDARD_ITEMS({remix_n + len(items)})", item_asm, count=1)
+        assert n == 1, "Item.asm: NUM_STANDARD_ITEMS not found"
+
+        # Item switch ON by default. Custom item j (0 = 0x2D) is bit 0x14 + j of the
+        # vanilla mask while that fits in 32 bits (Item.MAX_NUM_STANDARD_ITEMS),
+        # then bit j - MAX_NUM_STANDARD_ITEMS of the extended mask.
+        max_std = int(re.search(r"constant MAX_NUM_STANDARD_ITEMS\((\d+)\)", item_asm).group(1))
+        m = re.search(r"constant EXTENDED_ENABLED_BITMASK_DEFAULT\((0x[0-9A-Fa-f]+|\d+)\)", item_asm)
+        default = int(m.group(1), 0)
+        for j in range(remix_n, remix_n + len(items)):
+            if j >= max_std:
+                default |= 1 << (j - max_std)
+            else:
+                raise ValueError("extra item would land in the vanilla item bitmask (not supported)")
+        item_asm = item_asm[:m.start(1)] + f"0x{default:08X}" + item_asm[m.end(1):]
+
+        # Item code (inside scope Item), before the add_item list
+        marker = re.search(r"^\s*print \"=+ ITEMS =+", item_asm, re.M)
+        includes = "    // Extra items (extra_items/)\n" + "\n".join(self.item_proc.item_includes()) + "\n\n"
+        item_asm = item_asm[:marker.start()] + "\n" + includes + item_asm[marker.start():]
+
+        # add_item right after the last Remix standard item (ids stay contiguous)
+        m = re.search(r"^\s*add_item\(Stopwatch\).*$", item_asm, re.M)
+        if not m:
+            raise RuntimeError("Item.asm: add_item(Stopwatch) (last standard item) not found")
+        adds = "".join(f"\n    add_item({it['name']})          // extra item" for it in items)
+        item_asm = item_asm[:m.end()] + adds + item_asm[m.end():]
+
+        with open("src/Item.asm", "w", encoding="utf-8") as f:
+            f.write(item_asm)
+
+        # Stages.asm: spawn rate on every stage (the per-stage macro writes the
+        # standard items' rates in order)
+        with open("src/Stages.asm", encoding="utf-8") as f:
+            stages = f.read()
+        m = re.search(r"^(\s*)db\s+default_item_rate\s*// stopwatch.*$", stages, re.M)
+        if not m:
+            raise RuntimeError("Stages.asm: stopwatch rate line not found")
+        rates = "".join(f"\n{m.group(1)}db     {it['rate']}        // {it['name']} (extra item)" for it in items)
+        stages = stages[:m.end()] + rates + stages[m.end():]
+        with open("src/Stages.asm", "w", encoding="utf-8") as f:
+            f.write(stages)
+
     def _patch_stage_asm(self):
         # Item.asm
         num_items = 0
@@ -1276,9 +1342,11 @@ class CharacterAppender:
 
         lineinfile.add_line_to_file(
             filepath="src/Item.asm",
-            line=f'\tconstant NUM_ITEMS({num_items}+{self.char_proc.items_added}+{len(self.stage_proc.item_add_list)})',
+            line=f'\tconstant NUM_ITEMS({num_items}+{self.char_proc.items_added}+{len(self.stage_proc.item_add_list)}+{len(self.item_proc.items)})',
             regexp=r'.*constant NUM_ITEMS\(.*\)'
         )
+
+        self._patch_extra_items()
 
         # Stage-registered custom items: splice the add_item(...) calls in after
         # the last one in src/Item.asm (inside scope Item, where the macro and
@@ -1710,7 +1778,7 @@ class CharacterAppender:
         # Insert extra imports in main asm before characters start (before "// METAL MARIO").
         # An import with a data folder (extra_imports/<Name>/config.yaml) gets its
         # generated FILES/FGM scope included right before it.
-        extra_import_includes = [f'include "{EXTRA_IMPORTS_ASM}"']
+        extra_import_includes = [f'include "{EXTRA_IMPORTS_ASM}"', f'include "{EXTRA_ITEMS_ASM}"']
         for ei, ei_folder in ExtraImportProcessor.list_imports().items():
             if ei in self.import_proc.generated:
                 extra_import_includes.append(
@@ -1733,7 +1801,8 @@ class CharacterAppender:
                 raise RuntimeError(f"Render.asm: battle setup label {label} not found")
             render = render.replace(
                 anchor,
-                anchor + "        jal     ExtraImports.load_files_ // load extra imports' files\n        nop\n", 1)
+                anchor + "        jal     ExtraImports.load_files_ // load extra imports' files\n        nop\n"
+                "        jal     ExtraItems.load_files_ // load extra items' files\n        nop\n", 1)
         with open("src/Render.asm", 'w', encoding='utf-8') as f:
             f.write(render)
 

@@ -89,9 +89,12 @@ class ExtraImportProcessor:
                 self.process(name, folder)
         self._write_extra_imports_asm()
 
-    def process(self, name, folder="./extra_imports"):
+    def process(self, name, folder="./extra_imports", output_root="build/extra_imports",
+                file_prefix="extra_import", wrap_scope=True):
+        """wrap_scope=False leaves out the outer `scope <Name> { }` of generated.asm
+        (extra items include it inside their own scope)."""
         original_path = f"{folder}/{name}"
-        output_path = f"build/extra_imports/{name}"
+        output_path = f"{output_root}/{name}"
         config = yaml.safe_load(open(f"{original_path}/config.yaml", encoding="utf-8")) or {}
 
         shutil.copytree(original_path, output_path, dirs_exist_ok=True)
@@ -114,7 +117,7 @@ class ExtraImportProcessor:
             has_reqlist = os.path.exists(f"{original_path}/{fname}_reqlist.txt")
             import_file = FileManager.add_file(
                 path=f"{output_path}/{fname}.bin",
-                name=f"extra_import_{name}_file_{fname}",
+                name=f"{file_prefix}_{name}_file_{fname}",
                 internal_file_table_offset=tbl_off,
                 internal_file_resource_offset=res_off,
                 reqlist_path=f"{output_path}/{fname}_reqlist.txt" if has_reqlist else None,
@@ -146,7 +149,7 @@ class ExtraImportProcessor:
                     for dep_name, dep_id in imported_file_ids.items():
                         line = line.replace(
                             "${" + dep_name.upper() + "}",
-                            f"{dep_id:04X} extra_import_{name}_file_{dep_name}")
+                            f"{dep_id:04X} {file_prefix}_{name}_file_{dep_name}")
                     f.write(line)
 
         sounds = config.get("sounds", {}) or {}
@@ -181,7 +184,7 @@ class ExtraImportProcessor:
                 f.write(bundled)
             texture_file = FileManager.add_file(
                 path=f"{output_path}/textures.bin",
-                name=f"extra_import_{name}_textures",
+                name=f"{file_prefix}_{name}_textures",
                 internal_file_table_offset="3FFFC",               # no pointers to relocate
                 internal_file_resource_offset="3FFFC",
                 compression_level=1
@@ -211,8 +214,9 @@ class ExtraImportProcessor:
         loader += ["        OS.routine_end(0x20)",
                    "    }"]
 
-        blocks = ["// Auto-generated from config.yaml files: / sounds: / textures: (do not edit)",
-                  f"scope {name} {{"]
+        blocks = ["// Auto-generated from config.yaml files: / sounds: / textures: (do not edit)"]
+        if wrap_scope:
+            blocks.append(f"scope {name} {{")
         if file_blocks:
             blocks.append("    scope FILES {\n" + "\n".join(file_blocks) + "\n    }")
         if fgm_constants:
@@ -220,7 +224,8 @@ class ExtraImportProcessor:
         if texture_blocks:
             blocks.append("    scope TEXTURES {\n" + "\n".join(texture_blocks) + "\n    }")
         blocks.append("\n".join(loader))
-        blocks.append("}")
+        if wrap_scope:
+            blocks.append("}")
 
         with open(f"{output_path}/generated.asm", "w", encoding="utf-8") as f:
             f.write("\n".join(blocks) + "\n")
