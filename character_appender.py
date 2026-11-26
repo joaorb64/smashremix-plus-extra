@@ -794,6 +794,25 @@ class CharacterAppender:
                 r"^\s*(add_sound|add_fgm|add_sound_advanced)\(.*")
         )
 
+        # FGM.asm - keep the ADPCM codebooks 8-byte aligned in RAM. write_sounds()
+        # moves vanilla predictor blocks + appends the new ones into the RAM
+        # segment wherever the code before it ends; the RSP loads a book with
+        # aLoadADPCM (DMA, low 3 address bits ignored on real HW / ares), so a
+        # book at addr%8 == 4 is read 4 bytes early -> wrong coefficients ->
+        # every such SFX crackles in ares (HLE mupen reads the exact address).
+        # Moved blocks keep their offset-within-CTL alignment; new blocks are
+        # 0xA8 each with the book at +0, so start them 16-aligned.
+        lineinfile.add_line_to_file(
+            filepath="src/FGM.asm",
+            line="\t\tfill ((PREDICTORS - CTL_TABLE) - (pc() - CTL_TABLE_PC)) & 0xF, 0x00 // Extra: book alignment",
+            inserter=lineinfile.BeforeFirst(r"^\s*predictors_moved:")
+        )
+        lineinfile.add_line_to_file(
+            filepath="src/FGM.asm",
+            line="\t\tfill (0 - pc()) & 0xF, 0x00 // Extra: book alignment",
+            inserter=lineinfile.BeforeFirst(r"^\s*predictors_extended:")
+        )
+
         # resultsscreen.asm
         lineinfile.add_line_to_file(
             filepath="src/resultsscreen.asm",

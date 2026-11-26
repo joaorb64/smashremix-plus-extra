@@ -1,7 +1,7 @@
 import os
 from typing import Callable, Optional
 
-from SSB import N64, NALEnum, ReplaceData, SSBtbl, FinishROM, process
+from SSB import N64, NALE, NALEnum, ReplaceData, SSBtbl, FinishROM, fetch, process
 from .vpk0 import compress as vpk0_compress
 from .file_appender import pad_rom_file
 
@@ -143,6 +143,21 @@ class ROMInjector:
             )
 
         new_tbl = self.entries.tobytes()
+
+        # ReplaceData shifts everything after the file table (sound banks
+        # .ctl/.tbl, sequences, ...) by len(new_tbl) - old_size. tobytes() only
+        # pads to 2 bytes, so that shift used to leave the audio data
+        # misaligned (e.g. CTL at ...BC6). The RSP ignores the low 3 bits of
+        # DMA addresses on real hardware / ares, so ADPCM books, loop state and
+        # samples were fetched from the wrong place -> crackling SFX (HLE
+        # emulators like mupen read exact addresses and hid it). Pad so the
+        # shift is a multiple of 16 and every following asset keeps the
+        # alignment it had in the base ROM.
+        s = fetch(self.n64, NALE[0][1][0])
+        e = fetch(self.n64, NALE[1][1][0])
+        dz = len(new_tbl) - (e - s)
+        if dz % 0x10:
+            new_tbl += bytes(0x10 - dz % 0x10)
 
         # Calculate minimum ROM size needed for all entries + file table
         # This mimics SSBFileInjector.cpp lines 1009-1027

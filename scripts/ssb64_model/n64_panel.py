@@ -893,7 +893,8 @@ def decode_cc(w0, w1):
 RENDER_MODES = {0xC4112078: 'opaque (the game\'s)', 0xC41049D8: 'translucent, alpha blended (the game\'s cloak)',
                 0xC4113078: 'cut-out (texture edge)', 0xC4113878: 'cut-out (texture edge, GE)',
                 0x00504130: 'translucent, no fog', 0x00503878: 'translucent glow, no fog',
-                0x441049D8: 'translucent (blend with fog color)'}
+                0x441049D8: 'translucent (blend with fog color)',
+                0x0C1849D8: 'translucent, no fog (2-cycle: fighters)', 0x0C192078: 'opaque, no fog (2-cycle: fighters)'}
 STATE_PRESETS = [
     # id, label, description, commands
     ('PRIM', 'Prim Color', 'Primitive color: what PRIM means in the combiner (tints, flat colors)',
@@ -914,6 +915,15 @@ STATE_PRESETS = [
      'to the prim color (bright), alpha from the texture x prim alpha (glows, trails)',
      [encode_cc(('PRIM', 'ENV', 'TEXEL0', 'ENV'), ('TEXEL0', '0', 'PRIM', '0'),
                 ('PRIM', 'ENV', 'TEXEL0', 'ENV'), ('TEXEL0', '0', 'PRIM', '0'))]),
+    ('CC_GRADIENT_2C', 'Combiner: Env to Prim by Texture (fighter)', 'Same as Env to Prim by Texture, for '
+     'fighters (drawn in 2-cycle mode): the second cycle passes the first through (a second TEXEL0 reads '
+     'the next tile on hardware / accurate emulators)',
+     [encode_cc(('PRIM', 'ENV', 'TEXEL0', 'ENV'), ('TEXEL0', '0', 'PRIM', '0'),
+                ('0', '0', '0', 'COMBINED'), ('0', '0', '0', 'COMBINED'))]),
+    ('CC_TEX_NOENV_2C', 'Combiner: Texture x Shade, no Env (fighter)', 'Texture x shade without the game\'s '
+     'env color (stage light / flash colors), for fighters (2-cycle mode)',
+     [encode_cc(('TEXEL0', '0', 'SHADE', '0'), ('0', '0', '0', 'TEXEL0'),
+                ('0', '0', '0', 'COMBINED'), ('0', '0', '0', 'COMBINED'))]),
     ('RM_XLU', 'Render Mode: Translucent', 'Alpha blended (the cloaking device then can\'t fade it: drawn last)',
      [(0xE200001C, 0xC41049D8)]),
     ('RM_NOFOG', 'Render Mode: Translucent, No Fog', 'Alpha blended, ignores the game\'s fog / flash colors',
@@ -1182,9 +1192,16 @@ RENDER_MODE_OPTIONS = [
     ('CUTOUT', 'Cut-out', 'Transparent pixels not drawn, hard edges (the build makes it cloaking-safe)', 0xC4113078),
     ('XLU', 'Translucent', 'Alpha blended, with the game\'s fog / flash colors (the cloaking device can\'t fade it)',
      0xC41049D8),
-    ('XLU_NOFOG', 'Translucent, No Fog', 'Alpha blended, ignores the game\'s fog / flash colors (effects)', 0x00504130),
-    ('GLOW', 'Glow', 'Alpha blended, no fog, depth tested but not written (trails, glows)', 0x00503878),
+    ('XLU_NOFOG', 'Translucent, No Fog', 'Alpha blended, ignores the game\'s fog / flash colors (effects; '
+     '1-cycle: on fighters use Translucent, No Fog (fighter))', 0x00504130),
+    ('GLOW', 'Glow', 'Alpha blended, no fog, depth tested but not written (trails, glows; 1-cycle: on fighters '
+     'use Translucent, No Fog (fighter))', 0x00503878),
     ('XLU_FOGCOLOR', 'Translucent over Fog Color', 'Alpha blended against the fog color (flashes)', 0x441049D8),
+    ('XLU_NOFOG_2C', 'Translucent, No Fog (fighter)', 'Alpha blended, ignores the game\'s fog / flash colors, '
+     'for fighters (drawn in 2-cycle mode: the 1-cycle Translucent / Glow modes blend twice there on hardware '
+     'and accurate emulators, too transparent)', 0x0C1849D8),
+    ('OPAQUE_NOFOG_2C', 'Opaque, No Fog (fighter)', 'Opaque, ignores the game\'s fog / flash colors (effects '
+     'on fighters: no stopwatch / hit flash tint)', 0x0C192078),
     ('CUSTOM', 'Custom', 'A render mode value of its own (edit it in the command list)', -1),
 ]
 COMBINER_OPTIONS = [('MODEL', 'Model Default', 'No combiner of its own: texture x shade (the model\'s)', None)] + [
