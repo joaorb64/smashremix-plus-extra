@@ -193,11 +193,36 @@ scope Freeze {
     }
 
     // @ Description
+    // Fighter struct buffer (sFTManagerStructsAllocBuf) the entries belong to. It's allocated from the
+    // heap every battle, so its address depends on what was loaded before it (the stage's files...).
+    // Entries are keyed by fighter struct, so the ones from an earlier battle at another address would
+    // never be freed, and once all NUM_ENTRIES were taken nobody could be frozen anymore.
+    constant STRUCTS_ALLOC_BUF(0x80130D84)
+    entries_alloc_buf:
+    dw 0
+
+    // @ Description
     // Clears the freeze info entry of a fighter. Called when a fighter is spawned.
+    // Clears all entries first if the fighter structs were allocated again (a new battle).
     // @ Arguments
     // a0 - fighter object
     scope reset_entry_: {
         lw      a0, 0x0084(a0)              // a0 = fighter struct
+
+        OS.read_word(STRUCTS_ALLOC_BUF, t1) // t1 = current fighter struct buffer
+        li      t3, entries_alloc_buf
+        lw      t2, 0x0000(t3)              // t2 = buffer the entries belong to
+        beq     t1, t2, _free_own           // same battle: only free this fighter's entry
+        sw      t1, 0x0000(t3)              // entries now belong to the current buffer
+        li      v0, entries
+        lli     t0, NUM_ENTRIES
+        _clear_all:
+        sw      r0, 0x0000(v0)              // free entry
+        addiu   t0, t0, -0x0001
+        bnez    t0, _clear_all
+        addiu   v0, v0, ENTRY_SIZE
+
+        _free_own:
         li      v0, entries
         lli     t0, NUM_ENTRIES
 
@@ -1025,7 +1050,7 @@ scope Freeze {
 
     // @ Description
     // Frozen fighters don't push other fighters either: treat them as airborne in the jostle check
-    // (ftMainProcUpdateInterrupt, which also has DualFighter's skip_sister_jostle hook just before this)
+    // (ftMainProcUpdateInterrupts calls this before the jostle check, so it can skip the rest of the routine)
     scope jostle_skip_frozen_: {
         OS.patch_start(0x5D28C, 0x800E1A8C)
         j       jostle_skip_frozen_
