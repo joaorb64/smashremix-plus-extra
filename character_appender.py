@@ -1,5 +1,7 @@
 import lineinfile
 import os
+import platform
+import subprocess
 import sys
 import shutil
 import yaml
@@ -44,9 +46,15 @@ class CharacterAppender:
             original_xdelta = os.path.join(smashremix_path, "original.xdelta")
             original_z64 = os.path.join(
                 smashremix_path, "roms", "original.z64")
-            result = run_windows_command(
-                f'{xdelta_exe} -d -f -s {ssb_rom} {original_xdelta} {original_z64}'
-            )
+            native_xdelta = shutil.which("xdelta3") if platform.system() != "Windows" else None
+            if native_xdelta:
+                result = subprocess.run(
+                    [native_xdelta, "-d", "-f", "-s", ssb_rom, original_xdelta, original_z64],
+                    capture_output=True, text=True)
+            else:
+                result = run_windows_command(
+                    f'{xdelta_exe} -d -f -s {ssb_rom} {original_xdelta} {original_z64}'
+                )
             if result.returncode != 0:
                 print(result.stderr)
             print("OK")

@@ -15,7 +15,7 @@ For Android, best emulator would be [Mupen64Plus-AE NIGHTLY BUILD](https://githu
 ## Prerequisites For Building Your Own Build
 - Windows: [Python 3.12+](https://www.python.org/downloads/latest/pymanager), pipenv
   - pipenv gets installed automatically by build.bat - to install manually, run `python -m pip install pipenv` in a terminal
-- Linux: Python 3.12+, pipenv, wine
+- Linux: Python 3.12+, pipenv, xdelta3 (wine is only needed on non-x86-64 hosts without a native `bass`)
 
 ## Setting Up Your Own Build
 - Clone the repository using `git clone --recursive` (note the recursive here for it to clone the original smashremix repo as a submodule)
@@ -30,7 +30,7 @@ For Android, best emulator would be [Mupen64Plus-AE NIGHTLY BUILD](https://githu
 - **Windows: `build.bat`**
   - Manual build: `python -m pipenv run character_appender.py && patch_extra.bat`
 - **Linux:**
-  - `pipenv run python3 character_appender.py && wine patch_extra.bat`
+  - `pipenv run bash build.sh` (native `bass` from `tools/linux-x86_64/`, CRC via `scripts/n64crc.py`)
 
 The build consists of two parts:
 - Running `character_appender.py` which does all the magic and generates a `smashremix/roms/original_extra.z64`. This is an extension of the `/roms/original.z64` file with extra content. It also prepares the `src/` and `build/` directories

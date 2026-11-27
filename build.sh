@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python3 "$SCRIPT_DIR/character_appender.py" "$@"
 
 # A native bass is used when there is one ($BASS, the one bundled in tools/linux-x86_64/ or bass in PATH);
-# otherwise the bundled bass.exe runs through wine (patch_extra.bat).
+# otherwise the bundled bass.exe runs through wine (patch_extra.bat). The CRC fix is native (scripts/n64crc.py).
 BASS="${BASS:-}"
 if [ -z "$BASS" ] && [ "$(uname -s)" = "Linux" ]; then
     for candidate in "$SCRIPT_DIR/tools/linux-x86_64/bass" "$(command -v bass || true)"; do
@@ -37,15 +37,11 @@ if ! "$BASS" -o "$ROM" main.asm -sym logfile.log > "$LOG" 2>&1; then
 fi
 echo "BUILD SUCCESS"
 
-# The CRC update is a separate (Windows) tool
-if command -v wine > /dev/null 2>&1; then
-    if ! wine "$ASM/rn64crc.exe" -u "$ROM" >> "$LOG" 2>&1; then
-        echo "CRC UPDATE FAILED"
-        cat "$LOG"
-        exit 1
-    fi
-else
-    echo "wine not found: the ROM's CRC was not updated (rn64crc.exe)" >&2
+# CRC update (native replacement for rn64crc.exe)
+if ! python3 "$SCRIPT_DIR/scripts/n64crc.py" -u "$ROM" >> "$LOG" 2>&1; then
+    echo "CRC UPDATE FAILED"
+    cat "$LOG"
+    exit 1
 fi
 
 echo "Build log exported to \"$LOG\""
