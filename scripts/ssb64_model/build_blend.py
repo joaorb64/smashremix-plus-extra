@@ -45,6 +45,7 @@ scene = bpy.context.scene
 # textures upside down from the game's rows (upright to edit), V to match: Blender's v = t / h
 # (n64_panel.update_view wraps / offsets in it directly)
 scene['n64_tex_flip_v'] = bool(man.get('tex_flip_v'))
+scene['n64_hw_color'] = True      # shaders on stored values, shown Raw: the RDP's blending (n64_panel.hw_colors)
 scene.render.fps = 60          # the game's frame rate; before the glTF import, which turns the
                                # animations' seconds into frames at the scene's rate
 try:     # bone tails toward the child joints (the default keeps each joint's own axes: bones
@@ -422,6 +423,16 @@ if parts or not IS_STAGE:
     c_parts = coll('Model parts', hide=True)
     for o in parts:
         move(o, c_parts)
+    # a sprite model's frames (its display list table): each frame object keeps its name
+    # (frames.asm's FRAME_<name>), so it follows the frame when frames are added / moved
+    _ft = (man.get('object') or {}).get('frame_table')
+    if _ft:
+        for o in parts:
+            _m = re.match(r'part(\d+)_(hi|lo)_j(\d+)$', o.name)
+            if _m and int(_m.group(3)) == _ft['joint']:
+                _k = int(_m.group(1))
+                _names = _ft.get('names') or []
+                o['n64_frame'] = (_names[_k] if _k < len(_names) and _names[_k] else f'F{_k}')
 if skel:
     c_skel = coll('Electric skeleton', hide=True)
     for o in skel:
@@ -623,7 +634,7 @@ if IS_STAGE and len(layer_colls) > 1:
     tree.links.new(prev, out_socket)
 
 # colors as stored (no filmic / AgX look)
-scene.view_settings.view_transform = 'Standard'
+scene.view_settings.view_transform = 'Raw' if scene.get('n64_hw_color') else 'Standard'
 scene.view_settings.look = 'None'
 
 # no specular shine (the game has none), texture colors in the solid view, and a far
@@ -654,14 +665,15 @@ for engine in ('BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE'):      # (4.2 - 4.x / 5.x)
         pass
 if scene.world is None:
     scene.world = bpy.data.worlds.new('N64 Background')
-scene.world.color = (0.045, 0.045, 0.045)
+WORLD_GRAY = tuple(PANEL.view_from_linear((0.045, 0.045, 0.045)))   # (same gray in hardware colors)
+scene.world.color = WORLD_GRAY
 try:
     scene.world.use_nodes = False
 except (AttributeError, TypeError):
     pass
 bg = next((n for n in (scene.world.node_tree.nodes if scene.world.node_tree else []) if n.type == 'BACKGROUND'), None)
 if bg is not None:                            # (Blender 5: worlds always use their nodes)
-    bg.inputs['Color'].default_value = (0.045, 0.045, 0.045, 1.0)
+    bg.inputs['Color'].default_value = (*WORLD_GRAY, 1.0)
     bg.inputs['Strength'].default_value = 1.0
 for attr, value in (('use_shadows', False), ('use_raytracing', False), ('use_gtao', False),
                     ('use_bloom', False), ('use_ssr', False), ('use_volumetric_shadows', False)):

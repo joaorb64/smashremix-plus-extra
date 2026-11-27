@@ -934,7 +934,8 @@ class Exporter:
                         continue
                     lst = MF.pointer_run(f.char_int, part['mobjsubs']) if part['mobjsubs'] is not None else []
                     try:
-                        geo, _ = MF.decode_model(f, self.joints, {joint: lst}, [(joint, part['dl'])])
+                        geo, _ = MF.decode_model(f, self.joints, {joint: lst}, [(joint, part['dl'])],
+                                                 carry_state=bool(getattr(f, 'object', None)))
                     except MF.BadDL as err:
                         print(f'  note: joint {joint} part {v} {detail}: {err}; not exported (kept as is)')
                         continue

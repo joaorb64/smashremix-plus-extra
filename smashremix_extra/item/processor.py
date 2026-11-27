@@ -6,6 +6,11 @@ Each folder has:
   Item.add_item(item) reads: SPAWN_ITEM, SHOW_GFX_WHEN_SPAWNED, PICKUP_ITEM_MAIN,
   PICKUP_ITEM_INIT, DROP_ITEM, THROW_ITEM, PLAYER_COLLISION, item_info_array,
   ITEM_INFO_ARRAY_ORIGIN).
+- optional <Sub>/<Sub>.asm sub-parts (e.g. one folder per thing the item summons),
+  included after <Name>.asm in folder order, then optional end.asm, which can list
+  them: PART_COUNT, and {PART_<n>} = the n-th part's folder name (e.g. a table of
+  {PART_<n>}.spawn_). (bass `global variable`s changed inside a nested scope
+  don't survive it, so parts can't reliably register themselves.)
 - config.yaml:
     name: "Extra Item"           # Item Switch / Training mode name
     rate: 5                      # spawn weight on every stage
@@ -18,7 +23,8 @@ Each folder has:
 
 The items become STANDARD items (item switch page 2, spawn rates, crates, training
 mode), numbered right after Remix's own (0x3A, ...). Their code lands in
-`scope Item { scope <Name> { generated FILES/FGM/NAMES ; <Name>.asm } }`.
+`scope Item { scope <Name> { generated FILES/FGM/NAMES ; <Name>.asm ; <Sub>/<Sub>.asm... ;
+end.asm } }`.
 
 Item Switch: page 0 = vanilla items, then 15 custom items per page (Remix's
 first, then the extra items, adding pages as needed). The custom items' enabled
@@ -217,11 +223,21 @@ class ItemProcessor(ExtraImportProcessor):
     def item_includes(self, src_dir="src"):
         """Lines for src/Item.asm, inside `scope Item`, before the add_item list."""
         lines = []
+        rel = lambda path: os.path.relpath(path, src_dir).replace("\\", "/")
         for it in self.items:
-            gen = os.path.relpath(f"{OUTPUT_ROOT}/{it['name']}/generated.asm", src_dir).replace("\\", "/")
-            code = os.path.relpath(f"{it['folder']}/{it['name']}/{it['name']}.asm", src_dir).replace("\\", "/")
+            base = f"{it['folder']}/{it['name']}"
             lines += [f"    scope {it['name']} {{",
-                      f'        include "{gen}"',
-                      f'        include "{code}"',
-                      "    }"]
+                      f'        include "{rel(f"{OUTPUT_ROOT}/{it["name"]}/generated.asm")}"',
+                      f'        include "{rel(f"{base}/{it["name"]}.asm")}"']
+            # sub-parts in their own folders (<Sub>/<Sub>.asm, e.g. one per assist of an
+            # item that summons things), then end.asm (e.g. tables the parts registered into)
+            parts = [sub for sub in sorted(os.listdir(base)) if os.path.isfile(f"{base}/{sub}/{sub}.asm")]
+            for sub in parts:
+                lines.append(f'        include "{rel(f"{base}/{sub}/{sub}.asm")}"')
+            if parts:       # for end.asm: {PART_<n>} = each part's scope name
+                lines += [f"        define PART_{n}({sub})" for n, sub in enumerate(parts)]
+                lines.append(f"        constant PART_COUNT({len(parts)})")
+            if os.path.isfile(f"{base}/end.asm"):
+                lines.append(f'        include "{rel(f"{base}/end.asm")}"')
+            lines.append("    }")
         return lines

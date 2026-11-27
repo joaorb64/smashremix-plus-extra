@@ -1320,6 +1320,15 @@ class CharacterAppender:
                 raise ValueError("extra item would land in the vanilla item bitmask (not supported)")
         item_asm = item_asm[:m.start(1)] + f"0x{default:08X}" + item_asm[m.end(1):]
 
+        # Extra items can add weapons (Projectile.add_projectile), but Stages.asm
+        # includes Item.asm before main.asm gets to Projectile.asm: include it first
+        # (top level; it has an include guard)
+        m = re.search(r"^scope Item \{", item_asm, re.M)
+        if not m:
+            raise RuntimeError("Item.asm: scope Item not found")
+        item_asm = (item_asm[:m.start()] + 'include "Projectile.asm"         // (extra items: add_projectile)\n'
+                    + item_asm[m.start():])
+
         # Item code (inside scope Item), before the add_item list
         marker = re.search(r"^\s*print \"=+ ITEMS =+", item_asm, re.M)
         includes = "    // Extra items (extra_items/)\n" + "\n".join(self.item_proc.item_includes()) + "\n\n"

@@ -37,6 +37,12 @@ def _coll(parent, name, hide=False):
     return c
 
 
+def _game_rgb(rgb255):
+    """A game color (0-255) for the shield's shader: stored value in hardware colors, else linear."""
+    import n64_panel as PANEL
+    return PANEL.view_rgb([c / 255 for c in rgb255[:3]])
+
+
 def _lin(rgb255):
     return [((c / 255) / 12.92 if c / 255 <= 0.04045 else ((c / 255 + 0.055) / 1.055) ** 2.4) for c in rgb255[:3]]
 
@@ -120,6 +126,7 @@ def _own_lights(m, lights):
 
 
 XLU_MODE = 'E200001C 00504DD8'          # translucent surface (AA, z compare, no z update)
+XLU_MODE_2C = 'E200001C 0C184DD8'       # the same in 2-cycle mode (itDisplayColAnimXLU: G_RM_PASS, ..._XLU_SURF2)
 
 
 def _item_state(m, entry):
@@ -130,8 +137,11 @@ def _item_state(m, entry):
     state = [c.strip() for c in str(m.get('n64_state', '')).split(';') if c.strip()]
     if not any(c.startswith('FB') for c in state):
         state.append('FB000000 00000000')
+    m['n64_cycles'] = 1                             # an item's context (n64_panel.two_cycle)
     if entry.get('dl_link') == 1 and not any(c.startswith('E200001C') for c in state):
-        state.insert(0, XLU_MODE)
+        m['n64_state'] = '; '.join(state)
+        import n64_panel as PANEL                   # ColAnim items (2-cycle combiner): G_RM_PASS + XLU_SURF2
+        state.insert(0, XLU_MODE_2C if PANEL.two_cycle(m) else XLU_MODE)
     m['n64_state'] = '; '.join(state)
 
 
@@ -448,6 +458,9 @@ def _shield_graphic(ref, g):
     nt.nodes.clear()
     out = nt.nodes.new('ShaderNodeOutputMaterial')
     img = bpy.data.images.load(os.path.join(ref, g['texture']), check_existing=True)
+    import n64_panel as PANEL
+    if PANEL.hw_colors():                        # (hardware colors: texels as stored, the lerp's factor)
+        img.colorspace_settings.name = 'Non-Color'
     img.alpha_mode = 'CHANNEL_PACKED'
     img.pack()
     tex = nt.nodes.new('ShaderNodeTexImage')
@@ -457,7 +470,7 @@ def _shield_graphic(ref, g):
     for i, c in enumerate(g['colors']):
         rgb = nt.nodes.new('ShaderNodeRGB')
         rgb.label = f"Shield env {g.get('ports', [str(i)] * 99)[i]}"
-        rgb.outputs[0].default_value = (*_lin(c['env']), 1.0)
+        rgb.outputs[0].default_value = (*_game_rgb(c['env']), 1.0)
         cols.append(rgb.outputs[0])
     env = cols[0]
     for i in range(1, len(cols)):
@@ -470,7 +483,7 @@ def _shield_graphic(ref, g):
         env = _sock(mix.outputs, 'Result_Color')
     prim = nt.nodes.new('ShaderNodeRGB')
     prim.label = 'Shield prim'
-    prim.outputs[0].default_value = (*_lin(g['colors'][0]['prim']), 1.0)
+    prim.outputs[0].default_value = (*_game_rgb(g['colors'][0]['prim']), 1.0)
     lerp = nt.nodes.new('ShaderNodeMix')         # per channel: env + (prim - env) x texel
     lerp.data_type = 'VECTOR'
     lerp.factor_mode = 'NON_UNIFORM'

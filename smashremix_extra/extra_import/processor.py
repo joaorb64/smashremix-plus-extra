@@ -23,10 +23,13 @@ class ExtraImportProcessor:
     - files: [[name, tableOffset, resourceOffset, {footer, trim}], ...]
       Same format as a stage's config.yaml `files:`. Each <name>.bin (and
       optional <name>_reqlist.txt, with ${NAME} tokens for the other files)
-      lives in the folder. These files are loaded at the start of every battle.
+      lives in the folder; name may be in a subfolder ("Sub/name": constants and
+      ${NAME} tokens use the bare name). These files are loaded at the start of
+      every battle.
     - sounds: {name: {sample_rate, fgm_type, reverb, length}}
       Same format as a stage's config.yaml `sounds:`. Each sounds/<name>.aifc
-      (or .wav, converted automatically) lives in the folder.
+      (or .wav, converted automatically) lives in the folder; "Sub/name" =
+      Sub/sounds/<name> (the FGM constant uses the bare name).
     - textures: {name: {file: <image>.png, format: rgba32|ia8, in_file: bool}}
       Converted at build time and inserted into the code, so they're always in
       RAM. Sides must be powers of 2 and fit in TMEM (rgba32 up to 32x32, ia8 up
@@ -105,7 +108,8 @@ class ExtraImportProcessor:
 
         for entry in config.get("files", []) or []:
             # [name, tableOffset, resourceOffset, {opts}] - see StageProcessor
-            fname = entry[0]
+            fname = entry[0]                # (may be "Sub/name")
+            key = os.path.basename(fname)   # constants / tokens
             tbl_off = entry[1] if len(entry) > 1 else "3FFFC"
             res_off = entry[2] if len(entry) > 2 else "3FFFC"
             opts = entry[3] if len(entry) > 3 and isinstance(entry[3], dict) else {}
@@ -117,16 +121,16 @@ class ExtraImportProcessor:
             has_reqlist = os.path.exists(f"{original_path}/{fname}_reqlist.txt")
             import_file = FileManager.add_file(
                 path=f"{output_path}/{fname}.bin",
-                name=f"{file_prefix}_{name}_file_{fname}",
+                name=f"{file_prefix}_{name}_file_{key}",
                 internal_file_table_offset=tbl_off,
                 internal_file_resource_offset=res_off,
                 reqlist_path=f"{output_path}/{fname}_reqlist.txt" if has_reqlist else None,
                 compression_level=1
             )
             imported_file_ids[fname] = import_file.id
-            file_names.append(fname.upper())
+            file_names.append(key.upper())
 
-            lines = [f"        scope {fname.upper()} {{",
+            lines = [f"        scope {key.upper()} {{",
                      f"            constant id(0x{import_file.id:X})",
                      "            OS.align(4)",
                      "            ptr:",
@@ -147,25 +151,30 @@ class ExtraImportProcessor:
             with open(compiled_path, "w", encoding="utf-8") as f:
                 for line in lines:
                     for dep_name, dep_id in imported_file_ids.items():
+                        dep_key = os.path.basename(dep_name)
                         line = line.replace(
-                            "${" + dep_name.upper() + "}",
-                            f"{dep_id:04X} {file_prefix}_{name}_file_{dep_name}")
+                            "${" + dep_key.upper() + "}",
+                            f"{dep_id:04X} {file_prefix}_{name}_file_{dep_key}")
                     f.write(line)
 
         sounds = config.get("sounds", {}) or {}
         from smashremix_extra.audio import vadpcm
-        if os.path.isdir(f"{output_path}/sounds"):
-            vadpcm.convert_dir(
-                f"{output_path}/sounds",
-                rate_for=lambda n: (sounds.get(n) or {}).get("sample_rate", 16000))
+        rates = {os.path.basename(n): (v or {}).get("sample_rate", 16000) for n, v in sounds.items()}
+        sound_dirs = {f"{output_path}/sounds"} | {
+            f"{output_path}/{os.path.dirname(n)}/sounds" for n in sounds if os.path.dirname(n)}
+        for sound_dir in sorted(sound_dirs):
+            if os.path.isdir(sound_dir):
+                vadpcm.convert_dir(sound_dir, rate_for=lambda n: rates.get(n, 16000))
 
         fgm_constants = []
         for sname, settings in sounds.items():
             settings = settings or {}
+            sdir, sbase = os.path.dirname(sname), os.path.basename(sname)
+            spath = f"{output_path}/{sdir}/sounds/{sbase}" if sdir else f"{output_path}/sounds/{sbase}"
             self.LAST_SFX_ID += 1
-            fgm_constants.append(f"        constant {sname.upper()}(0x{self.LAST_SFX_ID:04X})")
+            fgm_constants.append(f"        constant {sbase.upper()}(0x{self.LAST_SFX_ID:04X})")
             self.sound_add_list.append(
-                f"add_sound(../{output_path}/sounds/{sname}, "
+                f"add_sound(../{spath}, "
                 f"SAMPLE_RATE_{settings.get('sample_rate', 16000)}, "
                 f"FGM_TYPE_{settings.get('fgm_type', 'VOICE')}, "
                 f"{settings.get('reverb', 0)}, {settings.get('length', -1)})")

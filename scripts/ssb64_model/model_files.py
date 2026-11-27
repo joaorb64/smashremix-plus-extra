@@ -14,6 +14,8 @@ block in main.bin (layout from the decomp, src/ft/fttypes.h FTAttributes):
 main.bin pointers into character.bin are external (main's external chain);
 pointers inside each file are internal (each file's internal chain).
 """
+import os
+import re
 import struct
 from dataclasses import dataclass, field
 
@@ -291,7 +293,56 @@ def load_object(attr_path, model_path=None, attr_int_head=None, attr_ext_head=No
                            anim=ptrs.get(attr_offset + 8) if dobjdesc is not None else None,
                            field=attr_offset + 4)        # (field + 4: anim_joints, like a stage layer's)
     f.object = dict(attr=attr_offset, single_file=model_path is None, dl_only=dobjdesc is None)
+    if model_path is not None and dobjdesc is not None:
+        table = frame_table(char, char_int)
+        joint = next((j.index for j in joints if j.dl is not None and j.dl in table), None)
+        if len(table) > 1 and joint is not None:
+            # the frames, as model part variants of the joint (variant k = table entry k)
+            f.modelparts[joint] = [[dict(field=None, char_field=4 * k, dl=dl, mobjsubs=None, scripts=None, flags=0),
+                                    dict(field=None, char_field=None, dl=None, mobjsubs=None, scripts=None, flags=0)]
+                                   for k, dl in enumerate(table)]
+            f.object['frame_table'] = dict(joint=joint, count=len(table),
+                                           names=frame_names(model_path, len(table)))
     return f
+
+
+FRAMES_ASM = 'frames.asm'           # beside a sprite model: its code's FRAME_<name>(index) constants
+
+
+def frame_names(model_path, count):
+    """The frames' names from frames.asm beside the model file (constant FRAME_<name>(k)),
+    [None] * count when it's missing / doesn't name them all."""
+    names = [None] * count
+    path = os.path.join(os.path.dirname(model_path), FRAMES_ASM)
+    if os.path.exists(path):
+        for m in re.finditer(r'constant\s+FRAME_(\w+)\s*\(\s*(\d+)\s*\)', open(path).read()):
+            if int(m.group(2)) < count:
+                names[int(m.group(2))] = m.group(1)
+    return names
+
+
+def write_frame_names(model_path, names):
+    """frames.asm beside the model file: FRAME_<name>(k) for the frame table's entries."""
+    path = os.path.join(os.path.dirname(model_path), FRAMES_ASM)
+    with open(path, 'w') as f:
+        f.write('// Frame indices into the display list table at the start of '
+                f'{os.path.basename(model_path)} (written by the model tool\'s import: Blender frame names)\n')
+        for k, n in enumerate(names):
+            f.write(f'constant FRAME_{n}({k})\n')
+    return path
+
+
+def frame_table(char, char_int):
+    """A sprite model's display list table at the start of the file (AssistSprite.asm: the
+    code swaps the DObj's dl for entry k to animate): the run of pointers at 0, 4, 8... to
+    display lists. [] if the file doesn't start with one."""
+    out = []
+    while 4 * len(out) in char_int:
+        t = char_int[4 * len(out)]
+        if t >= len(char) or t % 8 or char[t] not in DL_START_OPS:
+            break
+        out.append(t)
+    return out
 
 
 GROUND_DATA = 0x14          # MPGroundData in a Remix stage header.bin (after its 0x14-byte preamble)

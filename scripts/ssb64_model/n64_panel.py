@@ -13,6 +13,7 @@ add-on: Edit > Preferences > Add-ons > Install from Disk.
 import os
 import re
 import math
+import textwrap
 
 import bpy
 import mathutils
@@ -455,6 +456,58 @@ def _srgb_lin(c):
     return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
 
+def hw_colors(scn=None):
+    """Hardware colors (scene n64_hw_color, set by build_blend): the shaders work on the values
+    the N64 stores (textures / colors as encoded, no sRGB decode) and the scene shows them as
+    they are (view transform Raw), so Blender's own blending is the RDP's math on those
+    values, like the console / ares, instead of blending in linear light."""
+    scn = scn if scn is not None else bpy.context.scene
+    return bool(scn is not None and scn.get('n64_hw_color'))
+
+
+def view_rgb(srgb):
+    """A stored (0-1 encoded) color as the shaders want it: as is in hardware colors, else linear."""
+    return [float(c) for c in srgb] if hw_colors() else [_srgb_lin(c) for c in srgb]
+
+
+def view_from_linear(lin):
+    """A linear color (Blender's own: base colors, vertex colors) for the shaders."""
+    return [linear_to_srgb(c) for c in lin] if hw_colors() else list(lin)
+
+
+def _raw_group():
+    """Node group 'N64 Encode': linear -> stored value (the exact sRGB curve, per channel)."""
+    g = bpy.data.node_groups.get('N64 Encode')
+    if g is not None:
+        return g
+    g = bpy.data.node_groups.new('N64 Encode', 'ShaderNodeTree')
+    g.interface.new_socket('Color', in_out='INPUT', socket_type='NodeSocketColor')
+    g.interface.new_socket('Color', in_out='OUTPUT', socket_type='NodeSocketColor')
+    gi, go = g.nodes.new('NodeGroupInput'), g.nodes.new('NodeGroupOutput')
+    sep, comb = g.nodes.new('ShaderNodeSeparateColor'), g.nodes.new('ShaderNodeCombineColor')
+    g.links.new(gi.outputs[0], sep.inputs[0])
+    for i, ch in enumerate(('Red', 'Green', 'Blue')):
+        c = sep.outputs[ch]
+        lo = g.nodes.new('ShaderNodeMath'); lo.operation = 'MULTIPLY'; lo.inputs[1].default_value = 12.92
+        g.links.new(c, lo.inputs[0])
+        cl = g.nodes.new('ShaderNodeMath'); cl.operation = 'MAXIMUM'; cl.inputs[1].default_value = 0.0
+        g.links.new(c, cl.inputs[0])
+        pw = g.nodes.new('ShaderNodeMath'); pw.operation = 'POWER'; pw.inputs[1].default_value = 1 / 2.4
+        g.links.new(cl.outputs[0], pw.inputs[0])
+        hi = g.nodes.new('ShaderNodeMath'); hi.operation = 'MULTIPLY_ADD'
+        hi.inputs[1].default_value, hi.inputs[2].default_value = 1.055, -0.055
+        g.links.new(pw.outputs[0], hi.inputs[0])
+        sel = g.nodes.new('ShaderNodeMath'); sel.operation = 'GREATER_THAN'; sel.inputs[1].default_value = 0.0031308
+        g.links.new(c, sel.inputs[0])
+        mix = g.nodes.new('ShaderNodeMix'); mix.data_type = 'FLOAT'
+        g.links.new(sel.outputs[0], mix.inputs['Factor'])
+        g.links.new(lo.outputs[0], mix.inputs['A'])
+        g.links.new(hi.outputs[0], mix.inputs['B'])
+        g.links.new(mix.outputs['Result'], comb.inputs[ch])
+    g.links.new(comb.outputs[0], go.inputs[0])
+    return g
+
+
 def _recolored(src, pal0, palp, name):
     """Image src (drawn in palette 0's colors) in palette p's: each color of palette 0's
     image becomes the color at the same pixels of palette p's (a preview: indices that
@@ -597,6 +650,8 @@ def _game_shade(m, node, nt):
     cl = node('ShaderNodeMix', data_type='RGBA', blend_type='MIX', clamp_result=True)
     cl.inputs['Factor'].default_value = 1.0
     nt.links.new(add.outputs[0], cl.inputs['B'])
+    if hw_colors():                               # the game's values, as they are
+        return cl.outputs['Result']
     gam = node('ShaderNodeGamma')                 # the game's values -> linear
     nt.links.new(cl.outputs['Result'], gam.inputs['Color'])
     gam.inputs['Gamma'].default_value = 2.2
@@ -639,10 +694,14 @@ def _format_view(m, node, nt, color, alpha):
         return a
     if fmt.startswith('CI'):             # palette colors are RGBA5551: alpha on / off
         return color, one_bit(alpha)
-    g = node('ShaderNodeGamma')          # linear -> the game's values
-    nt.links.new(color, g.inputs['Color'])
-    g.inputs['Gamma'].default_value = 1 / 2.2
-    srgb = g.outputs[0]
+    hw = hw_colors()                     # (hardware colors: the color is the game's values already)
+    if hw:
+        srgb = color
+    else:
+        g = node('ShaderNodeGamma')      # linear -> the game's values
+        nt.links.new(color, g.inputs['Color'])
+        g.inputs['Gamma'].default_value = 1 / 2.2
+        srgb = g.outputs[0]
     if fmt == 'RGBA16':
         sep = node('ShaderNodeSeparateXYZ')
         nt.links.new(srgb, sep.inputs[0])
@@ -661,6 +720,8 @@ def _format_view(m, node, nt, color, alpha):
             nt.links.new(i, gray.inputs[k])
         out_c = gray.outputs[0]
         out_a = i if ab is None else (one_bit(alpha) if ab == 1 else bits(alpha, ab))
+    if hw:
+        return out_c, out_a
     back = node('ShaderNodeGamma')
     nt.links.new(out_c, back.inputs['Color'])
     back.inputs['Gamma'].default_value = 2.2
@@ -719,6 +780,228 @@ def _edge_alpha(m, cmds, node, nt, alpha):
     return False, alpha
 
 
+def two_cycle(m, cmds=None):
+    """Whether the material draws in 2-cycle mode: its own cycle-type command (E3000A01) if
+    it has one, else the context's: fighters (no scene n64_kind) are always 2-cycle
+    (ftDisplayMain), items / projectiles / stages 1-cycle unless their combiner is written for
+    2-cycle (below). n64_cycles: 2 forces 2-cycle, 1 = an item's context in a fighter scene
+    (reference items)."""
+    cmds = parse_state(m) if cmds is None else cmds
+    ct = next((b for a, b in cmds if a == 0xE3000A01), None)
+    if ct is not None:
+        return (ct >> 20) & 3 == 1
+    if m.get('n64_cycles') == 2:
+        return True
+    scn = bpy.context.scene
+    if m.get('n64_cycles') != 1 and not (scn is not None and scn.get('n64_kind')):
+        return True
+    # items / projectiles / stages: 1-cycle by default, but ColAnim items (ITAttributes
+    # is_display_colanim: itDisplayColAnim*) and DLs that switch themselves draw 2-cycle.
+    # Their combiners are written for it: cycle 2 reads COMBINED, which 1-cycle mode
+    # never gives a meaningful value, so no shipped asset uses it there.
+    fc = next(((a, b) for a, b in cmds if a >> 24 == 0xFC), None)
+    if fc is None:
+        return False
+    w0, w1 = fc
+    return 0 in ((w0 >> 5) & 15, (w1 >> 24) & 15, w0 & 31, (w1 >> 6) & 7,
+                 (w1 >> 21) & 7, (w1 >> 3) & 7, w1 & 7) or (w0 & 31) == 7
+
+
+def _rm_cycles(rm, two):
+    """The blender formulas the RDP runs: [(P, A, M, B)] per cycle (1-cycle: cycle 1's only)."""
+    c1 = ((rm >> 30) & 3, (rm >> 26) & 3, (rm >> 22) & 3, (rm >> 18) & 3)
+    c2 = ((rm >> 28) & 3, (rm >> 24) & 3, (rm >> 20) & 3, (rm >> 16) & 3)
+    return [c1, c2] if two else [c1]
+
+
+def _blender_on(rm):
+    """Does the blender run on the material's pixels? FORCE_BL always; otherwise only on
+    partially covered pixels, which with ALPHA_CVG_SEL + AA_EN (coverage = alpha in eighths:
+    00503878, the 1-cycle trail mode) means wherever alpha < 1."""
+    return rm is not None and bool(rm & 0x4000 or rm & 0x2008 == 0x2008)
+
+
+def _blends_memory(rm, two):
+    """Does a cycle mix in what's behind? B = memory coverage (G_BL_A_MEM: the anti-aliased
+    opaque / cut-out modes, 0x0055...., 0xC411....) only blends partially covered edge pixels
+    and is opaque inside, so it doesn't count (the cut-out / edge path draws those)."""
+    return any(p == 1 or (mm == 1 and b in (0, 2)) for p, _, mm, b in _rm_cycles(rm, two))
+
+
+def ares_warnings(m):
+    """What draws differently on accurate hardware (ares / console) than on HLE emulators."""
+    cmds = parse_state(m)
+    two = two_cycle(m, cmds)
+    out = []
+    fc = next(((a, b) for a, b in cmds if a >> 24 == 0xFC), None)
+    if fc is not None:
+        w0, w1 = fc
+        cyc2 = ((w0 >> 5) & 15, (w1 >> 24) & 15, w0 & 31, (w1 >> 6) & 7,
+                (w1 >> 21) & 7, (w1 >> 3) & 7, (w1 >> 18) & 7, w1 & 7)
+        second = any(k in m.keys() for k in ('n64_scroll2_x', 'n64_scroll2_y', 'n64_tex_next'))
+        uses_t0 = cyc2[0] == 1 or cyc2[1] == 1 or cyc2[2] in (1, 8) or cyc2[3] == 1 or \
+            1 in (cyc2[4], cyc2[5], cyc2[6], cyc2[7])
+        if two and uses_t0 and not second:
+            out.append('Cycle 2 uses Texel 0: in 2-cycle mode that reads tile 1, left over from '
+                       'whatever was drawn before (wrong UVs / streaks / gaps on ares, shown as '
+                       'streaks here). Use Combined')
+    rm = next((b for a, b in cmds if a == 0xE200001C), None)
+    if _blender_on(rm):
+        cyc = _rm_cycles(rm, two)
+        if two and sum(p == 1 or (mm == 1 and b in (0, 2)) for p, _, mm, b in cyc) > 1:
+            out.append('Both blender cycles blend with the framebuffer: more transparent on '
+                       'hardware (1-cycle mode on a fighter: use a fighter preset)')
+        if any(mm == 1 and b == 2 for _p, _, mm, b in cyc):
+            out.append('Additive blend: on hardware a channel past 255 wraps around instead of '
+                       'saturating (red / yellow over bright backgrounds)')
+    return out
+
+
+WRAP_BACKDROP = (0.5, 0.5, 0.5)     # default assumed framebuffer color under additive surfaces
+
+
+def _wrap_additive(nt, node, col, kv, vadd):
+    """The RDP's additive overflow: it doesn't clamp, an 8-bit channel past 255 wraps (226 +
+    170 -> 140: phoboslab.org/log/2026/05/n64-additive-blending). A Blender shader can't
+    read what's behind, so this assumes it's the scene's n64_wrap_backdrop color B (stored
+    values, in the material panel): where col + k * B passes 256/255 the channel shows
+    wrapped as E + T * behind with E, T >= 0 (Blender can't subtract), exact when what's
+    behind is B, darker / lighter with it elsewhere. -> (col, k) per channel."""
+    scn = bpy.context.scene
+    if scn is not None and 'n64_wrap_backdrop' not in scn.keys():
+        scn['n64_wrap_backdrop'] = list(WRAP_BACKDROP)
+    B = node('ShaderNodeCombineXYZ')
+    B.label = 'N64 Wrap Backdrop'
+    for i in range(3):
+        if scn is not None:
+            _drive(B.inputs[i], 'default_value', scn, 'c', {'c': f'["n64_wrap_backdrop"][{i}]'}, id_type='SCENE')
+    B = B.outputs[0]
+
+    def vm(op, a, b, c=None):
+        n = node('ShaderNodeVectorMath', operation=op)
+        for i, v in enumerate((a, b, c)):
+            if v is None:
+                continue
+            if isinstance(v, tuple):
+                n.inputs[i].default_value = v
+            else:
+                nt.links.new(v, n.inputs[i])
+        return n.outputs[0]
+    top = (256 / 255,) * 3
+    v = vadd(col, vm('MULTIPLY', kv, B))              # the hardware's sum over B
+    # 1 where it wraps (v > 256/255), else 0: (sign(v - 256/255) + 1) / 2
+    over = vm('MULTIPLY', vm('SUBTRACT', vm('SIGN', vm('SUBTRACT', v, top), None), (-1.0,) * 3), (0.5,) * 3)
+    w = vm('MODULO', v, top)                          # the wrapped value
+    t = vm('MINIMUM', vm('DIVIDE', w, vm('MAXIMUM', B, (1e-4,) * 3)), kv)   # behind's share: <= k
+    e = vm('MAXIMUM', vm('SUBTRACT', w, vm('MULTIPLY', t, B)), (0.0,) * 3)  # the rest: emitted
+
+    def lerp(a, b):                                   # a + (b - a) * over, per channel
+        return vadd(a, vm('MULTIPLY', vm('SUBTRACT', b, a), over))
+    return lerp(col, e), lerp(kv, t)
+
+
+def _build_blender(m, nt, node, cmds, rm, two, comb_c, comb_a, shade_a, out, hex_color, rgb, val):
+    """The RDP blender (FORCE_BL, or coverage-blended: see _blender_on): per cycle
+    out = P * A + M * B (B = 1 - A: the non-forced division by A + B is a no-op). Each value
+    is kept as c + k * framebuffer (k: how much of what's behind shows), so Blender's
+    blended surface = Emission(c) + Transparent(k) draws it exactly, cycles chained (cycle 2's
+    IN = cycle 1's result). Not emulated: the hardware's 8-bit wrap-around on overflow."""
+    blc, bla = hex_color(0xF9, 0x00000000)          # blend color
+    fogc, foga = hex_color(0xF8, 0x00000000)        # fog color (fighters: flash, alpha 0 at rest)
+    zero_c, one = rgb((0, 0, 0)), val(1.0)
+    zero = val(0.0)
+
+    def scale(c, s):
+        n = node('ShaderNodeVectorMath', operation='SCALE')
+        nt.links.new(c, n.inputs[0])
+        nt.links.new(s, n.inputs['Scale'])
+        return n.outputs[0]
+
+    def vadd(a, b):
+        n = node('ShaderNodeVectorMath', operation='ADD')
+        nt.links.new(a, n.inputs[0])
+        nt.links.new(b, n.inputs[1])
+        return n.outputs[0]
+
+    def mop(op, a, b, clamp=False):
+        n = node('ShaderNodeMath', operation=op, use_clamp=clamp)
+        for i, v in enumerate((a, b)):
+            if isinstance(v, float):
+                n.inputs[i].default_value = v
+            else:
+                nt.links.new(v, n.inputs[i])
+        return n.outputs[0]
+
+    if not rm & 0x4000:                               # blending by coverage = alpha in eighths
+        comb_a = mop('DIVIDE', mop('FLOOR', mop('MULTIPLY', comb_a, 8.0), 0.0), 8.0)
+    # alpha compare (E2001E01 = 1): nothing drawn at or under the blend color's alpha
+    compare = next((b & 3 for a, b in cmds if a == 0xE2001E01), 0)
+    keep = mop('GREATER_THAN', comb_a, bla) if compare == 1 else None
+    cur = (comb_c, zero)                              # IN of cycle 1: the combiner's color
+    mem = (zero_c, one)
+    for p, a, mm, b in _rm_cycles(rm, two):
+        cols = {0: cur, 1: mem, 2: (rgb(blc), zero), 3: (rgb(fogc), zero)}
+        # A: combiner alpha / fog alpha / shade alpha (as a fog factor: none here) / 0
+        av = {0: comb_a, 1: val(foga), 2: zero if p == 3 else shade_a, 3: zero}[a]
+        bv = {0: mop('SUBTRACT', 1.0, av), 1: one, 2: one, 3: zero}[b]   # 1-A / mem cvg / 1 / 0
+        (pc, pk), (mc, mk) = cols[p], cols[mm]
+        if b == 1:                                    # memory coverage: opaque inside, P as is
+            cur = (pc, pk)
+            continue
+        cur = (vadd(scale(pc, av), scale(mc, bv)),
+               mop('ADD', mop('MULTIPLY', pk, av), mop('MULTIPLY', mk, bv)))
+    col, k = cur
+    if keep is not None:                              # rejected pixels leave memory as it is
+        col = scale(col, keep)
+        k = mop('SUBTRACT', 1.0, mop('MULTIPLY', keep, mop('SUBTRACT', 1.0, k)))
+    k = mop('MINIMUM', k, 1.0, clamp=True)
+    kv = node('ShaderNodeCombineXYZ')                 # (per channel from here: the wrap is)
+    for i in range(3):
+        nt.links.new(k, kv.inputs[i])
+    kv = kv.outputs[0]
+    if any(mm == 1 and b == 2 for _p, _a, mm, b in _rm_cycles(rm, two)):
+        col, kv = _wrap_additive(nt, node, col, kv, vadd)
+    for attr, value in (('surface_render_method', 'BLENDED'), ('blend_method', 'BLEND')):
+        try:
+            setattr(m, attr, value)
+        except (AttributeError, TypeError):
+            pass
+    em = node('ShaderNodeEmission')
+    nt.links.new(col, em.inputs['Color'])
+    tr = node('ShaderNodeBsdfTransparent')
+    nt.links.new(kv, tr.inputs['Color'])
+    add = node('ShaderNodeAddShader')
+    nt.links.new(em.outputs[0], add.inputs[0])
+    nt.links.new(tr.outputs[0], add.inputs[1])
+    nt.links.new(add.outputs[0], out.inputs['Surface'])
+
+
+def _stale_tile(m, nt, tex, node, encode):
+    """The material's texture read through a stale tile descriptor (see build_combiner):
+    a stand-in for the unknowable real one: u stretched 4x and wrapped, v pinned near one row
+    (a tile with a wider line / smaller mask reads one row's texels down the whole face):
+    vertical streaks of the texture's own colors, transparent where those texels are."""
+    uv = node('ShaderNodeUVMap')
+    sep = node('ShaderNodeSeparateXYZ')
+    nt.links.new(uv.outputs['UV'], sep.inputs[0])
+    su = node('ShaderNodeMath', operation='MULTIPLY')
+    nt.links.new(sep.outputs['X'], su.inputs[0])
+    su.inputs[1].default_value = 4.0
+    wu = node('ShaderNodeMath', operation='WRAP')
+    nt.links.new(su.outputs[0], wu.inputs[0])
+    wu.inputs[1].default_value, wu.inputs[2].default_value = 1.0, 0.0
+    sv = node('ShaderNodeMath', operation='MULTIPLY_ADD')
+    nt.links.new(sep.outputs['Y'], sv.inputs[0])
+    sv.inputs[1].default_value, sv.inputs[2].default_value = 0.0625, 0.37
+    comb = node('ShaderNodeCombineXYZ')
+    nt.links.new(wu.outputs[0], comb.inputs['X'])
+    nt.links.new(sv.outputs[0], comb.inputs['Y'])
+    t = node('ShaderNodeTexImage')
+    t.image, t.interpolation, t.extension = tex.image, 'Closest', 'REPEAT'
+    nt.links.new(comb.outputs[0], t.inputs['Vector'])
+    return encode(t.outputs['Color']), t.outputs['Alpha']
+
+
 def build_combiner(m, nt, tex, out, bsdf):
     """The material's N64 color combiner as shader nodes: two cycles of (a - b) * c + d,
     color and alpha, with its prim / env colors and the texture. SHADE is Blender's own
@@ -754,10 +1037,19 @@ def build_combiner(m, nt, tex, out, bsdf):
 
     def hex_color(op, default):
         v = next((b for a, b in cmds if a >> 24 == op), default)
-        return [_srgb_lin(((v >> sh) & 255) / 255) for sh in (24, 16, 8)], (v & 255) / 255
+        return view_rgb([((v >> sh) & 255) / 255 for sh in (24, 16, 8)]), (v & 255) / 255
+    hw = hw_colors()
+
+    def encode(sock):        # linear -> the stored value (hardware colors)
+        if not hw:
+            return sock
+        n = node('ShaderNodeGroup')
+        n.node_tree = _raw_group()
+        nt.links.new(sock, n.inputs[0])
+        return n.outputs[0]
     if tex is None:          # untextured: its color is the Base Color (per costume)
         bc = bsdf.inputs['Base Color'].default_value
-        prim_c, prim_a = list(bc[:3]), hex_color(0xFA, 0xFFFFFFFF)[1]
+        prim_c, prim_a = view_from_linear(bc[:3]), hex_color(0xFA, 0xFFFFFFFF)[1]
     else:
         prim_c, prim_a = hex_color(0xFA, 0xFFFFFFFF)
     # env default: white for fighters; items / projectiles (scene n64_default_env) fade
@@ -770,17 +1062,18 @@ def build_combiner(m, nt, tex, out, bsdf):
     tex_a = tex.outputs['Alpha'] if tex is not None else one
     # material animation: the image list entry / palette its index properties pick
     tex_c, tex_a = _anim_texture(m, nt, tex, node, tex_c, tex_a)
-    if tex is not None:                  # how the texture's format stores it (materials.encode_direct)
+    if tex is not None:
+        tex_c = encode(tex_c)                  # how the texture's format stores it (materials.encode_direct)
         tex_c, tex_a = _format_view(m, node, nt, tex_c, tex_a)
     if lit:
         shade_c = _game_shade(m, node, nt)
         shade_a = one
     else:
         vc = node('ShaderNodeVertexColor')
-        shade_c, shade_a = vc.outputs['Color'], vc.outputs['Alpha']
+        shade_c, shade_a = encode(vc.outputs['Color']), vc.outputs['Alpha']
     P, Pa, E, Ea = rgb(prim_c), val(prim_a), rgb(env_c), val(env_a)
     # the MObj's colors (animated: material animation) instead of the display list's
-    lin = 'c/12.92 if c <= 0.04045 else pow((c+0.055)/1.055, 2.4)'
+    lin = 'c' if hw else 'c/12.92 if c <= 0.04045 else pow((c+0.055)/1.055, 2.4)'
     for prop, (sock, sock_a) in (('n64_prim_color', (P, Pa)), ('n64_env_color', (E, Ea))):
         if prop in m.keys():
             for ch in range(3):
@@ -795,18 +1088,43 @@ def build_combiner(m, nt, tex, out, bsdf):
     A, B, C, D = inv(CC_A), inv(CC_B), inv(CC_C), inv(CC_D)
     AA, ACc = inv(AC_ABD), inv(AC_C)
     comb_c, comb_a = zero_c, zero
-    for cyc in range(2):
+    two = two_cycle(m, cmds)
+    # what the hardware samples for TEXEL0 / TEXEL1 per cycle (tile t = the material's
+    # texture): cycle 1 reads tiles t / t+1; in 2-cycle mode cycle 2 reads t+1 as TEXEL0 and
+    # (pipelined) the next pixel's tile t as TEXEL1. Tile t+1 is only set up by a
+    # second-tile material (MObj scroll2 / next texture); otherwise it's whatever the RDP last
+    # had there (fighters never set tile 1: it's left from the stage / effects drawn before, so
+    # it changes per stage). That stale tile still points into TMEM, where this material's
+    # texture now is: the hardware reads this texture through someone else's format / size /
+    # mask -> wrong UVs, streaks, see-through gaps (ares: MK tornado vertical yellow lines,
+    # MM trail invisible parts). Shown as that: the texture through a scrambled mapping.
+    second = tex is not None and any(k in m.keys() for k in ('n64_scroll2_x', 'n64_scroll2_y', 'n64_tex_next'))
+    if tex is None:
+        und_c, und_a = one_c, one
+    elif second:
+        und_c, und_a = tex_c, tex_a
+    else:
+        und_c, und_a = _stale_tile(m, nt, tex, node, encode)
+    texels = [(tex_c, tex_a, und_c, und_a), (und_c, und_a, tex_c, tex_a)] if two else \
+        [None, (tex_c, tex_a, und_c, und_a)]
+    if not two and not any(a >> 24 == 0xFC for a, _ in cmds):
+        # no combiner of its own in a 1-cycle context: it keeps what was drawn before (unknown);
+        # the model default chained as before (texture x shade)
+        texels = [(tex_c, tex_a, tex_c, tex_a)] * 2
+    # 1-cycle mode only runs the second cycle's combiner (its COMBINED is undefined: 0)
+    for cyc in (range(2) if two or texels[0] is not None else (1,)):
+        t0c, t0a, t1c, t1a = texels[cyc]
         if cyc == 0:
             ca, cb, cc, cd = A.get((w0 >> 20) & 15), B.get((w1 >> 28) & 15), C.get((w0 >> 15) & 31), D.get((w1 >> 15) & 7)
             aa, ab, ac, ad = AA.get((w0 >> 12) & 7), AA.get((w1 >> 12) & 7), ACc.get((w0 >> 9) & 7), AA.get((w1 >> 9) & 7)
         else:
             ca, cb, cc, cd = A.get((w0 >> 5) & 15), B.get((w1 >> 24) & 15), C.get(w0 & 31), D.get((w1 >> 6) & 7)
             aa, ab, ac, ad = AA.get((w1 >> 21) & 7), AA.get((w1 >> 3) & 7), ACc.get((w1 >> 18) & 7), AA.get(w1 & 7)
-        csrc = {'COMBINED': comb_c, 'TEXEL0': tex_c, 'TEXEL1': tex_c, 'PRIM': P, 'SHADE': shade_c, 'ENV': E,
-                '1': one_c, 'NOISE': half, 'COMBINED_ALPHA': comb_a, 'TEXEL0_ALPHA': tex_a,
-                'TEXEL1_ALPHA': tex_a, 'PRIM_ALPHA': Pa, 'SHADE_ALPHA': shade_a, 'ENV_ALPHA': Ea,
+        csrc = {'COMBINED': comb_c, 'TEXEL0': t0c, 'TEXEL1': t1c, 'PRIM': P, 'SHADE': shade_c, 'ENV': E,
+                '1': one_c, 'NOISE': half, 'COMBINED_ALPHA': comb_a, 'TEXEL0_ALPHA': t0a,
+                'TEXEL1_ALPHA': t1a, 'PRIM_ALPHA': Pa, 'SHADE_ALPHA': shade_a, 'ENV_ALPHA': Ea,
                 'LOD_FRACTION': one, 'PRIM_LOD_FRAC': lod}
-        asrc = {'COMBINED': comb_a, 'TEXEL0': tex_a, 'TEXEL1': tex_a, 'PRIM': Pa, 'SHADE': shade_a, 'ENV': Ea,
+        asrc = {'COMBINED': comb_a, 'TEXEL0': t0a, 'TEXEL1': t1a, 'PRIM': Pa, 'SHADE': shade_a, 'ENV': Ea,
                 '1': one, 'LOD_FRACTION': one, 'PRIM_LOD_FRAC': lod}
         sub = node('ShaderNodeVectorMath', operation='SUBTRACT')
         nt.links.new(csrc.get(ca, zero_c), sub.inputs[0])
@@ -830,6 +1148,10 @@ def build_combiner(m, nt, tex, out, bsdf):
         nt.links.new(amul.outputs[0], aadd.inputs[0])
         nt.links.new(asrc.get(ad, zero), aadd.inputs[1])
         comb_c, comb_a = clampc.outputs['Result'], aadd.outputs[0]
+    rm = next((b for a, b in cmds if a == 0xE200001C), None)
+    if _blender_on(rm) and _blends_memory(rm, two):
+        _build_blender(m, nt, node, cmds, rm, two, comb_c, comb_a, shade_a, out, hex_color, rgb, val)
+        return
     # translucent: the render mode's (cycle 2) blender weighs memory by 1 - alpha (XLU modes:
     # 0x0050...., 0x4410....); opaque / cut-out modes use memory coverage (0x0055...., 0xC411....)
     blending, comb_a = _edge_alpha(m, cmds, node, nt, comb_a)
@@ -1507,6 +1829,13 @@ class N64_PT_material(bpy.types.Panel):
             col.label(text='No texture: the Base Color is the color', icon='INFO')
         col.prop(m, 'n64ui_render_mode', text='Render Mode')
         col.prop(m, 'n64ui_combiner', text='Combiner')
+        for msg in ares_warnings(m):                 # hardware-accurate (ares) differences
+            box = col.box()
+            for i, line in enumerate(textwrap.wrap(msg, 48)):   # panels don't wrap labels
+                box.label(text=line, icon='ERROR' if i == 0 else 'BLANK1')
+            if msg.startswith('Additive') and 'n64_wrap_backdrop' in context.scene.keys():
+                box.label(text='Shown wrapped over this backdrop (exact where behind matches):')
+                box.prop(context.scene, '["n64_wrap_backdrop"]', text='Wrap Backdrop')
         if any(a >> 24 == 0xFA for a, _ in parse_state(m)) or m.n64ui_combiner in ('CC_TEX_PRIM', 'CC_GRADIENT'):
             col.prop(m, 'n64ui_prim', text='Prim Color')
         if any(a >> 24 == 0xFB for a, _ in parse_state(m)) or m.n64ui_combiner == 'CC_GRADIENT':
@@ -2838,7 +3167,7 @@ def _vs_hud_material(name, rgb=(0, 0, 0)):
     out = nt.nodes.new('ShaderNodeOutputMaterial')
     em = nt.nodes.new('ShaderNodeEmission')
     nt.links.new(em.outputs[0], out.inputs['Surface'])
-    em.inputs['Color'].default_value = (*(_srgb_lin(c / 255) for c in rgb), 1.0)
+    em.inputs['Color'].default_value = (*view_rgb([c / 255 for c in rgb]), 1.0)
     return m
 
 
@@ -3038,6 +3367,7 @@ MAPOBJ_KINDS = {
 def _helper_mat(name, rgba):
     m = bpy.data.materials.get(name)
     if m is None:
+        rgba = (*view_from_linear(rgba[:3]), rgba[3])    # (hardware colors: shown as stored values)
         m = bpy.data.materials.new(name)
         m['n64_helper'] = True
         m.diffuse_color = rgba
@@ -5430,10 +5760,33 @@ class N64_OT_part_add(bpy.types.Operator):
     bl_options = {'UNDO'}
     joint: bpy.props.IntProperty()
     source: bpy.props.IntProperty(default=-2, description='-2: the body\'s piece; else the variant to copy')
+    frames: bpy.props.BoolProperty(default=False, description='A sprite model\'s frame table: the copy goes '
+                                   'right after the source, with its own name')
 
     def execute(self, context):
         j = self.joint
         have = part_objects(j)
+        if self.frames:
+            v = max(have) + 1 if have else 0
+            r = self._add(context, j, v, self.source)
+            if r is not None:
+                return r
+            taken = {frame_name(j, w) for w in have}
+            base = frame_name(j, self.source) if self.source >= 0 else 'FRAME'
+            name, n = f'{base}_COPY', 2
+            while name in taken:
+                name, n = f'{base}_COPY{n}', n + 1
+            for o in part_objects(j, v).get(v, []):
+                o['n64_frame'] = name
+            if 0 <= self.source < v - 1:         # in place: after the source
+                mapping = {w: w + 1 for w in range(self.source + 1, v)}
+                mapping[v] = self.source + 1
+                _renumber_parts(context.scene, j, mapping)
+                v = self.source + 1
+            apply_parts(context.scene)
+            bpy.ops.n64.part_select(joint=j, variant=v)
+            self.report({'INFO'}, f'frame {v} added: {name} (a copy of frame {self.source})')
+            return {'FINISHED'}
         if not have and self.source == -2:
             # the game starts every joint with a body piece on model part id 0 (drawing the body's
             # piece) and goes back to variant 0's mesh when parts reset: variant 0 must look like
@@ -5465,7 +5818,7 @@ class N64_OT_part_add(bpy.types.Operator):
             self.report({'ERROR'}, 'No Model parts collection')
             return {'CANCELLED'}
         made = []
-        for detail in ('hi', 'lo'):
+        for detail in ('hi',) if self.frames else ('hi', 'lo'):     # (frame tables: no low detail)
             if source == -2:
                 src = next((o for o in body_objects(j, detail) if not re.search(r'_c\d+$', o.name)), None)
             else:
@@ -5529,6 +5882,8 @@ class N64_OT_part_remove(bpy.types.Operator):
     bl_options = {'UNDO'}
     joint: bpy.props.IntProperty()
     variant: bpy.props.IntProperty(default=-1, description='-1: the last')
+    frames: bpy.props.BoolProperty(default=False, description='A sprite model\'s frame table: any frame can go '
+                                   '(the code uses frame names), the last one stays')
 
     def execute(self, context):
         j = self.joint
@@ -5538,6 +5893,21 @@ class N64_OT_part_remove(bpy.types.Operator):
         v = max(have) if self.variant < 0 else self.variant
         if v not in have:
             return {'CANCELLED'}
+        if self.frames:
+            if len(have) == 1:
+                self.report({'ERROR'}, 'The frame table needs at least one frame')
+                return {'CANCELLED'}
+            name = frame_name(j, v)
+            for o in have[v]:
+                bpy.data.objects.remove(o)
+            shown = dict(context.scene.get('n64_parts_shown') or {})
+            if shown.get(str(j)) == v:
+                shown.pop(str(j))
+                context.scene['n64_parts_shown'] = shown
+            _renumber_parts(context.scene, j, {w: w - 1 for w in sorted(have) if w > v})
+            apply_parts(context.scene)
+            self.report({'INFO'}, f'frame {v} ({name}) removed: code using FRAME_{name} won\'t build')
+            return {'FINISHED'}
         if v == 0 and len(have) > 1:
             self.report({'ERROR'}, 'Variant 0 is the body\'s look the joint starts with: remove the others first')
             return {'CANCELLED'}
@@ -5566,6 +5936,8 @@ class N64_OT_part_move(bpy.types.Operator):
     joint: bpy.props.IntProperty()
     variant: bpy.props.IntProperty()
     direction: bpy.props.IntProperty(default=1, description='-1: up (a lower number), 1: down')
+    frames: bpy.props.BoolProperty(default=False, description='A sprite model\'s frame table: any frames swap '
+                                   '(the code uses frame names)')
 
     def execute(self, context):
         j, v = self.joint, self.variant
@@ -5573,6 +5945,10 @@ class N64_OT_part_move(bpy.types.Operator):
         have = part_objects(j)
         if v not in have or w not in have:
             return {'CANCELLED'}
+        if self.frames:
+            _renumber_parts(context.scene, j, {v: w, w: v})
+            apply_parts(context.scene)
+            return {'FINISHED'}
         if 0 in (v, w):
             self.report({'ERROR'}, 'Variant 0 is the body\'s look the joint starts with: it stays variant 0')
             return {'CANCELLED'}
@@ -5794,6 +6170,51 @@ class N64_OT_copy_text(bpy.types.Operator):
         context.window_manager.clipboard = self.text
         self.report({'INFO'}, f'Copied: {self.text}')
         return {'FINISHED'}
+
+
+def frame_name(j, v):
+    """Frame v's name (FRAME_<name> in the code's frames.asm: the import rewrites it)."""
+    hi = next(iter(part_objects(j, v, 'hi').get(v, [])), None)
+    return str(hi.get('n64_frame', f'F{v}')) if hi is not None else f'F{v}'
+
+
+def draw_frame_table(lay, scene, j):
+    """A sprite model's frames (the display list table at the start of its file, which the code
+    swaps a DObj's dl to): joint_j's model part variants, one per table entry, each with the
+    name its FRAME_<name> constant gets (frames.asm, rewritten by the import). Add / remove /
+    reorder freely: the code uses the names."""
+    have = part_objects(j)
+    cur = int(dict(scene.get('n64_parts_shown') or {}).get(str(j), -2))
+    box = lay.box()
+    box.label(text=f'Frames: {len(have)} (display list table, joint_{j:02d})', icon='RENDERLAYERS')
+    box.label(text='The code uses FRAME_<name> (frames.asm, written by the import)', icon='INFO')
+    r = box.row(align=True)
+    op = r.operator('n64.part_show', text='Body (spawn DL)', depress=cur == -2)
+    op.joint, op.variant = j, -2
+    last = max(have) if have else -1
+    for v in sorted(have):
+        hi = next((o for o in have[v] if '_hi_' in o.name), have[v][0])
+        r = box.row(align=True)
+        op = r.operator('n64.part_select', text=f'{v}', depress=cur == v)
+        op.joint, op.variant = j, v
+        if 'n64_frame' in hi.keys():
+            r.prop(hi, '["n64_frame"]', text='')
+        else:
+            r.label(text=f'F{v}')
+        sub = r.row(align=True)
+        sub.enabled = v > 0
+        op = sub.operator('n64.part_move', text='', icon='TRIA_UP')
+        op.joint, op.variant, op.direction, op.frames = j, v, -1, True
+        sub = r.row(align=True)
+        sub.enabled = v < last
+        op = sub.operator('n64.part_move', text='', icon='TRIA_DOWN')
+        op.joint, op.variant, op.direction, op.frames = j, v, 1, True
+        op = r.operator('n64.part_add', text='', icon='DUPLICATE')
+        op.joint, op.source, op.frames = j, v, True
+        sub = r.row(align=True)
+        sub.enabled = len(have) > 1
+        op = sub.operator('n64.part_remove', text='', icon='X')
+        op.joint, op.variant, op.frames = j, v, True
 
 
 def draw_part_variants(lay, scene, j):
@@ -6131,6 +6552,10 @@ class N64_PT_fighter_view(bpy.types.Panel):
                                        f'{tp["index"] + 1} to it in Armature > N64 Fighter Joints')
         joints = sorted({int(m.group(1)) for o in _view_objects('Model parts')
                          if (m := re.match(r'part\d+_hi_j(\d+)$', o.name))})
+        ft = ((man or {}).get('object') or {}).get('frame_table')
+        if ft and ft['joint'] in joints:
+            draw_frame_table(lay, sc, ft['joint'])
+            joints.remove(ft['joint'])
         if joints:
             lay.label(text='Model parts (select a bone to add / edit)', icon='MESH_DATA')
             shown = dict(sc.get('n64_parts_shown') or {})

@@ -131,6 +131,12 @@ def export_argv(a):
         return kind, [src, out] + (['--stage'] if kind == 'stage' else [])
     if not os.path.isfile(src):
         raise SystemExit(f'{src}: no such folder or ROM')
+    folder = os.path.dirname(src) or '.'
+    if src.lower().endswith('.bin') and os.path.exists(os.path.join(folder, 'config.yaml')):
+        stem = os.path.splitext(os.path.basename(src))[0]
+        stem = stem[:-7] if stem.endswith('_hitbox') else stem
+        raise SystemExit(f'{src} is a file of an extra folder: export the folder with the item NAME, e.g.\n'
+                         f'  ssb64_model.py export {folder} {stem} {out}')
     if not name:
         raise SystemExit('a ROM export needs the NAME of the fighter, stage or item')
     kinds = [a.kind] if a.kind else rom_kind(name)

@@ -451,6 +451,62 @@ def write_joint_anims(f, work_dir, blob, remap):
     return out
 
 
+def write_frame_table(f, ft, work_dir, textures, writer):
+    """A sprite model's display list table (model_files.frame_table): word k at the start of
+    the file -> variant k's display list (Blender: part<k>_hi_j<joint> in Model parts), built
+    on the joint like the body. Has to be the first thing written. -> the frame count."""
+    blob, joint = writer.blob, ft['joint']
+    path = os.path.join(work_dir, 'parts.gltf')
+    if not os.path.exists(path):
+        raise SystemExit(f'{path}: not found: this model\'s frames are its model part variants (Model parts)')
+    frames, extra = {}, []
+    for o in IF.merge_same_name(IF.load_gltf(path, one_joint=True)):
+        m = re.match(r'part(\d+)_(hi|lo)_j(\d+)$', o['name'])
+        if m and m.group(2) == 'hi' and int(m.group(3)) == joint:
+            frames[int(m.group(1))] = o
+        else:
+            extra.append(o['name'])
+    if extra:
+        print(f'  warning: not frames of joint_{joint:02d} (part<k>_hi_j{joint:02d}), skipped: {", ".join(extra)}')
+    n = max(frames) + 1 if frames else 0
+    missing = [k for k in range(n) if k not in frames]
+    if not frames or missing:
+        raise SystemExit(f'frame table: variants {missing or [0]} missing: the frames have to be variants 0..N-1')
+    # names (Blender: each frame object's n64_frame; else the export's, else F<k>)
+    blend = {}
+    cj = os.path.join(work_dir, 'costumes.json')
+    if os.path.exists(cj):
+        blend = json.load(open(cj)).get('frame_names') or {}
+    old = ft.get('names') or []
+    names = []
+    for k in range(n):
+        nm = blend.get(f'part{k}_hi_j{joint:02d}') or (old[k] if k < len(old) and n == ft['count'] else None)
+        names.append(re.sub(r'\W', '_', nm.strip()).upper() if nm else f'F{k}')
+    dup = sorted({x for x in names if names.count(x) > 1})
+    if dup:
+        raise SystemExit(f'frame table: frame names used twice: {", ".join(dup)} (rename them in Blender)')
+    if n != ft['count']:
+        print(f'  note: {ft["count"]} -> {n} frames (frames.asm renumbered by name)')
+    table = blob.add(b'\0' * (4 * n), 4)
+    if table != 0:
+        raise SystemExit('frame table: the file keeps other data before the model, the table can\'t be at its start')
+    d = f.details['hi']
+    W = [j.world for j in d['joints']]
+    prologue = prologue_for(f, d, textures.lights)
+    epilogue = epilogue_of(f, f.modelparts[joint][0][0]['dl'])
+    for k in range(n):
+        o = frames[k]
+        if not o['tris']:
+            raise SystemExit(f'frame table: part{k}_hi_j{joint:02d} is empty')
+        dls, mats = IF.build_joints([o], W, textures, blob, prologue, writer.store, only_joint=joint,
+                                    mobj_order={joint: []}, epilogue=epilogue, keep_order=True)
+        if mats.get(joint):
+            raise SystemExit(f'frame table: part{k}_hi_j{joint:02d} uses MObj materials ({mats[joint]}): the code '
+                             'only swaps the display list, so frames can only draw textures set in the DL')
+        blob.ptr(table + 4 * k, dls[joint])
+    return n, names
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('folder', help='character or stage folder (its config.yaml lists the files)')
@@ -501,6 +557,9 @@ def main(argv=None):
         raise SystemExit(f'{path}: not found (run blend_to_gltf.py on the .blend first)')
     objs = IF.load_gltf(path)
     writer = ModelWriter(f, textures, blob, {ms: remap[sc] for ms, sc in scripts.items()})
+    ft = f.object.get('frame_table')
+    if ft:                       # (first: the table is read at the file's start)
+        n_frames, frame_names = write_frame_table(f, ft, a.work_dir, textures, writer)
     targets, dls = writer.build('hi', objs, [r for r in (MOBJSUBS, MATANIM) if attr_off + r in ext])
     # joint animations (anim_joints, attributes +8): Blender's (blend_to_gltf.py joint_anims)
     for fld, tgt in write_joint_anims(f, a.work_dir, blob, remap).items():
@@ -537,18 +596,24 @@ def main(argv=None):
         req.insert(len(MF.chain(bytes(hb), ext_head)) - 1, token)
         added += 1
 
-    out = a.out or a.folder
-    os.makedirs(out, exist_ok=True)
-    open(os.path.join(out, model_name + '.bin'), 'wb').write(new)
-    open(os.path.join(out, os.path.basename(kw['attr_path'])), 'wb').write(hb)
+    # in place (files: entries may be in subfolders, e.g. Sub/name), or all in --out
+    place = (lambda p: p) if a.out is None else (lambda p: os.path.join(a.out, os.path.basename(p)))
+    model_out = place(kw['model_path'])
+    os.makedirs(os.path.dirname(model_out) or '.', exist_ok=True)
+    open(model_out, 'wb').write(new)
+    open(place(kw['attr_path']), 'wb').write(hb)
     if added:
-        open(os.path.join(out, os.path.basename(reqlist_path)), 'w', encoding='utf-8', newline='').write(
+        open(place(reqlist_path), 'w', encoding='utf-8', newline='').write(
             newline.join(req) + (newline if req_raw.endswith(b'\n') else ''))
+    if ft:                      # the code's FRAME_<name> numbers, in the frames' new order
+        print(f'  {MF.write_frame_names(model_out, frame_names)}: {len(frame_names)} frame names')
     if a.out is None:
-        set_config_head(cfg_path, model_name, head)
+        set_config_head(cfg_path, os.path.relpath(os.path.splitext(kw['model_path'])[0], a.folder)
+                        .replace(os.sep, '/'), head)
     tris = sum(len(o['tris']) for o in objs)
     print(f'{model_name}.bin: {len(f.char)} -> {len(new)} bytes, chain head 0x{head:X}; '
           f'{tris} triangles on joints {sorted(dls)}'
+          + (f'; {n_frames} frames in the display list table' if ft else '')
           + (f'; {added} new attribute pointers' if added else ''))
     if a.out:
         print(f'  (config.yaml not updated: set {model_name}\'s chain head to "{head:04X}")')

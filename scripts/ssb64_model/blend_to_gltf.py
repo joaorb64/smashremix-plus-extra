@@ -497,6 +497,9 @@ json.dump(dict(export_dir=export_dir, materials=costumes, props=props, lights=li
                # model part variants renumbered in Blender (removed / moved): object -> its export variant
                part_origins={base_name(o.name): int(o['n64_part_orig']) for o in bpy.data.objects
                              if o.type == 'MESH' and 'n64_part_orig' in o.keys()},
+               # sprite model frames (display list table): object -> its name (frames.asm)
+               frame_names={base_name(o.name): str(o['n64_frame']) for o in bpy.data.objects
+                            if o.type == 'MESH' and 'n64_frame' in o.keys()},
                costume_sources={str(k): int(v) for k, v in dict(bpy.context.scene.get('n64_costume_sources') or {}).items()},
                shield_pose=shield_pose()),
           open(os.path.join(OUT, 'costumes.json'), 'w'), indent=1)

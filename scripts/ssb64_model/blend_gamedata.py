@@ -72,6 +72,8 @@ def helper_mat(name, rgba):
         return m
     m = bpy.data.materials.new(name)
     m['n64_helper'] = True             # not a model material (blend_to_gltf.py / the panel skip it)
+    import n64_panel as PANEL          # (hardware colors: the scene shows stored values)
+    rgba = (*PANEL.view_from_linear(rgba[:3]), rgba[3])
     m.diffuse_color = rgba
     m.use_nodes = True
     bsdf = next((n for n in m.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
