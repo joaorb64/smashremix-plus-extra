@@ -190,7 +190,8 @@ for m in bpy.data.materials:
         continue
     p = {k: (m[k] if isinstance(m[k], str) else str(m[k])) for k in ('n64_format', 'n64_wrap_s', 'n64_wrap_t',
                                                                       'n64_cull', 'n64_lighting', 'n64_light_color',
-                                                                      'n64_shadow_color', 'n64_state') if k in m.keys()}
+                                                                      'n64_shadow_color', 'n64_state', 'n64_filter')
+         if k in m.keys()}
     # culling: Blender's Backface Culling checkbox (on: back faces culled, off: double-sided);
     # n64_cull only for what it can't say (front / both)
     if p.get('n64_cull') not in ('front', 'both'):

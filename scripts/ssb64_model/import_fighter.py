@@ -335,8 +335,10 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
         if w0 >> 24 in (0xDB, 0xFC, 0xFA, 0xE3, 0xE2):
             base_state[skey(w0)] = (w0, w1)
     # what a material without its own value draws with: the model's lights, the game's filter
-    base_state[skey(MAT.FILTER_CMD)] = (MAT.FILTER_CMD, MAT.FILTER['bilinear'])
-    light_defaults = {k: v for k, v in base_state.items() if k[0] == 0xDB or k == skey(MAT.FILTER_CMD)}
+    # (base_state keeps what the prologue really sets: a point-filter prologue gets reset)
+    base_state.setdefault(skey(MAT.FILTER_CMD), (MAT.FILTER_CMD, MAT.FILTER['bilinear']))
+    light_defaults = {k: v for k, v in base_state.items() if k[0] == 0xDB}
+    light_defaults[skey(MAT.FILTER_CMD)] = (MAT.FILTER_CMD, MAT.FILTER['bilinear'])
 
     def setup_fn(mi):
         def setup(dw, mat):
@@ -444,6 +446,11 @@ def build_joints(objs, joints_W, textures, blob, prologue, store, only_joint=Non
                 waiting.add(later)
         if dw.alpha_compare:                     # not reset by the game's render mode
             dw.raw(GW.g(0xE7000000) + b''.join(GW.g(*c) for c in MAT.ALPHA_COMPARE_OFF))
+        # texture filter (point / average materials): the game never sets it back, so whatever
+        # it draws next (stage, other items) would inherit it: back to the game's bilinear
+        filt = getattr(dw, 'cur', {}).get(skey(MAT.FILTER_CMD))
+        if filt is not None and filt[1] != MAT.FILTER['bilinear']:
+            dw.raw(GW.g(0xE7000000) + GW.g(MAT.FILTER_CMD, MAT.FILTER['bilinear']))
         if epilogue:                             # items / stages: the state the original DL left
             dw.raw(epilogue)
         dls[j] = dw.finish()
