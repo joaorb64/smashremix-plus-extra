@@ -8,9 +8,14 @@ Each folder has:
   ITEM_INFO_ARRAY_ORIGIN).
 - optional <Sub>/<Sub>.asm sub-parts (e.g. one folder per thing the item summons),
   included after <Name>.asm in folder order, then optional end.asm, which can list
-  them: PART_COUNT, and {PART_<n>} = the n-th part's folder name (e.g. a table of
-  {PART_<n>}.spawn_). (bass `global variable`s changed inside a nested scope
-  don't survive it, so parts can't reliably register themselves.)
+  them: PART_COUNT (0 without parts), and {PART_<n>} = the n-th part's folder name
+  (e.g. a table of {PART_<n>}.spawn_). (bass `global variable`s changed inside a
+  nested scope don't survive it, so parts can't reliably register themselves.)
+  Adding / removing a part = adding / removing its folder.
+  A part's own <Sub>/config.yaml can have files: / sounds: / textures: / attributes:
+  (paths relative to the part's folder: its sounds in <Sub>/sounds/). They're merged
+  into the item's (as "Sub/name"): the constants stay the item's (FILES.<FILE>,
+  FGM.<SOUND>, reachable from the part's scope), so names must be unique.
 - config.yaml:
     name: "Extra Item"           # Item Switch / Training mode name
     rate: 5                      # spawn weight on every stage
@@ -90,9 +95,66 @@ class ItemProcessor(ExtraImportProcessor):
                              f"room for {free} more ({', '.join(i['name'] for i in self.items)})")
         self._write_asm()
 
+    @staticmethod
+    def parts(base):
+        """The item folder BASE's sub-parts: <Sub>/<Sub>.asm, in folder order."""
+        return [sub for sub in sorted(os.listdir(base))
+                if not sub.startswith("_") and os.path.isfile(f"{base}/{sub}/{sub}.asm")]
+
+    @classmethod
+    def merged_config(cls, base):
+        """BASE/config.yaml with its parts' config.yaml files: / sounds: / textures: /
+        attributes: added (their names / files prefixed with the part's folder)."""
+        config = yaml.safe_load(open(f"{base}/config.yaml", encoding="utf-8")) or {}
+        owner = {}                                      # constant name -> where it's from
+
+        def claim(kind, key, where):
+            k = (kind, os.path.basename(key).upper())
+            if k in owner:
+                raise ValueError(f"{base}: {kind} {os.path.basename(key)!r} is in both {owner[k]} and "
+                                 f"{where}: names must be unique within an item")
+            owner[k] = where
+        for e in config.get("files", []) or []:
+            claim("file", e[0], "config.yaml")
+        for k in config.get("sounds", {}) or {}:
+            claim("sound", k, "config.yaml")
+        for k in config.get("textures", {}) or {}:
+            claim("texture", k, "config.yaml")
+        blocks = config.get("attributes") or []
+        attributes = [blocks] if isinstance(blocks, dict) else list(blocks)
+        for sub in cls.parts(base):
+            path = f"{base}/{sub}/config.yaml"
+            if not os.path.isfile(path):
+                continue
+            part = yaml.safe_load(open(path, encoding="utf-8")) or {}
+            where = f"{sub}/config.yaml"
+            unknown = set(part) - {"files", "sounds", "textures", "attributes"}
+            if unknown:
+                raise ValueError(f"{base}/{where}: only files: / sounds: / textures: / attributes: "
+                                 f"go in a part's config.yaml (not {', '.join(sorted(unknown))})")
+            for e in part.get("files", []) or []:
+                claim("file", e[0], where)
+                config.setdefault("files", []).append([f"{sub}/{e[0]}", *e[1:]])
+            for k, v in (part.get("sounds", {}) or {}).items():
+                claim("sound", k, where)
+                config.setdefault("sounds", {})[f"{sub}/{k}"] = v
+            for k, v in (part.get("textures", {}) or {}).items():
+                claim("texture", k, where)
+                v = dict(v or {})
+                v["file"] = f"{sub}/{v.get('file', k + '.png')}"
+                config.setdefault("textures", {})[k] = v
+            pb = part.get("attributes") or []
+            for b in ([pb] if isinstance(pb, dict) else pb):
+                if not b.get("file"):
+                    raise ValueError(f"{base}/{where}: attributes: needs file: (one of its files:)")
+                attributes.append(dict(b, file=f"{sub}/{b['file']}"))
+        config["attributes"] = attributes
+        return config
+
     def process_item(self, name, folder):
-        config = yaml.safe_load(open(f"{folder}/{name}/config.yaml", encoding="utf-8")) or {}
-        self.process(name, folder, output_root=OUTPUT_ROOT, file_prefix="extra_item", wrap_scope=False)
+        config = self.merged_config(f"{folder}/{name}")
+        self.process(name, folder, output_root=OUTPUT_ROOT, file_prefix="extra_item", wrap_scope=False,
+                     config=config)
         output_path = f"{OUTPUT_ROOT}/{name}"
 
         blocks = config.get("attributes") or []
@@ -231,12 +293,12 @@ class ItemProcessor(ExtraImportProcessor):
                       f'        include "{rel(f"{base}/{it["name"]}.asm")}"']
             # sub-parts in their own folders (<Sub>/<Sub>.asm, e.g. one per assist of an
             # item that summons things), then end.asm (e.g. tables the parts registered into)
-            parts = [sub for sub in sorted(os.listdir(base)) if os.path.isfile(f"{base}/{sub}/{sub}.asm")]
+            parts = self.parts(base)
             for sub in parts:
                 lines.append(f'        include "{rel(f"{base}/{sub}/{sub}.asm")}"')
-            if parts:       # for end.asm: {PART_<n>} = each part's scope name
-                lines += [f"        define PART_{n}({sub})" for n, sub in enumerate(parts)]
-                lines.append(f"        constant PART_COUNT({len(parts)})")
+            # for end.asm: {PART_<n>} = each part's scope name
+            lines += [f"        define PART_{n}({sub})" for n, sub in enumerate(parts)]
+            lines.append(f"        constant PART_COUNT({len(parts)})")
             if os.path.isfile(f"{base}/end.asm"):
                 lines.append(f'        include "{rel(f"{base}/end.asm")}"')
             lines.append("    }")

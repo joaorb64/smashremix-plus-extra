@@ -10,6 +10,11 @@ build(man): from the export manifest, in build_blend.py
                        (Blender's front view, y = 0)
   Stage objects        empties: map objects (spawn points, item spawns, rebirth platform...)
                        and spawn locations; rectangles: blast zones, camera bounds
+  ECB                  fighters / items / projectiles: their map collision diamond, a mesh 'ECB' (top,
+                       right and bottom vertex, mirrored in x) on the front plane, at the object's
+                       position. Object > N64 Game Data: top, center, bottom, width. A fighter's
+                       vertices are game units, the object scaled 1 / size_multi (the game scales the
+                       model, not the diamond: Blender's model is unscaled)
 collect(): what the .blend has, for gamedata.json (blend_to_gltf.py).
 """
 import re
@@ -275,8 +280,64 @@ def build_stage(sc):
             ob.hide_set(True)
 
 
+ECB_COLOR = (0.95, 0.35, 0.95, 0.25)
+
+
+def ecb_set(ob, top, center, bottom, width):
+    """The ECB mesh's vertices: 0 top, 1 right side, 2 bottom (game units; Mirror makes the left)."""
+    v = ob.data.vertices
+    v[0].co = (0.0, 0.0, top)
+    v[1].co = (width, 0.0, center)
+    v[2].co = (0.0, 0.0, bottom)
+    ob.data.update()
+
+
+def ecb_get(ob, world=False):
+    """(top, center, bottom, width) from the ECB mesh: the side vertex = the one farthest from
+    x = 0, top / bottom = the other two. (A fighter's: always its vertices, game units.)"""
+    world = world and ob.get('n64_ecb_kind') != 'fighter'
+    M = ob.matrix_world if world else mathutils.Matrix.Identity(4)
+    vs = [M @ v.co for v in ob.data.vertices]
+    if len(vs) < 3:
+        raise SystemExit(f'{ob.name}: the ECB needs its 3 vertices (top, side, bottom)')
+    side = max(vs, key=lambda c: abs(c.x))
+    rest = sorted((c for c in vs if c is not side), key=lambda c: c.z)
+    return rest[-1].z, side.z, rest[0].z, abs(side.x)
+
+
+def build_ecb(e):
+    """Manifest 'ecb' -> the diamond (one triangle, mirrored)."""
+    me = bpy.data.meshes.new('ECB')
+    me.from_pydata([(0, 0, 1), (1, 0, 0), (0, 0, -1)], [], [(0, 2, 1)])
+    ob = bpy.data.objects.new('ECB', me)
+    _coll('ECB').objects.link(ob)
+    ecb_set(ob, e['top'], e['center'], e['bottom'], e['width'])
+    me.materials.append(helper_mat('N64 ECB', ECB_COLOR))
+    mod = ob.modifiers.new('Mirror', 'MIRROR')
+    mod.use_axis[0] = True
+    mod.use_clip = True
+    mod.use_mirror_merge = True
+    ob['n64_gamedata'] = 'ecb'
+    ob['n64_ecb_kind'] = e.get('kind', 'item')
+    if e.get('kind') == 'fighter':
+        ob['n64_ecb_size'] = float(e.get('size') or 1.0)
+        ob.scale = (1.0 / ob['n64_ecb_size'],) * 3       # (on the unscaled model as in the game)
+        for vl in bpy.context.scene.view_layers:     # hidden at first, as the hurtboxes
+            lc = vl.layer_collection.children.get('ECB')
+            if lc is not None:
+                lc.hide_viewport = True
+    ob.show_wire = True
+    ob.show_in_front = True
+    ob.color = ECB_COLOR
+    ob.lock_rotation = (True, True, True)
+    ob.lock_scale = (True, True, True)
+    ob.lock_location = (True, True, True)       # (relative to the object's position: edit the vertices)
+
+
 def build(man):
     arm = next((o for o in bpy.data.objects if o.type == 'ARMATURE' and not o.get('n64_reference')), None)
+    if man.get('ecb'):
+        build_ecb(man['ecb'])
     if man.get('hurtboxes'):
         build_hurtboxes(man['hurtboxes'], arm)
     if man.get('stage_collision'):
@@ -487,9 +548,24 @@ def collect_stage():
     return dict(lines=lines, map_objects=mapobjs, spawn_locations=spawns, bounds=bounds)
 
 
+def collect_ecb():
+    obs = _objs('ecb')
+    if not obs:
+        return None
+    if len(obs) > 1:
+        raise SystemExit(f'{len(obs)} ECB objects ({", ".join(o.name for o in obs)}): an object has one')
+    vals = ecb_get(obs[0], world=True)
+    vals = [round(v, 3) for v in vals] if obs[0].get('n64_ecb_kind') == 'fighter' else \
+        [int(round(v)) for v in vals]
+    return dict(zip(('top', 'center', 'bottom', 'width'), vals))
+
+
 def collect():
     """gamedata.json contents (only what the .blend has)."""
     out = {}
+    ecb = collect_ecb()
+    if ecb is not None:
+        out['ecb'] = ecb
     if any(o.get('n64_gamedata') == 'hurtbox' for o in bpy.data.objects) or bpy.data.collections.get('Hurtboxes'):
         out['hurtboxes'] = collect_hurtboxes()
     if bpy.data.collections.get('Collision') or bpy.data.collections.get('Stage objects'):

@@ -476,3 +476,156 @@ def write_mapobjs(stage_path, stage_head, mapobjs):
         struct.pack_into('>H', d, geom + 0x14, len(mapobjs))
         struct.pack_into('>H', d, geom + 0x18 + 2, target // 4)
     open(stage_path, 'wb').write(d)
+
+
+# ---------------------------------------------------------------------------- item / projectile ECB
+
+# The map collision diamond (ECB): MPObjectColl {s16 top, center, bottom, width} in the attributes,
+# relative to the object's position: points (0, top), (+-width, center), (0, bottom).
+ECB_KEYS = ('top', 'center', 'bottom', 'width')
+ECB_OFF = {'item': 0x2A, 'weapon': 0x1C}       # ITAttributes / WPAttributes (projectile_bin_generator.py)
+
+
+def _attr_blocks(cfg):
+    blocks = cfg.get('attributes') or []
+    return [blocks] if isinstance(blocks, dict) else [b for b in blocks if isinstance(b, dict)]
+
+
+def _cfg_block(cfg, file_name, offset):
+    """config.yaml attributes: block of FILE_NAME (the files: name) at OFFSET, or None."""
+    for b in _attr_blocks(cfg):
+        if str(b.get('file')) == file_name and int(str(b.get('offset', 0)), 0) == offset:
+            return b
+    return None
+
+
+def object_ecb(attr, attr_offset, kind, cfg=None, file_name=None):
+    """Manifest 'ecb': {kind, top, center, bottom, width, source: 'config' | 'bin'} (config.yaml's
+    attributes: map_coll when the file's block has one: the build writes it over the file's)."""
+    vals = dict(zip(ECB_KEYS, struct.unpack_from('>4h', attr, attr_offset + ECB_OFF[kind])))
+    source = 'bin'
+    b = _cfg_block(cfg or {}, file_name, attr_offset) if file_name else None
+    if b is not None and b.get('map_coll') is not None:
+        mc = b['map_coll']
+        vals.update(dict(zip(ECB_KEYS, mc)) if isinstance(mc, (list, tuple)) else
+                    {k: int(mc[k]) for k in ECB_KEYS if k in mc})
+        source = 'config'
+    return dict(kind=kind, source=source, **{k: int(v) for k, v in vals.items()})
+
+
+def object_kind(folder, cfg, file_name, attr_offset):
+    """'item' (ITAttributes) or 'weapon' (WPAttributes) for a folder's object: items in extra
+    items / stages (or with a config.yaml attributes: block), projectiles in characters."""
+    if _cfg_block(cfg, file_name, attr_offset) is not None:
+        return 'item'
+    return 'weapon' if folder and os.path.exists(os.path.join(folder, 'main.bin')) else 'item'
+
+
+def _set_cfg_map_coll(text, file_name, vals):
+    """config.yaml TEXT with the map_coll of FILE_NAME's attributes: block set to VALS."""
+    lines = text.split('\n')
+    s = next((i for i, ln in enumerate(lines) if re.match(r'^attributes\s*:', ln)), None)
+    if s is None:
+        raise SystemExit('config.yaml: no attributes: to update')
+    e = s + 1                       # (its list items may sit at column 0: up to the next top-level key)
+    while e < len(lines) and not re.match(r'^[^\s#-][^:]*:', lines[e]):
+        e += 1
+    starts = [i for i in range(s + 1, e) if re.match(r'^\s*- ', lines[i])] or [s]
+    starts.append(e)
+    for a, b in zip(starts, starts[1:]):
+        if not any(re.match(r'^\s*-?\s*file\s*:\s*["\']?' + re.escape(file_name) + r'["\']?\s*(#.*)?$',
+                            lines[i]) for i in range(a, b)):
+            continue
+        for i in range(a, b):
+            m = re.match(r'^(\s*-?\s*map_coll\s*:\s*)(\{[^}]*\}|\[[^\]]*\])(.*)$', lines[i])
+            if m:
+                lines[i] = m.group(1) + _fmt({k: vals[k] for k in ECB_KEYS}) + m.group(3)
+                return '\n'.join(lines)
+        raise SystemExit(f'config.yaml attributes: {file_name}: map_coll must be on one line '
+                         '({ top: .., center: .., bottom: .., width: .. }) to be updated')
+    raise SystemExit(f'config.yaml attributes: no block for {file_name}')
+
+
+def apply_object_ecb(work, man, attr, attr_offset, cfg_path, file_name, write_cfg):
+    """gamedata.json ecb -> config.yaml's map_coll (when it has it) or ATTR (bytearray, in place).
+    Returns a message or None."""
+    gd = _load_work(work)
+    old = man.get('ecb')
+    if gd is None or not gd.get('ecb') or old is None:
+        return None
+    new = {k: int(gd['ecb'][k]) for k in ECB_KEYS}
+    for k in ('top', 'center', 'bottom', 'width'):
+        if not -32768 <= new[k] <= 32767:
+            raise SystemExit(f'ECB {k} = {new[k]}: out of range')
+    if new['width'] < 0 or new['top'] < new['bottom']:
+        raise SystemExit(f'ECB {new}: top must be above bottom, width >= 0')
+    desc = ', '.join(f'{k} {new[k]}' for k in ECB_KEYS)
+    if new == {k: old[k] for k in ECB_KEYS}:
+        return f'ECB: {desc}, unchanged'
+    if old['source'] == 'config':
+        if not write_cfg:
+            return f'ECB: {desc}\n  config.yaml attributes: {file_name} map_coll (not updated: --out): ' + \
+                _fmt(new)
+        text = open(cfg_path, encoding='utf-8').read()
+        open(cfg_path, 'w', encoding='utf-8').write(_set_cfg_map_coll(text, file_name, new))
+        return f'ECB: {desc} -> config.yaml attributes: {file_name} map_coll'
+    struct.pack_into('>4h', attr, attr_offset + ECB_OFF[old['kind']], *(new[k] for k in ECB_KEYS))
+    return f'ECB: {desc} -> {file_name}.bin'
+
+
+# ---------------------------------------------------------------------------- fighter ECB
+
+# FTAttributes + 0x9C: MPObjectColl as f32 {top, center, bottom, width} (fttypes.h map_coll),
+# config.yaml attributes: ecb_upper_y / ecb_center_y / ecb_bottom_y / ecb_width (the build
+# writes them over main.bin's). Not scaled by the model size (attr + 0x0, the TopN scale).
+FIGHTER_ECB_OFF = 0x9C
+FIGHTER_SIZE_OFF = 0x0
+FIGHTER_ECB_CFG = dict(top='ecb_upper_y', center='ecb_center_y', bottom='ecb_bottom_y', width='ecb_width')
+
+
+def fighter_ecb(main, attr, cfg):
+    """Manifest 'ecb' for a fighter: {kind: 'fighter', top, center, bottom, width (game units),
+    size (the model's scale: Blender draws the diamond / size, on the unscaled model),
+    config: [the keys config.yaml sets]}."""
+    at = (cfg or {}).get('attributes') or {}
+    at = at if isinstance(at, dict) else {}
+    vals = dict(zip(ECB_KEYS, struct.unpack_from('>4f', main, attr + FIGHTER_ECB_OFF)))
+    in_cfg = [k for k in ECB_KEYS if at.get(FIGHTER_ECB_CFG[k]) is not None]
+    for k in in_cfg:
+        vals[k] = float(at[FIGHTER_ECB_CFG[k]])
+    size = float(at['size_multi']) if at.get('size_multi') is not None else \
+        struct.unpack_from('>f', main, attr + FIGHTER_SIZE_OFF)[0]
+    if not size > 0:
+        size = 1.0
+    return dict(kind='fighter', size=size, config=in_cfg, **{k: round(v, 3) for k, v in vals.items()})
+
+
+def apply_fighter_ecb(main, attr, work, man, cfg_path):
+    """gamedata.json ecb -> main.bin (bytearray, in place) and config.yaml's ecb_* keys it has
+    (CFG_PATH None: not written, listed). Returns a message or None."""
+    gd = _load_work(work)
+    old = man.get('ecb')
+    if gd is None or not gd.get('ecb') or not old or old.get('kind') != 'fighter':
+        return None
+    new = {k: round(float(gd['ecb'][k]), 3) for k in ECB_KEYS}
+    if new['width'] < 0 or new['top'] < new['bottom']:
+        raise SystemExit(f'ECB {new}: top must be above bottom, width >= 0')
+    desc = ', '.join(f'{k} {new[k]:g}' for k in ECB_KEYS)
+    if all(abs(new[k] - old[k]) < 0.01 for k in ECB_KEYS):
+        return f'ECB: {desc}, unchanged'
+    struct.pack_into('>4f', main, attr + FIGHTER_ECB_OFF, *(new[k] for k in ECB_KEYS))
+    msg = f'ECB: {desc} -> main.bin'
+    keys = [k for k in old.get('config') or [] if abs(new[k] - old[k]) >= 0.01]
+    if keys:
+        lines = {k: f'{FIGHTER_ECB_CFG[k]}: {_fmt(float(new[k]))}' for k in keys}
+        if cfg_path:
+            raw = open(cfg_path, encoding='utf-8', newline='').read()
+            nl = '\r\n' if '\r\n' in raw else '\n'
+            text = raw.replace('\r\n', '\n')
+            for k in keys:
+                text = set_yaml(text, 'attributes.' + FIGHTER_ECB_CFG[k], [lines[k]])
+            open(cfg_path, 'w', encoding='utf-8', newline='').write(text.replace('\n', nl))
+            msg += '; config.yaml attributes: ' + ', '.join(lines.values())
+        else:
+            msg += '; config.yaml attributes needs (not updated: --out): ' + ', '.join(lines.values())
+    return msg

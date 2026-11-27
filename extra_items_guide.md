@@ -100,6 +100,27 @@ constant ITEM_INFO_ARRAY_ORIGIN(origin())
 Remix's own items in `src/items/` are working examples of this interface (states, map
 collision, fighter checks); engine routine addresses come from ssb-decomp-re.
 
+## Parts (sub-folders)
+
+An item made of interchangeable pieces (e.g. one folder per thing it can summon) can put
+each one in `<Name>/<Part>/`, with `<Part>.asm`. Adding or removing a piece = adding or
+removing its folder (a folder starting with `_` is skipped):
+
+```
+extra_items/ExtraItem/
+    config.yaml  ExtraItem.asm  end.asm
+    PartA/  PartA.asm  config.yaml  parta.bin  parta_hitbox.bin  sounds/parta_voice.wav
+    PartB/  PartB.asm  ...
+```
+
+- The parts' asm is included after `<Name>.asm`, in folder order, each in the item's scope.
+  Then `end.asm` (optional) sees `PART_COUNT` (0 without parts) and `{PART_<n>}` = the n-th
+  part's folder name, e.g. to build a table of `{PART_<n>}.spawn_`.
+- A part's `config.yaml` has only `files:` / `sounds:` / `textures:` / `attributes:`, with
+  names relative to its own folder (sounds in `<Part>/sounds/`). They're merged into the
+  item's: the constants stay the item's (`FILES.PARTA.ptr`, `FGM.PARTA_VOICE`, reachable from
+  the part's code), so file / sound / texture names must be unique within the item.
+
 ## What the appender changes
 
 - `src/Item.asm`: `NUM_STANDARD_ITEMS`, `NUM_ITEMS`, `EXTENDED_ENABLED_BITMASK_DEFAULT`

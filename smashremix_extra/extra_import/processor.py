@@ -93,12 +93,14 @@ class ExtraImportProcessor:
         self._write_extra_imports_asm()
 
     def process(self, name, folder="./extra_imports", output_root="build/extra_imports",
-                file_prefix="extra_import", wrap_scope=True):
+                file_prefix="extra_import", wrap_scope=True, config=None):
         """wrap_scope=False leaves out the outer `scope <Name> { }` of generated.asm
-        (extra items include it inside their own scope)."""
+        (extra items include it inside their own scope). config: the folder's config.yaml
+        as already read (extra items: merged with their parts')."""
         original_path = f"{folder}/{name}"
         output_path = f"{output_root}/{name}"
-        config = yaml.safe_load(open(f"{original_path}/config.yaml", encoding="utf-8")) or {}
+        if config is None:
+            config = yaml.safe_load(open(f"{original_path}/config.yaml", encoding="utf-8")) or {}
 
         shutil.copytree(original_path, output_path, dirs_exist_ok=True)
 

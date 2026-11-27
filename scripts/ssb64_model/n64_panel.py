@@ -3640,6 +3640,49 @@ def _hb_local(ob):
     return tuple(L.translation), tuple(half * L.col[k].xyz.length for k in range(3))
 
 
+def _ecb_get(ob, as_float=False):
+    """An ECB mesh (blend_gamedata.py): (top, center, bottom, width), game units (ints: items /
+    projectiles' s16; floats: fighters' f32)."""
+    if ob.mode == 'EDIT':
+        ob.update_from_editmode()
+    vs = [v.co for v in ob.data.vertices]
+    if len(vs) < 3:
+        return (0, 0, 0, 0)
+    side = max(vs, key=lambda c: abs(c.x))
+    rest = sorted((c for c in vs if c is not side), key=lambda c: c.z)
+    vals = (rest[-1].z, side.z, rest[0].z, abs(side.x))
+    return tuple(round(v, 3) for v in vals) if as_float else tuple(int(round(v)) for v in vals)
+
+
+def _ecb_set(ob, **kw):
+    if ob.mode == 'EDIT':
+        return                             # (Object Mode: the mesh data)
+    top, center, bottom, width = _ecb_get(ob, as_float=ob.get('n64_ecb_kind') == 'fighter')
+    top, center = kw.get('top', top), kw.get('center', center)
+    bottom, width = kw.get('bottom', bottom), max(0, kw.get('width', width))
+    v = ob.data.vertices
+    for i, co in enumerate(((0.0, 0.0, top), (width, 0.0, center), (0.0, 0.0, bottom))):
+        v[i].co = co
+    for i in range(3, len(v)):
+        v[i].co = (0.0, 0.0, bottom)
+    ob.data.update()
+
+
+def _ecb_prop(key, name, description, **kw):
+    i = ('top', 'center', 'bottom', 'width').index(key)
+    return bpy.props.IntProperty(get=lambda self: _ecb_get(self)[i],
+                                 set=lambda self, v: _ecb_set(self, **{key: v}),
+                                 name=name, description=description, **kw)
+
+
+def _ecb_fprop(key, name, description, **kw):
+    """A fighter's ECB value (f32: attributes ecb_upper_y / ecb_center_y / ecb_bottom_y / ecb_width)."""
+    i = ('top', 'center', 'bottom', 'width').index(key)
+    return bpy.props.FloatProperty(get=lambda self: _ecb_get(self, as_float=True)[i],
+                                   set=lambda self, v: _ecb_set(self, **{key: v}),
+                                   name=name, description=description, precision=1, step=100, **kw)
+
+
 def _hb_set(ob, offset=None, size=None):
     arm, bone = _hb_bone(ob)
     W = _joint_world(arm, bone.name) if bone else None
@@ -4321,6 +4364,17 @@ def _kind_set(self, value):
 
 
 OBJECT_PROPS = {
+    'n64ui_ecb_top': _ecb_prop('top', 'Top', 'Map collision top point: hits ceilings (attributes map_coll top)'),
+    'n64ui_ecb_center': _ecb_prop('center', 'Center', 'Height of the side points: hit walls (map_coll center)'),
+    'n64ui_ecb_bottom': _ecb_prop('bottom', 'Bottom', 'Map collision bottom point: where it stands on floors '
+                                                        '(map_coll bottom)'),
+    'n64ui_ecb_width': _ecb_prop('width', 'Width', 'Side points\' distance from the center (map_coll width)',
+                                 min=0),
+    'n64ui_ecb_ftop': _ecb_fprop('top', 'Top', 'Map collision top point: hits ceilings (attributes ecb_upper_y)'),
+    'n64ui_ecb_fcenter': _ecb_fprop('center', 'Center', 'Height of the side points: hit walls (ecb_center_y)'),
+    'n64ui_ecb_fbottom': _ecb_fprop('bottom', 'Bottom', 'Map collision bottom point: where the fighter stands '
+                                                          '(ecb_bottom_y)'),
+    'n64ui_ecb_fwidth': _ecb_fprop('width', 'Width', 'Side points\' distance from the center (ecb_width)', min=0),
     'n64ui_hb_placement': obj_enum('n64_hurtbox_placement', HB_PLACEMENTS, 'mid', name='Placement',
                                    description='Where a hit on this box counts: low, mid or high (the '
                                                'damage reaction)'),
@@ -4548,6 +4602,23 @@ class N64_PT_gamedata(bpy.types.Panel):
             lay.label(text='config.yaml spawn_locations (the fighter\'s feet)')
         elif kind == 'bounds':
             lay.label(text=f'{ob.name}: scale / move its points (Edit Mode)', icon='SELECT_SET')
+        elif kind == 'ecb':
+            ek = ob.get('n64_ecb_kind')
+            fighter = ek == 'fighter'
+            lay.label(text='Map collision diamond (' + {'weapon': 'projectile', 'fighter': 'fighter'}.get(ek, 'item')
+                      + ')', icon='MESH_DATA')
+            col = lay.column(align=True)
+            col.enabled = ob.mode != 'EDIT'
+            p = 'n64ui_ecb_f' if fighter else 'n64ui_ecb_'
+            for k in ('top', 'center', 'bottom', 'width'):
+                col.prop(ob, p + k)
+            lay.label(text='Or move its vertices (Edit Mode): top, right side, bottom', icon='INFO')
+            lay.label(text='Relative to the object\'s position (the origin); the left side mirrors')
+            if fighter:
+                lay.label(text=f'Game units; drawn at 1 / size ({ob.get("n64_ecb_size", 1.0):g}) on the model')
+                lay.label(text='The import writes it (main.bin, config.yaml ecb_* when set there)')
+            else:
+                lay.label(text='Bottom = where it stands; the import writes it (config.yaml map_coll / .bin)')
 
 
 # ---- joint attributes (jointattrs.py): Bone > N64 Joint, Armature > N64 Fighter Joints -------

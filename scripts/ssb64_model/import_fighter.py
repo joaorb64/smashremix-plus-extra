@@ -1011,6 +1011,11 @@ def main(argv=None):
                              a.cfg_out, write_cfg=True, jm=jm if jm else None)
     if msg:
         print('  ' + msg)
+    # the map collision diamond (the .blend's ECB): main.bin, and config.yaml's ecb_* keys it has
+    msg = GD.apply_fighter_ecb(main, f.attr, a.work_dir, getattr(textures, 'manifest', None) or {},
+                               a.cfg_out if a.cfg_out and os.path.exists(a.cfg_out) else None)
+    if msg:
+        print('  ' + msg)
     import legs
     # slope foot IK: ids that don't point at legs (not changed); (joints removed: the ids are the
     # new numbering, f the old - checked before, in Blender's bones)

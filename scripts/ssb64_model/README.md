@@ -195,6 +195,26 @@ layers 0 and 1 themselves. Hazard code may also address joints by index: check i
 On a layer drawn the "secondary" way (MPGroundData `layer_mask` bit set) every joint's display list is
 written as a DObjDLLink list, as the game reads them there.
 
+### ECB (fighters, items, projectiles)
+
+The `ECB` collection: the object's map collision diamond (attributes `map_coll`: ITAttributes
++ 0x2A, WPAttributes + 0x1C), a translucent mesh on the front plane around the object's
+position: vertex 0 top, 1 right side, 2 bottom, the left side mirrored. Move its vertices (Edit
+Mode), or set **Top / Center / Bottom / Width** in **Object > N64 Game Data**. Bottom is where the
+object stands on floors, top hits ceilings, the sides (center height, +-width) hit walls.
+
+It's read from config.yaml's `attributes:` block for the file when that has `map_coll` (the build
+writes it over the file's), else from the attributes file. The import writes it back to the same
+place (config.yaml's line keeps its comment). Projectile vs item: a folder with main.bin
+(a character) holds projectiles, other folders (extra items, stages) items.
+
+Fighters have one too (FTAttributes + 0x9C, f32 top / center / bottom / width; hidden at first, as
+the hurtboxes): the same mesh and panel, with float values. The game scales the model by its size
+(attributes + 0x0, `size_multi`) but not the diamond, so the `ECB` object is scaled 1 / size to
+sit on Blender's unscaled model; its vertices (and the panel) stay in game units. It's read from
+config.yaml `attributes:` `ecb_upper_y` / `ecb_center_y` / `ecb_bottom_y` / `ecb_width` where
+set, else main.bin; the import writes main.bin and the config.yaml keys that are set there.
+
 ### Hurtboxes (fighters)
 
 The `Hurtboxes` collection (hidden at first: its eye in the outliner, or **Show Hurtboxes** in the

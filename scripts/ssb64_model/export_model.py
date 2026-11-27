@@ -1143,6 +1143,11 @@ def main(argv=None):
         ex = Exporter(f, out_dir, a.costumes or costumes_in_scripts(f) or 1)
         ex.manifest['object'] = f.object
         ex.manifest['source'] = source_info('object', char_dir if a.object else None, a, a.object or a.item)
+        # its map collision diamond (Blender: 'ECB')
+        attr_name = os.path.relpath(os.path.splitext(f.object['attr_path'])[0], char_dir).replace(os.sep, '/') \
+            if a.object else None
+        kind = 'item' if a.item else GD.object_kind(char_dir if a.object else None, cfg, attr_name, f.object['attr'])
+        ex.manifest['ecb'] = GD.object_ecb(f.main, f.object['attr'], kind, cfg if a.object else None, attr_name)
         ex.run()
         m = ex.manifest
         tris = sum(o['triangles'] for o in m['objects'].values())
@@ -1236,6 +1241,7 @@ def main(argv=None):
             ex.fighter_anims = []
     ex.manifest['source'] = source_info('fighter', None if (a.main or a.char) else char_dir, a, a.fighter)
     ex.manifest['hurtboxes'] = GD.hurtboxes(f, {} if a.rom else cfg)     # (Blender: 'Hurtboxes')
+    ex.manifest['ecb'] = GD.fighter_ecb(f.main, f.attr, {} if a.rom else cfg)    # (Blender: 'ECB')
     try:
         ex.manifest['vs_1p'] = vs1p_info(cfg, a, None if (a.main or a.char) else char_dir)
     except (OSError, IndexError, ValueError, struct.error) as e:

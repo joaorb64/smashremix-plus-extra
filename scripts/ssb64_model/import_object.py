@@ -31,6 +31,7 @@ import materials as MAT  # noqa: E402
 import matanim as MA  # noqa: E402
 import jointanim as JA  # noqa: E402
 import gbi_writer as GW  # noqa: E402
+import gamedata as GD  # noqa: E402
 import import_fighter as IF  # noqa: E402
 import export_model as EX  # noqa: E402
 from smashremix_extra import ge_bin as ge  # noqa: E402
@@ -596,6 +597,11 @@ def main(argv=None):
         req.insert(len(MF.chain(bytes(hb), ext_head)) - 1, token)
         added += 1
 
+    # the map collision diamond edited in Blender ('ECB'): config.yaml's map_coll or the attributes
+    man = textures.manifest or {}
+    attr_name = os.path.relpath(os.path.splitext(kw['attr_path'])[0], a.folder).replace(os.sep, '/')
+    ecb_msg = GD.apply_object_ecb(a.work_dir, man, hb, attr_off, cfg_path, attr_name, a.out is None)
+
     # in place (files: entries may be in subfolders, e.g. Sub/name), or all in --out
     place = (lambda p: p) if a.out is None else (lambda p: os.path.join(a.out, os.path.basename(p)))
     model_out = place(kw['model_path'])
@@ -615,6 +621,8 @@ def main(argv=None):
           f'{tris} triangles on joints {sorted(dls)}'
           + (f'; {n_frames} frames in the display list table' if ft else '')
           + (f'; {added} new attribute pointers' if added else ''))
+    if ecb_msg:
+        print(f'  {ecb_msg}')
     if a.out:
         print(f'  (config.yaml not updated: set {model_name}\'s chain head to "{head:04X}")')
 

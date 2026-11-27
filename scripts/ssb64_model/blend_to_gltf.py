@@ -604,7 +604,7 @@ for me in {o.data for o in bpy.data.objects if o.type == 'MESH'}:      # (costum
         uv_ba.data[li].uv = (c[2], c[3])
 
 # meshes that won't be in the game: not in a collection the import reads
-_known = re.compile(r'(Costume \d+|Layer \d+.*|Room .*|Hurtboxes|Reference|Shield.*|VS Screen|Collision.*|Stage objects.*)$')
+_known = re.compile(r'(Costume \d+|Layer \d+.*|Room .*|Hurtboxes|Reference|Shield.*|VS Screen|Collision.*|Stage objects.*|ECB)$')
 for ob in bpy.data.objects:
     if ob.type != 'MESH' or ob.get('n64_reference') or bpy.context.scene.get('n64_kind') == 'stage':
         continue
