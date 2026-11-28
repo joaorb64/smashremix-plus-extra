@@ -338,7 +338,7 @@ def tex_flip_v(scene=None):
 
 
 # bumped when the material view's nodes change: blends made before rebuild them once (register)
-VIEW_VERSION = 2
+VIEW_VERSION = 3
 
 
 def refresh_old_views():
@@ -1155,6 +1155,10 @@ def build_combiner(m, nt, tex, out, bsdf):
     # translucent: the render mode's (cycle 2) blender weighs memory by 1 - alpha (XLU modes:
     # 0x0050...., 0x4410....); opaque / cut-out modes use memory coverage (0x0055...., 0xC411....)
     blending, comb_a = _edge_alpha(m, cmds, node, nt, comb_a)
+    # Sprite-table frames are coplanar at y = 0; EEVEE's DITHERED pass overwrites a lower-index
+    # frame black where an overlapping frame is transparent, so draw sprite-table models BLENDED.
+    if not blending and any('n64_frame' in o.keys() for o in bpy.data.objects):
+        blending = True
     if isinstance(comb_a, float):
         comb_a = val(comb_a)
     for attr, value in (('surface_render_method', 'BLENDED' if blending else 'DITHERED'),
